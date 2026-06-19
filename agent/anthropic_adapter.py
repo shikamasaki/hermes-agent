@@ -1,4 +1,4 @@
-﻿"""Anthropic Messages API adapter for Hermes Agent.
+"""Anthropic Messages API adapter for Hermes Agent.
 
 Translates between Hermes's internal OpenAI-style message format and
 Anthropic's Messages API. Follows the same pattern as the codex_responses
