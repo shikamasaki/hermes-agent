@@ -1907,3 +1907,49 @@ class TestFinalPayloadHasNoBlankTextBlocks:
         )
         image_blocks = [b for b in tool_result_block["content"] if b.get("type") == "image"]
         assert len(image_blocks) == 1
+
+class TestOAuthSanitizerUrlPreservation:
+    """Regression tests for issue #48860.
+
+    The OAuth system-prompt sanitizer must NOT rewrite the docs host
+    hermes-agent.nousresearch.com when replacing the product-name slug.
+    """
+
+    def _apply_sanitizer(self, text: str) -> str:
+        import re
+
+        text = text.replace("Hermes Agent", "Claude Code")
+        text = text.replace("Hermes agent", "Claude Code")
+        text = re.sub(r"(?<![:/\w])hermes-agent(?!\.nousresearch\.com)", "claude-code", text)
+        text = text.replace("Nous Research", "Anthropic")
+        return text
+
+    def test_docs_url_host_is_preserved(self):
+        """hermes-agent.nousresearch.com must survive sanitization intact."""
+        prompt = (
+            "Consult the documentation at "
+            "https://hermes-agent.nousresearch.com/docs for details."
+        )
+        result = self._apply_sanitizer(prompt)
+        assert "hermes-agent.nousresearch.com" in result, (
+            "Docs URL host was corrupted by the OAuth sanitizer"
+        )
+        assert "claude-code.nousresearch.com" not in result
+
+    def test_product_name_is_still_replaced(self):
+        """Non-URL occurrences of the slug must still be rewritten."""
+        prompt = "Welcome to Hermes Agent, powered by Nous Research."
+        result = self._apply_sanitizer(prompt)
+        assert "Claude Code" in result
+        assert "Anthropic" in result
+        assert "Hermes Agent" not in result
+        assert "Nous Research" not in result
+
+    def test_url_host_preserved_and_name_replaced_together(self):
+        """Both rules must hold when the prompt contains the URL and product name."""
+        prompt = "Hermes Agent help: https://hermes-agent.nousresearch.com/docs"
+        result = self._apply_sanitizer(prompt)
+        assert "Claude Code" in result
+        assert "hermes-agent.nousresearch.com" in result
+        assert "claude-code.nousresearch.com" not in result
+

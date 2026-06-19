@@ -1,4 +1,4 @@
-"""Anthropic Messages API adapter for Hermes Agent.
+﻿"""Anthropic Messages API adapter for Hermes Agent.
 
 Translates between Hermes's internal OpenAI-style message format and
 Anthropic's Messages API. Follows the same pattern as the codex_responses
@@ -1038,7 +1038,7 @@ def build_anthropic_kwargs(
                 text = block.get("text", "")
                 text = text.replace("Hermes Agent", "Claude Code")
                 text = text.replace("Hermes agent", "Claude Code")
-                text = text.replace("hermes-agent", "claude-code")
+                text = re.sub(r"(?<![:/\w])hermes-agent(?!\.nousresearch\.com)", "claude-code", text)
                 text = text.replace("Nous Research", "Anthropic")
                 text = _apply_oauth_prose_aliases(text)
                 block["text"] = text
