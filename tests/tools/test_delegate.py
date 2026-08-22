@@ -1431,6 +1431,39 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_model_routing_fields_are_forwarded(self):
+        """Explicit/adaptive routing hints must survive the live dispatch wrapper."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "route me",
+                    "route": "agy-flash-low",
+                    "difficulty": "routine",
+                    "difficulty_reason": "single literal response",
+                    "required_capabilities": ["reasoning"],
+                    "minimum_model_class": "fast",
+                    "output_schema": {"type": "object"},
+                },
+            )
+
+        self.assertEqual(captured["route"], "agy-flash-low")
+        self.assertEqual(captured["difficulty"], "routine")
+        self.assertEqual(captured["difficulty_reason"], "single literal response")
+        self.assertEqual(captured["required_capabilities"], ["reasoning"])
+        self.assertEqual(captured["minimum_model_class"], "fast")
+        self.assertEqual(captured["output_schema"], {"type": "object"})
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
