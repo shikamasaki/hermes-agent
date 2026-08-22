@@ -139,7 +139,15 @@ class TestClientIdentity:
             "source": "agy",
         }
 
-    def test_pairs_marked_cli_client_by_candidate_ordinal(self):
+    def test_pairs_marked_cli_client_by_direct_secret_adjacency(self):
+        """Direct adjacency to the selected client outranks marker locality.
+
+        Neither secret here carries an auth/cloudcode marker, so the only
+        evidence available is that ``desktop_secret`` is compiled
+        immediately after the selected ``cli_id`` — nothing could have been
+        interleaved between them. That beats picking by candidate ordinal,
+        which would have no basis at all in this layout.
+        """
         from hermes_cli import antigravity_auth as ag
 
         desktop_id = "111111111111-" + ("d" * 32) + ".apps.googleusercontent.com"
@@ -159,9 +167,35 @@ class TestClientIdentity:
 
         assert identity == {
             "client_id": cli_id,
-            "client_secret": cli_secret,
+            "client_secret": desktop_secret,
             "source": "agy",
         }
+
+    def test_returns_none_when_selected_secret_has_neither_adjacency_nor_marker(self):
+        """Fail closed: no direct adjacency and no marker on either secret.
+
+        Both secrets sit far from the selected client and carry no
+        auth/cloudcode marker of their own — there is nothing left to pair
+        on but ordinal position, which is exactly the guess this extractor
+        must refuse to make.
+        """
+        from hermes_cli import antigravity_auth as ag
+
+        desktop_id = "111111111111-" + ("d" * 32) + ".apps.googleusercontent.com"
+        cli_id = "222222222222-" + ("c" * 33) + ".apps.googleusercontent.com"
+        desktop_secret = "GOCSPX-" + ("D" * 28)
+        cli_secret = "GOCSPX-" + ("C" * 28)
+        blob = (
+            desktop_id
+            + "Overriding CloudCodeServerURL via CLOUD_CODE_URL "
+            + cli_id
+            + " unrelated filler between client and secrets "
+            + desktop_secret
+            + " more unrelated filler "
+            + cli_secret
+        )
+
+        assert ag._extract_client_identity_from_strings(blob) is None
 
     def test_fails_clearly_when_no_identity_available(self, monkeypatch):
         from hermes_cli import antigravity_auth as ag
@@ -478,6 +512,116 @@ class TestAuthRegistryWiring:
 # ── Slice 6: full localhost PKCE login flow ──
 
 class TestPKCELogin:
+    def test_agy_118_pairs_client_and_secret_from_disjoint_string_regions(self):
+        """agy 1.1.18 does not lay client IDs and secrets out in parallel order.
+
+        Go sorts its string table by length, so the two compiled-in
+        ``GOCSPX-`` secrets land back-to-back in the 35-character bucket
+        while the two client IDs sit in a completely different region
+        (~565 KB away in the real 1.1.18 binary).  Pairing the two lists by
+        candidate ordinal therefore has no basis: picking client index 1
+        and secret index 1 is a coin flip that silently yields a mismatched
+        client_id/client_secret pair, and Google rejects that exchange.
+
+        The extractor must instead pair by *marker locality* — the secret
+        that actually belongs to the Cloud Code client — and must refuse to
+        guess when it cannot establish that association.
+        """
+        from hermes_cli import antigravity_auth as ag
+
+        desktop_id = "111111111111-" + ("d" * 32) + ".apps.googleusercontent.com"
+        cli_id = "222222222222-" + ("c" * 33) + ".apps.googleusercontent.com"
+        # Secrets adjacent to each other, far from either client id, and in
+        # the OPPOSITE order to the client ids — exactly the 1.1.18 layout.
+        cli_secret = "GOCSPX-" + ("C" * 28)
+        desktop_secret = "GOCSPX-" + ("D" * 28)
+        blob = (
+            "https://auth.cloud.google/authorize"
+            + cli_secret
+            + desktop_secret
+            + "https://cloudcode-pa.googleapis.com"
+            + ("filler padding " * 200)
+            + desktop_id
+            + ("more unrelated padding " * 200)
+            + "Overriding CloudCodeServerURL via CLOUD_CODE_URL environment variable: %q"
+            + cli_id
+        )
+
+        identity = ag._extract_client_identity_from_strings(blob)
+
+        # Index pairing would return desktop_secret here (client ordinal 1 ->
+        # secret ordinal 1). That is the bug.
+        assert identity is not None
+        assert identity["client_id"] == cli_id
+        assert identity["client_secret"] == cli_secret
+        assert identity["source"] == "agy"
+
+    def test_agy_118_refuses_to_guess_when_pairing_is_ambiguous(self):
+        """Never emit a client_id/client_secret pair we cannot justify.
+
+        With several indistinguishable secrets and no marker association,
+        a wrong guess produces an opaque HTTP 401 at token-exchange time.
+        Returning None instead lets ``resolve_client_identity`` raise the
+        actionable "set HERMES_ANTIGRAVITY_CLIENT_ID/SECRET" error.
+        """
+        from hermes_cli import antigravity_auth as ag
+
+        first_id = "111111111111-" + ("d" * 32) + ".apps.googleusercontent.com"
+        second_id = "222222222222-" + ("c" * 33) + ".apps.googleusercontent.com"
+        blob = (
+            first_id
+            + ("filler padding " * 200)
+            + second_id
+            + ("filler padding " * 200)
+            + "GOCSPX-" + ("A" * 28)
+            + "GOCSPX-" + ("B" * 28)
+        )
+
+        assert ag._extract_client_identity_from_strings(blob) is None
+
+    def test_agy_118_login_still_uses_consumer_authorization_code_contract(self, monkeypatch):
+        """The hosted antigravity.google endpoints are NOT the login flow.
+
+        ``https://antigravity.google/oauth/client-metadata.json`` and
+        ``https://antigravity.google/oauth-callback`` belong to agy's *MCP
+        client* (RFC 7591/8414 + client-ID-metadata-document), used when agy
+        connects outward to third-party MCP servers.  ``auth.cloud.google``
+        + ``sts.googleapis.com`` belong to ``wifOAuthMethod``, the separate
+        enterprise workforce-identity login method.
+
+        Hermes implements the consumer ``oauthMethod`` path, which in 1.1.18
+        still uses accounts.google.com + oauth2.googleapis.com/token with a
+        confidential desktop client.  Pin that so a future reader does not
+        "fix" this into the MCP contract again.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        from hermes_cli import antigravity_auth as ag
+
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_CLIENT_ID", "cid-from-env")
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_CLIENT_SECRET", "csec-from-env")
+
+        url = ag.build_authorize_url(
+            redirect_uri="http://127.0.0.1:8765/callback",
+            code_challenge="chal123",
+            state="state123",
+        )
+        parsed = urlparse(url)
+        assert (parsed.scheme, parsed.netloc) == ("https", "accounts.google.com")
+        params = parse_qs(parsed.query)
+        assert params["client_id"] == ["cid-from-env"]
+        assert params["code_challenge_method"] == ["S256"]
+
+        # A hosted https redirect must still be rejected: Hermes owns a
+        # loopback listener and cannot receive antigravity.google's callback.
+        with pytest.raises(ag.AntigravityAuthError) as excinfo:
+            ag.build_authorize_url(
+                redirect_uri="https://antigravity.google/oauth-callback",
+                code_challenge="chal123",
+                state="state123",
+            )
+        assert excinfo.value.code == "antigravity_redirect_invalid"
+
     def test_authorize_url_has_pkce_and_state(self, monkeypatch):
         from hermes_cli import antigravity_auth as ag
 

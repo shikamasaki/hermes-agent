@@ -126,12 +126,87 @@ def redact_state(state: Dict[str, Any]) -> Dict[str, Any]:
 # ── Client identity ──────────────────────────────────────────────────
 
 
+#: Markers emitted near the Cloud Code CLI client id in the ``agy`` binary.
+_CLIENT_ID_MARKERS = ("CLOUD_CODE_URL",)
+
+#: Markers emitted near the Cloud Code CLI client secret. Go's length-sorted
+#: string table keeps these auth-host literals in the secret's neighbourhood,
+#: which is what lets us pair a secret without relying on candidate ordinal.
+_CLIENT_SECRET_MARKERS = (
+    "https://auth.cloud.google/authorize",
+    "https://cloudcode-pa.googleapis.com",
+)
+
+#: How far before/after a candidate we will look for its marker.
+_MARKER_WINDOW_BYTES = 512
+
+#: How many bytes of pure separator (whitespace/newlines) may sit between a
+#: client and a secret for them to still count as "directly adjacent" —
+#: i.e. compiled back-to-back in the binary's string table, not merely in
+#: the same neighbourhood.
+_ADJACENCY_GAP_BYTES = 2
+
+
+def _direct_adjacent_secret(blob: str, client_match, secret_matches):
+    """Return the secret compiled immediately after *client_match*, if any.
+
+    This is the strongest possible evidence of pairing: the two literals
+    are back-to-back in the string table, so there is no room for another
+    client/secret to have been interleaved. Only applied to the *selected*
+    client — never used to pick between competing clients.
+    """
+    for secret_match in secret_matches:
+        gap = secret_match.start() - client_match.end()
+        if 0 <= gap <= _ADJACENCY_GAP_BYTES and not blob[client_match.end():secret_match.start()].strip():
+            return secret_match
+    return None
+
+
+def _select_by_marker(matches, markers, distance_fn):
+    """Pick the candidate closest to any *marker*, or None if none is marked.
+
+    Returning None when nothing is marked is deliberate: it is the signal
+    that locality could not justify a pairing.
+    """
+    scored = []
+    for match in matches:
+        for marker in markers:
+            distance = distance_fn(match, marker, _MARKER_WINDOW_BYTES)
+            if distance is not None:
+                scored.append((distance, match.start(), match))
+    if not scored:
+        return None
+    return min(scored, key=lambda item: (item[0], item[1]))[2]
+
+
 def _extract_client_identity_from_strings(blob: str) -> Optional[Dict[str, str]]:
     """Extract the installed-app identity from non-secret ``agy`` strings.
 
     Google's installed client secrets use a fixed 28-character payload after
     ``GOCSPX-``. Matching that exact shape is important because current agy
     binaries can place two compiled copies directly adjacent to one another.
+
+    Pairing rule
+    ------------
+    Client IDs and secrets must each be located by *evidence* — direct
+    adjacency or a neighbouring marker — never by candidate ordinal. Go
+    sorts its string table by length, so agy's two ``GOCSPX-`` secrets can
+    land back-to-back in the 35-character bucket while the two client IDs
+    live in an unrelated region (~565 KB away in 1.1.18). The two lists
+    therefore share no ordering, and index pairing can silently yield a
+    mismatched client_id/client_secret whose token exchange Google rejects
+    with an opaque HTTP 401.
+
+    Once the client is selected (by its ``CLOUD_CODE_URL`` marker, or as
+    the sole candidate), the secret is chosen in this order:
+
+    1. A secret compiled directly adjacent to the selected client — the
+       strongest possible evidence, since nothing could be interleaved.
+    2. A secret located by its own auth/cloudcode marker locality.
+    3. A single unambiguous secret candidate.
+
+    When none of these establish a pairing, we return None so the caller
+    can raise actionable guidance instead of guessing.
     """
     client_matches = list(
         re.finditer(
@@ -145,25 +220,34 @@ def _extract_client_identity_from_strings(blob: str) -> Optional[Dict[str, str]]
     if not client_matches or not secret_matches:
         return None
 
-    # The agy binary currently contains both desktop and CLI OAuth clients.
-    # The CLI client is emitted next to its Cloud Code server override marker;
-    # prefer that local association rather than assuming the first client ID.
-    marker = "CLOUD_CODE_URL"
-    marked_clients = []
-    for index, match in enumerate(client_matches):
-        marker_pos = blob.rfind(marker, max(0, match.start() - 512), match.start())
-        if marker_pos >= 0:
-            marked_clients.append((match.start() - marker_pos, index, match))
-    if marked_clients:
-        _, client_index, client_match = min(
-            marked_clients, key=lambda item: item[0]
-        )
-    else:
-        client_index, client_match = 0, client_matches[0]
+    def _nearest_preceding(match: "re.Match[str]", marker: str, window: int) -> Optional[int]:
+        """Distance from *marker* to *match*, or None when absent."""
+        pos = blob.rfind(marker, max(0, match.start() - window), match.start())
+        return None if pos < 0 else match.start() - pos
 
-    if client_index >= len(secret_matches):
-        return None
-    secret_match = secret_matches[client_index]
+    # The agy binary contains both the desktop and the Cloud Code CLI OAuth
+    # client. The CLI client is emitted next to its Cloud Code server
+    # override marker; prefer that local association.
+    client_match = _select_by_marker(client_matches, _CLIENT_ID_MARKERS, _nearest_preceding)
+    if client_match is None:
+        if len(client_matches) > 1:
+            # Two indistinguishable clients and no marker: guessing risks
+            # pairing the wrong tenant. Fail loudly instead.
+            return None
+        client_match = client_matches[0]
+
+    # Strongest evidence first: a secret compiled directly next to the
+    # selected client needs no marker to justify the pairing.
+    secret_match = _direct_adjacent_secret(blob, client_match, secret_matches)
+    if secret_match is None:
+        # Otherwise the CLI secret is emitted next to its own Cloud Code
+        # auth-host markers.
+        secret_match = _select_by_marker(secret_matches, _CLIENT_SECRET_MARKERS, _nearest_preceding)
+    if secret_match is None:
+        if len(secret_matches) > 1:
+            return None
+        secret_match = secret_matches[0]
+
     return {
         "client_id": client_match.group(1),
         "client_secret": secret_match.group(1),
