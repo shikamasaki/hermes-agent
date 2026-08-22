@@ -1538,3 +1538,280 @@ class TestCodeAssistStreamingClient:
         finish = next(c for c in chunks if c.choices[0].finish_reason)
         assert finish.choices[0].finish_reason == "tool_calls"
         assert finish.usage.prompt_tokens == 7
+
+
+class TestQuotaSummaryParsing:
+    """Normalization of ``:retrieveUserQuotaSummary`` payloads (PR2).
+
+    Every assertion here is on the *normalized* output: the parser must never
+    carry account identity, description text, or raw payload fragments through.
+    """
+
+    def test_parses_grouped_weekly_and_five_hour_windows(self):
+        from agent.gemini_cloudcode_adapter import parse_quota_summary
+
+        payload = {
+            "groups": [
+                {
+                    "displayName": "user@example.com must never escape",
+                    "description": "private description",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "displayName": "account@example.com weekly",
+                            "remainingFraction": 0.62,
+                            "resetTime": "2026-08-25T09:00:00Z",
+                            "window": "weekly",
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "remainingFraction": 0.25,
+                            "resetTime": "2026-08-22T14:30:00Z",
+                            "window": "5h",
+                        },
+                    ],
+                },
+            ],
+            # Top-level entries can contain both grouped duplicates and
+            # distinct pools.  Combine both sources and deduplicate by ID.
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "remainingFraction": 0.62,
+                    "window": "weekly",
+                },
+                {
+                    "bucketId": "3p-weekly",
+                    "displayName": "arbitrary provider text",
+                    "remainingFraction": 0.9,
+                    "resetTime": "2026-08-29T09:00:00Z",
+                    "window": "weekly",
+                },
+                {
+                    "bucketId": "3p-5h",
+                    "remainingFraction": 0.4,
+                    "resetTime": "2026-08-22T15:00:00Z",
+                    "window": "5h",
+                },
+            ],
+        }
+
+        windows = parse_quota_summary(payload)
+
+        assert [(w.label, w.used_percent) for w in windows] == [
+            ("Gemini Models (weekly)", pytest.approx(38.0)),
+            ("Gemini Models (5h)", pytest.approx(75.0)),
+            ("Claude and GPT models (weekly)", pytest.approx(10.0)),
+            ("Claude and GPT models (5h)", pytest.approx(60.0)),
+        ]
+        blob = " ".join(f"{w.label} {w.detail or ''}" for w in windows)
+        assert "example.com" not in blob
+        assert "private description" not in blob
+
+    def test_clamps_fractions_and_skips_malformed_buckets(self):
+        from agent.gemini_cloudcode_adapter import parse_quota_summary
+
+        payload = {
+            "buckets": [
+                {"bucketId": "gemini-weekly", "remainingFraction": 1.4},
+                {"bucketId": "gemini-5h", "remainingFraction": -0.5},
+                {"bucketId": "3p-weekly", "remainingFraction": float("nan")},
+                {"bucketId": "3p-weekly", "remainingFraction": 10**1000},
+                {"bucketId": "3p-weekly", "remainingFraction": 0.5},
+                {"bucketId": "3p-5h", "remainingFraction": "0.5"},
+                {"bucketId": "3p-5h", "remainingFraction": True},
+                {"bucketId": "3p-5h", "remainingAmount": "500"},
+                {"bucketId": "future-daily", "remainingFraction": 0.5},
+                {
+                    "bucketId": "3p-5h",
+                    "remainingFraction": 0.5,
+                    "disabled": True,
+                },
+                "not-a-bucket",
+                {"remainingFraction": 0.5},
+            ]
+        }
+
+        windows = parse_quota_summary(payload)
+
+        assert [(w.label, w.used_percent) for w in windows] == [
+            ("Gemini Models (weekly)", 0.0),
+            ("Gemini Models (5h)", 100.0),
+            ("Claude and GPT models (weekly)", 50.0),
+        ]
+
+    def test_preserves_reset_timestamps_without_identity_leakage(self):
+        from agent.gemini_cloudcode_adapter import parse_quota_summary
+
+        payload = {
+            "groups": [
+                {
+                    "displayName": "user@example.com",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "remainingFraction": 0.5,
+                            "resetTime": 10**100,
+                            "userEmail": "user@example.com",
+                            "description": "secret description",
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "remainingFraction": 0.4,
+                            "resetTime": "2026-08-25T09:00:00Z",
+                        },
+                    ],
+                }
+            ]
+        }
+
+        windows = parse_quota_summary(payload)
+
+        assert len(windows) == 2
+        assert windows[0].reset_at is None
+        assert windows[1].reset_at is not None
+        assert "example.com" not in repr(windows)
+        assert "secret description" not in repr(windows)
+
+    def test_unsupported_payloads_return_no_windows(self):
+        from agent.gemini_cloudcode_adapter import parse_quota_summary
+
+        assert parse_quota_summary(None) == []
+        assert parse_quota_summary({}) == []
+        assert parse_quota_summary({"quotaBuckets": "nope"}) == []
+        assert parse_quota_summary([1, 2, 3]) == []
+
+
+class TestQuotaSummaryFetch:
+    """The ``:retrieveUserQuotaSummary`` HTTP contract (PR2)."""
+
+    def test_posts_to_quota_summary_endpoint_with_project_only(self):
+        import json as _json
+
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import (
+            CODE_ASSIST_BASE_URL,
+            fetch_quota_summary,
+        )
+
+        captured = {}
+
+        def handler(request):
+            captured["url"] = str(request.url)
+            captured["method"] = request.method
+            captured["body"] = _json.loads(request.read().decode())
+            captured["auth"] = request.headers.get("authorization")
+            return httpx.Response(
+                200,
+                json={
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "remainingFraction": 0.8,
+                            "window": "weekly",
+                            "resetTime": "2026-08-25T09:00:00Z",
+                        }
+                    ]
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            windows = fetch_quota_summary(
+                access_token="tok-abc",
+                project="proj-1",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=client,
+            )
+
+        assert captured["method"] == "POST"
+        assert captured["url"] == f"{CODE_ASSIST_BASE_URL}:retrieveUserQuotaSummary"
+        # Request carries the already-resolved project ONLY — no identity.
+        assert captured["body"] == {"project": "proj-1"}
+        assert captured["auth"] == "Bearer tok-abc"
+        # ...and only normalized quota data comes back.
+        assert [(w.label, w.used_percent) for w in windows] == [
+            ("Gemini Models (weekly)", pytest.approx(20.0))
+        ]
+
+    def test_http_error_fails_closed_without_body_leakage(self, caplog):
+        import logging
+
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import (
+            CODE_ASSIST_BASE_URL,
+            fetch_quota_summary,
+        )
+
+        def handler(request):
+            return httpx.Response(403, json={"error": "user@example.com is not entitled"})
+
+        with caplog.at_level(logging.DEBUG):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                windows = fetch_quota_summary(
+                    access_token="tok-abc",
+                    project="proj-1",
+                    base_url=CODE_ASSIST_BASE_URL,
+                    http_client=client,
+                )
+
+        assert windows is None
+        assert "example.com" not in caplog.text
+        assert "not entitled" not in caplog.text
+
+    def test_malformed_json_fails_closed(self, caplog):
+        import logging
+
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import (
+            CODE_ASSIST_BASE_URL,
+            fetch_quota_summary,
+        )
+
+        def handler(request):
+            return httpx.Response(200, content=b"user@example.com <<not json>>")
+
+        with caplog.at_level(logging.DEBUG):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                windows = fetch_quota_summary(
+                    access_token="tok-abc",
+                    project="proj-1",
+                    base_url=CODE_ASSIST_BASE_URL,
+                    http_client=client,
+                )
+
+        assert windows is None
+        assert "example.com" not in caplog.text
+
+    def test_missing_token_or_project_makes_no_request(self):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import (
+            CODE_ASSIST_BASE_URL,
+            fetch_quota_summary,
+        )
+
+        def handler(request):
+            raise AssertionError("must not call the control plane without credentials")
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            assert (
+                fetch_quota_summary(
+                    access_token="",
+                    project="proj-1",
+                    base_url=CODE_ASSIST_BASE_URL,
+                    http_client=client,
+                )
+                is None
+            )
+            assert (
+                fetch_quota_summary(
+                    access_token="tok-abc",
+                    project=None,
+                    base_url=CODE_ASSIST_BASE_URL,
+                    http_client=client,
+                )
+                is None
+            )

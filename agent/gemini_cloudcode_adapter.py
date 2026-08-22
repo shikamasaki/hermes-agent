@@ -286,6 +286,182 @@ def discover_entitled_models(
     return models or None
 
 
+# ── Account quota summary (``/usage``) ────────────────────────────────
+#
+# The Code Assist control plane exposes the subscription's remaining quota via
+# ``POST {base}:retrieveUserQuotaSummary``. The request carries the resolved
+# project only — no account identity is sent, and none is read back out: the
+# normalizer below keeps *only* the group/model label, the window kind, the
+# remaining fraction, and the reset timestamp. Description strings, emails,
+# and any other free-text the service may attach are dropped on the floor
+# rather than filtered later, so they can never reach a snapshot or a log line.
+
+# The summary RPC currently defines exactly four baseline pools.  Use static
+# labels rather than provider-supplied display text so account identifiers or
+# arbitrary descriptions can never enter `/usage` output.  Unknown future
+# bucket IDs fail closed until their semantics are reviewed.
+_QUOTA_BUCKET_SPECS = {
+    "gemini-5h": ("Gemini Models", "5h"),
+    "gemini-weekly": ("Gemini Models", "weekly"),
+    "3p-5h": ("Claude and GPT models", "5h"),
+    "3p-weekly": ("Claude and GPT models", "weekly"),
+}
+
+
+def _quota_bucket_id(bucket: Dict[str, Any]) -> Optional[str]:
+    value = str(bucket.get("bucketId") or bucket.get("bucket_id") or "").strip()
+    return value or None
+
+
+def _quota_remaining_fraction(bucket: Dict[str, Any]) -> Optional[float]:
+    """Return a clamped [0,1] remaining fraction, or None when unusable.
+
+    Fails closed: a missing, non-numeric, boolean, or non-finite value yields
+    None so the caller skips the bucket rather than fabricating "unlimited"
+    (1.0) or "exhausted" (0.0) quota.
+    """
+    for key in ("remainingFraction", "remaining_fraction"):
+        if key not in bucket:
+            continue
+        value = bucket.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return max(0.0, min(1.0, value))
+    return None
+
+
+def _iter_quota_buckets(payload: Dict[str, Any]):
+    """Yield bucket dictionaries from grouped and top-level response shapes."""
+    for key in ("quotaGroups", "quota_groups", "groups"):
+        groups = payload.get(key)
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for bucket_key in ("quotaBuckets", "quota_buckets", "buckets"):
+                buckets = group.get(bucket_key)
+                if isinstance(buckets, list):
+                    for bucket in buckets:
+                        if isinstance(bucket, dict):
+                            yield bucket
+
+    # Top-level buckets may repeat grouped entries or carry distinct pools.
+    # The caller combines both sources and deduplicates by the contract's
+    # stable bucket ID.
+    for key in ("quotaBuckets", "quota_buckets", "buckets"):
+        buckets = payload.get(key)
+        if isinstance(buckets, list):
+            for bucket in buckets:
+                if isinstance(bucket, dict):
+                    yield bucket
+
+
+def parse_quota_summary(payload: Any) -> List[Any]:
+    """Normalize a quota-summary payload into ``AccountUsageWindow`` values.
+
+    Only the four reviewed baseline bucket IDs are accepted.  Amount-only
+    buckets intentionally remain unavailable: the wire contract supplies no
+    denominator from which a truthful percentage could be derived.
+    """
+    from agent.account_usage import AccountUsageWindow
+
+    if not isinstance(payload, dict):
+        return []
+
+    windows: List[Any] = []
+    seen: set[str] = set()
+    for bucket in _iter_quota_buckets(payload):
+        if bucket.get("disabled") is True:
+            continue
+        bucket_id = _quota_bucket_id(bucket)
+        if not bucket_id or bucket_id not in _QUOTA_BUCKET_SPECS or bucket_id in seen:
+            continue
+        remaining = _quota_remaining_fraction(bucket)
+        if remaining is None:
+            continue
+        seen.add(bucket_id)
+        pool_label, period_label = _QUOTA_BUCKET_SPECS[bucket_id]
+        reset_at = None
+        for key in ("resetTime", "reset_time", "resetAt", "reset_at"):
+            if key in bucket:
+                reset_at = _parse_quota_reset(bucket.get(key))
+                if reset_at is not None:
+                    break
+        windows.append(
+            AccountUsageWindow(
+                label=f"{pool_label} ({period_label})",
+                used_percent=max(0.0, min(100.0, (1.0 - remaining) * 100.0)),
+                reset_at=reset_at,
+            )
+        )
+    return windows
+
+
+def _parse_quota_reset(value: Any) -> Any:
+    """Parse one reset timestamp without invalidating sibling buckets."""
+    from agent.account_usage import _parse_dt
+
+    try:
+        return _parse_dt(value)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def fetch_quota_summary(
+    *,
+    access_token: str,
+    project: Optional[str],
+    base_url: str = CODE_ASSIST_BASE_URL,
+    timeout: float = 8.0,
+    http_client: Any = None,
+) -> Optional[List[Any]]:
+    """Fetch and normalize the subscription's quota summary.
+
+    Returns the normalized windows, or None when the summary is unavailable
+    (no credentials, HTTP error, malformed body, unsupported shape). Fails
+    closed on purpose: an empty list would read as "quota data, and it's
+    empty", while None lets ``/usage`` say the block is simply unavailable.
+
+    The token and project live only in the in-flight request; neither they nor
+    any part of the response body appear in logs or exceptions.
+    """
+    token = str(access_token or "").strip()
+    resolved_project = str(project or "").strip()
+    if not token or not resolved_project:
+        return None
+
+    import httpx
+
+    client = http_client or httpx
+    url = f"{str(base_url or CODE_ASSIST_BASE_URL).rstrip('/')}:retrieveUserQuotaSummary"
+    try:
+        response = client.post(
+            url,
+            headers=build_antigravity_headers(token),
+            json={"project": resolved_project},
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            logger.debug("retrieveUserQuotaSummary failed: HTTP %s", response.status_code)
+            return None
+        payload = response.json()
+    except Exception as exc:
+        # Type name only — an httpx error repr can carry the request URL and
+        # a JSON decode error can carry a slice of the response body.
+        logger.debug("retrieveUserQuotaSummary error: %s", type(exc).__name__)
+        return None
+
+    windows = parse_quota_summary(payload)
+    return windows or None
+
+
 def _safe_code_assist_http_error(response: Any) -> Exception:
     """Return a retry-classifiable error without retaining provider payloads."""
     from agent.gemini_native_adapter import GeminiAPIError
@@ -437,9 +613,11 @@ __all__ = [
     "CODE_ASSIST_BASE_URL",
     "CodeAssistClient",
     "discover_entitled_models",
+    "fetch_quota_summary",
     "build_code_assist_request",
     "build_gemini_request",
     "parse_entitled_models",
+    "parse_quota_summary",
     "translate_code_assist_response",
     "translate_code_assist_stream_event",
     "unwrap_code_assist_response",

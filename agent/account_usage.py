@@ -881,6 +881,86 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+# ── Google Antigravity (Code Assist subscription quota) ──────────────────────
+
+
+def _resolve_antigravity_usage_credentials() -> tuple[str, Optional[str], str]:
+    """Return ``(token, project, base_url)`` from the existing OAuth runtime.
+
+    Reuses the same resolver the agent runtime uses, so ``/usage`` reports the
+    account that actually serves requests. The token stays in memory — it is
+    only handed to the quota fetch below and never logged or persisted here.
+    Raises when the user is not signed in (the caller fails open).
+    """
+    from hermes_cli.antigravity_auth import resolve_antigravity_runtime_credentials
+
+    creds = resolve_antigravity_runtime_credentials()
+    token = str(creds.get("api_key", "") or "").strip()
+    project = str(creds.get("project_id", "") or "").strip() or None
+    base_url = str(creds.get("base_url", "") or "").strip()
+    return token, project, base_url
+
+
+def _antigravity_fetch_quota_summary(**kwargs: Any) -> Optional[list[AccountUsageWindow]]:
+    """Indirection seam over the adapter's quota fetch (mocked in tests)."""
+    from agent.gemini_cloudcode_adapter import fetch_quota_summary
+
+    return fetch_quota_summary(**kwargs)
+
+
+def _fetch_antigravity_account_usage() -> Optional[AccountUsageSnapshot]:
+    """Build the ``/usage`` snapshot for the Google Antigravity subscription.
+
+    The project is resolved first (explicitly stored, else discovered via the
+    same ``:loadCodeAssist`` path the transport uses) because
+    ``:retrieveUserQuotaSummary`` requires it. When the summary is
+    unavailable — unsupported plan, control-plane error, malformed body — the
+    snapshot reports "unavailable" rather than fabricating full or empty
+    quota.
+    """
+    from agent.gemini_cloudcode_adapter import (
+        CODE_ASSIST_BASE_URL,
+        resolve_project_context,
+    )
+
+    token, project, base_url = _resolve_antigravity_usage_credentials()
+    if not token:
+        return None
+    base_url = base_url or CODE_ASSIST_BASE_URL
+
+    if not project:
+        project = resolve_project_context(
+            access_token=token,
+            configured_project=None,
+            base_url=base_url,
+        )
+
+    windows = None
+    if project:
+        windows = _antigravity_fetch_quota_summary(
+            access_token=token,
+            project=project,
+            base_url=base_url,
+            timeout=10.0,
+        )
+
+    if not windows:
+        return AccountUsageSnapshot(
+            provider="google-antigravity",
+            source="quota_summary",
+            fetched_at=_utc_now(),
+            unavailable_reason=(
+                "Antigravity quota summary is unavailable for this account."
+            ),
+        )
+    return AccountUsageSnapshot(
+        provider="google-antigravity",
+        source="quota_summary",
+        fetched_at=_utc_now(),
+        windows=tuple(windows),
+    )
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -897,6 +977,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized in {"google-antigravity", "antigravity", "agy", "google-agy"}:
+            return _fetch_antigravity_account_usage()
     except Exception:
         return None
     return None
