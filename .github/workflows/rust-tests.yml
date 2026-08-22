@@ -27,7 +27,9 @@ concurrency:
 jobs:
   bootstrap-installer:
     name: cargo test (bootstrap installer)
-    runs-on: ubuntu-latest
+    # cargo parallelizes codegen units and test binaries across cores, and
+    # this lane builds the crate from scratch whenever Cargo.toml changes.
+    runs-on: ubuntu-latest-32-core
     timeout-minutes: 30
     defaults:
       run:

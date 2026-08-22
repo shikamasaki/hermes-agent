@@ -6,7 +6,7 @@ on:
       slice_count:
         description: Number of parallel test slices
         type: number
-        default: 8
+        default: 3
 
 permissions:
   contents: read
@@ -48,7 +48,11 @@ jobs:
   test:
     name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
     needs: generate
-    runs-on: ubuntu-latest
+    # 32-core larger runner. The slice count above is tuned to it: three
+    # slices reach the floor set by the slowest single test file (~82s), so a
+    # fourth buys nothing, and one slice alone is less aggregate compute than
+    # the twelve 4-core runners this replaced.
+    runs-on: ubuntu-latest-32-core
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -131,6 +135,12 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
+          # 1.5x cores, not the runner's own cpu_count*2 default (64 here).
+          # Measured locally: at 1x cores the same file set cost 15% more
+          # total CPU-wall than at 0.5x for no wall-clock gain, so the
+          # default oversubscribes a machine this size. Tune from the
+          # per-slice duration artifacts.
+          HERMES_TEST_WORKERS: 48
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

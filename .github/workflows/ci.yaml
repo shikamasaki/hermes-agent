@@ -73,7 +73,7 @@ jobs:
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
     with:
-      slice_count: 12
+      slice_count: 3
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
