@@ -1619,6 +1619,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_provider_project_id: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1968,6 +1969,7 @@ def _build_child_agent(
                 model=effective_model,
                 provider=effective_provider,
                 api_mode=effective_api_mode,
+                provider_project_id=override_provider_project_id,
                 acp_command=effective_acp_command,
                 acp_args=effective_acp_args,
                 max_iterations=max_iterations,
@@ -3892,6 +3894,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 override_request_overrides=creds.get("request_overrides"),
                 override_max_tokens=creds.get("max_output_tokens"),
+                override_provider_project_id=creds.get("provider_project_id"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
@@ -4588,6 +4591,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
+        "provider_project_id": runtime.get("project_id"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }

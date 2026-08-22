@@ -824,6 +824,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_nous,
     _model_flow_openai_codex,
     _model_flow_xai_oauth,
+    _model_flow_antigravity,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
     _model_flow_custom,
@@ -3978,6 +3979,8 @@ def select_provider_and_model(args=None):
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "xai-oauth":
         _model_flow_xai_oauth(config, current_model, args=args)
+    elif selected_provider == "google-antigravity":
+        _model_flow_antigravity(config, current_model, args=args)
     elif selected_provider == "qwen-oauth":
         _model_flow_qwen_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
