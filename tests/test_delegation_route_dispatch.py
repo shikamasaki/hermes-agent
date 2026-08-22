@@ -236,6 +236,7 @@ class TestChildIsolation:
         assert metadata == {
             "id": "route-a-standard",
             "provider": "provider-a",
+            "backend": "native",
             "model": "model-a-advanced",
             "model_class": "advanced",
             "difficulty": "standard",

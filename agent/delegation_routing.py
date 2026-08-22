@@ -17,10 +17,9 @@ owns the two halves of that contract:
   Cached usage is supplied by :mod:`agent.delegation_usage_cache`, which
   refreshes out of band.
 
-Only native backends are routable in this revision.  The catalog deliberately
-does not keep a fixed provider allowlist: any non-empty provider slug may be
-configured, while runtime availability and credential resolution remain the
-responsibility of the trusted adapter layer.
+Two backends are routable: provider-agnostic ``native`` routes resolved by
+the trusted runtime adapter layer, and the local-only ``claude-p`` subscription
+backend. Arbitrary CLI-shelling backends remain unsupported.
 """
 
 from __future__ import annotations
@@ -33,6 +32,10 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 __all__ = [
     "BUILTIN_CAPABILITIES",
+    "CLAUDE_P_BACKEND",
+    "CLAUDE_P_TOOL_PROFILES",
+
+    "ROUTABLE_BACKENDS",
     "DelegationRoute",
     "ModelClass",
     "ProviderUsage",
@@ -97,14 +100,34 @@ BUILTIN_CAPABILITIES: tuple[str, ...] = (
 
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
+#: The single external-CLI backend this PR supports: Claude Code print mode
+#: (``claude -p``), used only to consume a Claude Pro/Max subscription. Its
+#: provider slug is fixed and does not belong to ``NATIVE_ROUTABLE_PROVIDERS``
+#: — it is never dispatched through the native in-process agent path.
+CLAUDE_P_BACKEND = "claude-p"
+CLAUDE_P_PROVIDER = "claude-p"
 
-def _parse_provider_slug(value: Any, *, where: str) -> str:
-    provider = _require_str({"provider": value}, "provider", where=where).lower()
-    if not _PROVIDER_SLUG_RE.fullmatch(provider):
-        raise RouteConfigError(
-            f"{where}: 'provider' must be a non-empty machine slug"
-        )
-    return provider
+#: Backends a route may declare. ``native`` dispatches through the in-process
+#: AIAgent path; ``claude-p`` shells out to the ``claude`` CLI. No other
+#: backend string is ever accepted.
+ROUTABLE_BACKENDS: frozenset[str] = frozenset({"native", CLAUDE_P_BACKEND})
+
+#: Fixed, least-privilege tool profiles a ``claude-p`` route may select via
+#: its ``tool_profile`` field. Never an arbitrary CLI/tool string.
+CLAUDE_P_TOOL_PROFILES: frozenset[str] = frozenset({"default", "read_only", "review", "coding"})
+DEFAULT_CLAUDE_P_TOOL_PROFILE = "read_only"
+
+#: Bounded defaults/ceilings for a claude-p child. The ceilings are hard: a
+#: route asking for more is clamped, never trusted, so a config typo cannot
+#: hand an external CLI an unbounded turn/spend/wall-clock budget.
+DEFAULT_CLAUDE_P_MAX_TURNS = 40
+MAX_CLAUDE_P_MAX_TURNS = 200
+DEFAULT_CLAUDE_P_MAX_BUDGET_USD = 5.0
+MAX_CLAUDE_P_MAX_BUDGET_USD = 50.0
+DEFAULT_CLAUDE_P_TIMEOUT_SECONDS = 900
+MAX_CLAUDE_P_TIMEOUT_SECONDS = 3600
+DEFAULT_CLAUDE_P_COOLDOWN_SECONDS = 60
+MAX_CLAUDE_P_COOLDOWN_SECONDS = 3600
 
 #: Policies for a route whose usage is unknown or expired.  ``fixed_priority``
 #: keeps the route eligible at its configured priority — never treating the
@@ -127,12 +150,33 @@ class DelegationRoute:
     task_difficulties: tuple[TaskDifficulty, ...]
     capabilities: frozenset[str] = frozenset()
     priority: int = 100
-    # Generic preference group: lower tiers rank before usage and priority.
-    preference_tier: int = 0
     reserve_remaining_percent: float = 0.0
     usage_window_prefixes: tuple[str, ...] = ()
     backend: str = "native"
+    #: Task-side (``delegate_task``) preference tier. Lower wins, ranked
+    #: BEFORE remaining-usage/priority; default 0 keeps every existing route
+    #: config byte-for-byte backward compatible. Main orchestrator routing
+    #: (``agent.orchestrator_usage_routing``) does not read this field.
+    preference_tier: int = 0
+    #: Only meaningful for ``backend == "claude-p"``: which fixed, least-
+    #: privilege tool allowlist the child CLI is launched with. Defaults to
+    #: read-only; ``coding`` must be opted into explicitly in route config.
+    tool_profile: str = "read_only"
+    #: Bounded execution limits for the claude-p child process.
+    max_turns: Optional[int] = 40
+    max_budget_usd: Optional[float] = 5.0
+    timeout_seconds: int = 900
+    cooldown_seconds: int = 60
     enabled: bool = True
+
+    @property
+    def is_claude_p(self) -> bool:
+        return self.backend == CLAUDE_P_BACKEND
+
+    @property
+    def write_capable(self) -> bool:
+        """True when this route's tool profile can modify the workdir."""
+        return self.is_claude_p and self.tool_profile in {"coding", "default"}
 
 
 @dataclass(frozen=True)
@@ -157,6 +201,15 @@ def _require_str(raw: Mapping[str, Any], key: str, *, where: str) -> str:
     if not value:
         raise RouteConfigError(f"{where}: '{key}' is required and must be a non-empty string")
     return value
+
+
+def _parse_provider_slug(value: Any, *, where: str) -> str:
+    provider = _require_str({"provider": value}, "provider", where=where).lower()
+    if not _PROVIDER_SLUG_RE.fullmatch(provider):
+        raise RouteConfigError(
+            f"{where}: 'provider' must be a non-empty machine slug"
+        )
+    return provider
 
 
 def _parse_model_class(value: Any, *, where: str) -> ModelClass:
@@ -233,18 +286,49 @@ def _parse_int(raw: Any, key: str, *, where: str, default: int, minimum: int = 0
     return value
 
 
-def _parse_strict_nonnegative_int(
-    raw: Any, key: str, *, where: str, default: int = 0
-) -> int:
+def _parse_strict_nonnegative_int(raw: Any, key: str, *, where: str, default: int = 0) -> int:
+    """Parse a strict nonnegative integer: no bool, no float truncation, no numeric strings.
+
+    Unlike :func:`_parse_int` (which accepts anything ``int()`` coerces, so
+    ``True`` and ``1.5`` would silently become ``1``), this rejects any value
+    that is not already exactly an ``int``. A preference tier controls which
+    provider gets picked first, so a config typo like ``"1"`` or ``1.5`` must
+    fail loudly rather than silently coerce.
+    """
     if raw is None:
         return default
     if isinstance(raw, bool) or not isinstance(raw, int):
-        raise RouteConfigError(
-            f"{where}: '{key}'={raw!r} must be a nonnegative integer"
-        )
+        raise RouteConfigError(f"{where}: '{key}'={raw!r} must be a nonnegative integer")
     if raw < 0:
         raise RouteConfigError(f"{where}: '{key}'={raw!r} must be >= 0")
     return raw
+
+
+def _parse_bounded_int(
+    raw: Any, key: str, *, where: str, default: int, ceiling: int, minimum: int = 1
+) -> int:
+    """Parse an integer and clamp it into ``[minimum, ceiling]``.
+
+    Clamping rather than rejecting keeps a slightly-too-large config working
+    while guaranteeing the external CLI can never be handed an unbounded
+    budget.
+    """
+    value = _parse_int(raw, key, where=where, default=default, minimum=minimum)
+    return min(ceiling, value)
+
+
+def _parse_bounded_float(
+    raw: Any, key: str, *, where: str, default: float, ceiling: float, minimum: float
+) -> float:
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise RouteConfigError(f"{where}: '{key}' must be a number") from None
+    if not math.isfinite(value) or value < minimum:
+        raise RouteConfigError(f"{where}: '{key}'={raw!r} must be >= {minimum}")
+    return min(ceiling, value)
 
 
 def _parse_route(raw: Any, index: int) -> DelegationRoute:
@@ -254,23 +338,53 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
 
     route_id = _require_str(raw, "id", where=where)
     if not _PROVIDER_SLUG_RE.fullmatch(route_id):
-        raise RouteConfigError(
-            f"{where}: 'id' must be a non-empty machine slug"
-        )
+        raise RouteConfigError(f"{where}: 'id' must be a non-empty machine slug")
     where = f"delegation.routes[{index}] (id={route_id!r})"
 
     backend = str(raw.get("backend") or "native").strip().lower()
-    if backend != "native":
+    if backend not in ROUTABLE_BACKENDS:
+        supported = ", ".join(sorted(ROUTABLE_BACKENDS))
         raise RouteConfigError(
-            f"{where}: unsupported 'backend' {backend!r}; only 'native' is routable "
-            f"(CLI-shelling backends are not supported)"
+            f"{where}: unsupported 'backend' {backend!r} (supported: {supported}). "
+            f"Arbitrary CLI-shelling backends are not routable."
         )
 
     provider = _parse_provider_slug(raw.get("provider"), where=where)
+    tool_profile = DEFAULT_CLAUDE_P_TOOL_PROFILE
+    if backend == CLAUDE_P_BACKEND:
+        # The claude-p backend has exactly one provider slug: it always runs
+        # the local `claude` CLI against the operator's subscription. Naming a
+        # native provider here would silently redirect subscription work onto
+        # API billing, so it is a loud config error.
+        if provider != CLAUDE_P_PROVIDER:
+            raise RouteConfigError(
+                f"{where}: backend 'claude-p' requires provider 'claude-p' "
+                f"(got {provider!r}); it never substitutes an API-key provider."
+            )
+        tool_profile = str(
+            raw.get("tool_profile") or DEFAULT_CLAUDE_P_TOOL_PROFILE
+        ).strip().lower()
+        if tool_profile not in CLAUDE_P_TOOL_PROFILES:
+            valid = ", ".join(sorted(CLAUDE_P_TOOL_PROFILES))
+            raise RouteConfigError(
+                f"{where}: unknown 'tool_profile' {raw.get('tool_profile')!r} "
+                f"(expected one of: {valid})"
+            )
+    elif raw.get("tool_profile") is not None:
+        raise RouteConfigError(
+            f"{where}: 'tool_profile' only applies to backend 'claude-p'"
+        )
 
     window_prefixes_raw = raw.get("usage_window_prefixes") or ()
     if isinstance(window_prefixes_raw, str) or not isinstance(window_prefixes_raw, Iterable):
         raise RouteConfigError(f"{where}: 'usage_window_prefixes' must be a list of strings")
+
+    capabilities = _parse_capabilities(raw.get("capabilities"), where=where)
+    if backend == CLAUDE_P_BACKEND and "coding" in capabilities and tool_profile not in {"coding", "default"}:
+        raise RouteConfigError(
+            f"{where}: capability 'coding' requires tool_profile 'coding' or 'default'; "
+            f"profile {tool_profile!r} cannot edit files"
+        )
 
     return DelegationRoute(
         id=route_id,
@@ -278,7 +392,7 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
         model=_require_str(raw, "model", where=where),
         model_class=_parse_model_class(raw.get("model_class"), where=where),
         task_difficulties=_parse_difficulties(raw.get("task_difficulties"), where=where),
-        capabilities=_parse_capabilities(raw.get("capabilities"), where=where),
+        capabilities=capabilities,
         priority=_parse_int(raw.get("priority"), "priority", where=where, default=100),
         preference_tier=_parse_strict_nonnegative_int(
             raw.get("preference_tier"), "preference_tier", where=where, default=0
@@ -290,6 +404,30 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
             str(p).strip() for p in window_prefixes_raw if str(p).strip()
         ),
         backend=backend,
+        tool_profile=tool_profile,
+        max_turns=_parse_bounded_int(
+            raw.get("max_turns"), "max_turns", where=where,
+            default=DEFAULT_CLAUDE_P_MAX_TURNS, ceiling=MAX_CLAUDE_P_MAX_TURNS,
+        ),
+        max_budget_usd=(
+            None
+            if backend == CLAUDE_P_BACKEND and tool_profile == "default" and raw.get("max_budget_usd") is None
+            else _parse_bounded_float(
+                raw.get("max_budget_usd"), "max_budget_usd", where=where,
+                default=DEFAULT_CLAUDE_P_MAX_BUDGET_USD,
+                ceiling=MAX_CLAUDE_P_MAX_BUDGET_USD, minimum=0.01,
+            )
+        ),
+        timeout_seconds=_parse_bounded_int(
+            raw.get("timeout_seconds"), "timeout_seconds", where=where,
+            default=DEFAULT_CLAUDE_P_TIMEOUT_SECONDS,
+            ceiling=MAX_CLAUDE_P_TIMEOUT_SECONDS,
+        ),
+        cooldown_seconds=_parse_bounded_int(
+            raw.get("cooldown_seconds"), "cooldown_seconds", where=where,
+            default=DEFAULT_CLAUDE_P_COOLDOWN_SECONDS,
+            ceiling=MAX_CLAUDE_P_COOLDOWN_SECONDS,
+        ),
         enabled=bool(raw.get("enabled", True)),
     )
 
@@ -406,8 +544,9 @@ class UsageView:
 
     def for_route(self, route: "DelegationRoute") -> ProviderUsage:
         # Route-scoped readings take precedence because one provider account
-        # may expose independent pools.  Provider-keyed entries remain
-        # supported for simple callers and backward-compatible tests.
+        # may expose independent pools (for example Antigravity Gemini versus
+        # Claude/GPT buckets).  Provider-keyed entries remain supported for
+        # simple callers and backward-compatible tests.
         found = self.entries.get(route.id) or self.entries.get(route.provider)
         if found is None:
             return ProviderUsage(provider=route.provider)
@@ -465,14 +604,20 @@ def _matches_request(
     available_providers: frozenset[str],
     *,
     check_difficulty: bool = True,
+    cooling_down_route_ids: frozenset[str] = frozenset(),
 ) -> Optional[str]:
     """Return a human-readable rejection reason, or None when the route fits."""
     if not route.enabled:
         return f"route {route.id!r} is disabled"
-    if route.backend != "native":
-        return f"route {route.id!r} uses non-native backend {route.backend!r}"
+    if route.backend not in ROUTABLE_BACKENDS:
+        return f"route {route.id!r} uses unsupported backend {route.backend!r}"
     if route.provider not in available_providers:
         return f"provider {route.provider!r} is not available (not authenticated or not installed)"
+    if route.id in cooling_down_route_ids:
+        # A recent pre-start rate-limit/overload/billing failure. Bounded and
+        # decided BEFORE execution, so the next route is chosen cleanly; it is
+        # never consulted once a task has started running tools.
+        return f"route {route.id!r} is in a bounded cooldown after a recent startup failure"
     if check_difficulty and request.difficulty not in route.task_difficulties:
         return (
             f"route {route.id!r} does not serve difficulty {request.difficulty.value!r}"
@@ -534,6 +679,7 @@ def select_route(
     *,
     usage: UsageView,
     available_providers: frozenset[str],
+    cooling_down_route_ids: frozenset[str] = frozenset(),
 ) -> RouteDecision:
     """Pick a route deterministically. Pure: never performs I/O.
 
@@ -568,6 +714,7 @@ def select_route(
             request,
             available_providers,
             check_difficulty=False,
+            cooling_down_route_ids=cooling_down_route_ids,
         )
         if rejection:
             return RouteDecision(
@@ -601,7 +748,10 @@ def select_route(
     rejections: list[str] = []
     eligible: list[DelegationRoute] = []
     for route in catalog.routes:
-        rejection = _matches_request(route, request, available_providers)
+        rejection = _matches_request(
+            route, request, available_providers,
+            cooling_down_route_ids=cooling_down_route_ids,
+        )
         if rejection:
             rejections.append(rejection)
             continue
@@ -611,24 +761,20 @@ def select_route(
             continue
         eligible.append(route)
 
-    # Preference tier ranks before the existing usage-aware total ordering.
-    # Once difficulty/model-class/capability and reserve constraints are
-    # satisfied, prefer the route with the most known
-    # remaining allowance.  Unknown usage is never treated as unlimited: it
-    # competes only when no route has a usable fresh/stale reading.  Priority
-    # and route id make equal readings deterministic.
+    # Preference tier ranks BEFORE usage/priority: a lower tier always wins
+    # over a higher tier regardless of remaining allowance, so Task-side
+    # delegation prefers tier-0 routes (e.g. Agy native, claude-p) over
+    # tier-1 (e.g. OpenAI native) whenever a tier-0 route is eligible. Within
+    # one tier the existing usage-aware ordering is unchanged: prefer the
+    # route with the most known remaining allowance, unknown usage never
+    # treated as unlimited (it competes only when no route in that tier has a
+    # usable fresh/stale reading), then priority, then route id.
     def _rank(route: DelegationRoute) -> tuple[Any, ...]:
         if not catalog.prefer_remaining_usage:
             return (route.preference_tier, route.priority, route.id)
         route_usage = usage.for_route(route)
         if route_usage.usable and route_usage.remaining_percent is not None:
-            return (
-                route.preference_tier,
-                0,
-                -route_usage.remaining_percent,
-                route.priority,
-                route.id,
-            )
+            return (route.preference_tier, 0, -route_usage.remaining_percent, route.priority, route.id)
         return (route.preference_tier, 1, 0.0, route.priority, route.id)
 
     eligible.sort(key=_rank)
