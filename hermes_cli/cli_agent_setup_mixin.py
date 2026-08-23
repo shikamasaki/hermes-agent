@@ -313,7 +313,7 @@ class CLIAgentSetupMixin:
         ``agent.orchestrator_usage_routing`` is enabled and the cached
         primary-provider usage crosses its configured threshold — see
         ``_apply_orchestrator_usage_routing``, which may retarget ``model``/
-        ``runtime`` to the configured Agy fallback (or back) before the
+        ``runtime`` to the configured fallback (or back) before the
         `/fast` overrides below are computed, so those overrides always
         apply to whichever model actually ends up selected.
         """
