@@ -9,6 +9,10 @@ Child construction and the ``claude`` subprocess are both stubbed: no real
 CLI is invoked, no credentials are read, no network is used.
 """
 
+import json
+import threading
+import weakref
+
 import pytest
 
 from agent import claude_p_backend as cb
@@ -435,6 +439,323 @@ class TestNoPostStartReroute:
             cooling_down_route_ids=dt._claude_p_cooling_down(catalog.routes),
         )
         assert decision.route_id != "claude-sub"
+
+
+# ---------------------------------------------------------------------------
+# Live registry / control lifecycle
+# ---------------------------------------------------------------------------
+
+
+class _LiveParent:
+    session_id = "parent-live-session"
+
+    def __init__(self):
+        self.touches = []
+
+    def _touch_activity(self, desc):
+        self.touches.append(desc)
+
+
+class TestClaudePLiveRegistryLifecycle:
+    def _spec(self, parent):
+        spec = dt.ClaudePChildSpec(
+            task_index=0,
+            goal="Audit the scheduler",
+            context=None,
+            params={
+                "model": "claude-opus-5",
+                "difficulty": "complex",
+                "tool_profile": "review",
+                "max_turns": 5,
+                "max_budget_usd": 1.0,
+                "timeout_seconds": 30,
+            },
+            route_decision={"route_id": "claude-sub", "provider": "claude-p"},
+            output_schema=None,
+            workdir=".",
+        )
+        spec._delegate_parent_ref = weakref.ref(parent)
+        spec._parent_session_id = parent.session_id
+        spec._delegation_id = "deleg-live"
+        return spec
+
+    def test_running_claude_p_child_is_listed_until_run_returns(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        started = threading.Event()
+        release = threading.Event()
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            started.set()
+            assert release.wait(timeout=2), "test did not release mocked claude-p run"
+            return cb.ClaudePRunResult(
+                status="completed",
+                summary="done",
+                error=None,
+                session_id=request.session_id,
+                claude_session_id=None,
+                num_turns=1,
+                cost_usd=0.0,
+                model=request.model,
+                duration_seconds=0.1,
+                exit_reason="completed",
+                tokens={"input": 1, "output": 1},
+                model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        result_holder = {}
+        thread = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                "result", dt._run_single_child(0, "Audit the scheduler", spec, parent)
+            )
+        )
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            active = dt.list_active_subagents()
+            assert [entry["subagent_id"] for entry in active] == [spec._subagent_id]
+            listed = json.loads(dt._handle_control_action("list", None, None, parent))
+            assert listed["count"] == 1
+            assert listed["subagents"][0]["subagent_id"] == spec._subagent_id
+            assert listed["subagents"][0]["goal"] == "Audit the scheduler"
+            assert listed["subagents"][0]["accepting_steer"] is False
+            release.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert result_holder["result"]["status"] == "completed"
+            after = json.loads(dt._handle_control_action("list", None, None, parent))
+            assert after["count"] == 0
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            dt._unregister_subagent(spec._subagent_id)
+
+    def test_stop_requests_claude_p_cancel_event(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            started.set()
+            assert cancel_event is not None
+            assert cancel_event.wait(timeout=2), "stop did not signal claude-p cancel"
+            cancelled.set()
+            return cb.ClaudePRunResult(
+                status="interrupted",
+                summary=None,
+                error="claude -p was interrupted",
+                session_id=request.session_id,
+                claude_session_id=None,
+                num_turns=0,
+                cost_usd=0.0,
+                model=request.model,
+                duration_seconds=0.1,
+                exit_reason="interrupted",
+                tokens={"input": 0, "output": 0},
+                model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        thread = threading.Thread(
+            target=lambda: dt._run_single_child(0, "Audit the scheduler", spec, parent)
+        )
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            out = json.loads(
+                dt._handle_control_action("stop", spec._subagent_id, None, parent)
+            )
+            assert out["status"] == "interrupt_requested"
+            assert cancelled.wait(timeout=2)
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+        finally:
+            thread.join(timeout=2)
+            dt._unregister_subagent(spec._subagent_id)
+
+    def test_claude_p_spec_has_activity_summary_for_async_progress(self):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+
+        summary = spec.get_activity_summary()
+
+        assert summary["api_call_count"] == 0
+        assert summary["current_tool"] == "claude-p"
+        assert isinstance(summary["last_activity_ts"], float)
+
+    def test_claude_p_parent_heartbeat_runs_while_child_is_waiting(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        started = threading.Event()
+        release = threading.Event()
+        monkeypatch.setattr(dt, "_HEARTBEAT_INTERVAL", 0.01)
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            started.set()
+            assert release.wait(timeout=2), "test did not release mocked claude-p run"
+            return cb.ClaudePRunResult(
+                status="completed", summary="done", error=None,
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=1, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="completed",
+                tokens={"input": 1, "output": 1}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        thread = threading.Thread(
+            target=lambda: dt._run_single_child(0, "Audit the scheduler", spec, parent)
+        )
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            for _ in range(100):
+                if parent.touches:
+                    break
+                threading.Event().wait(0.01)
+            assert any("claude-p" in desc for desc in parent.touches)
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            dt._unregister_subagent(spec._subagent_id)
+
+    def test_claude_p_emits_completion_progress_event(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        events = []
+        spec.tool_progress_callback = lambda event_type, **kwargs: events.append(
+            (event_type, kwargs)
+        )
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            return cb.ClaudePRunResult(
+                status="completed",
+                summary="done",
+                error=None,
+                session_id=request.session_id,
+                claude_session_id=None,
+                num_turns=1,
+                cost_usd=0.0,
+                model=request.model,
+                duration_seconds=0.1,
+                exit_reason="completed",
+                tokens={"input": 1, "output": 2},
+                model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        result = dt._run_single_child(0, "Audit the scheduler", spec, parent)
+
+        assert result["status"] == "completed"
+        complete_events = [event for event in events if event[0] == "subagent.complete"]
+        assert complete_events
+        assert complete_events[-1][1]["status"] == "completed"
+        assert complete_events[-1][1]["summary"] == "done"
+
+    def test_claude_p_emits_start_and_single_completion_progress_events(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        events = []
+        spec.tool_progress_callback = lambda event_type, **kwargs: events.append(event_type)
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            return cb.ClaudePRunResult(
+                status="completed", summary="done", error=None,
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=1, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="completed",
+                tokens={"input": 1, "output": 2}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        dt._run_single_child(0, "Audit the scheduler", spec, parent)
+
+        assert events.count("subagent.start") == 1
+        assert events.count("subagent.complete") == 1
+
+    def test_claude_p_exception_is_structured_and_unregistered(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        result = dt._run_single_child(0, "Audit the scheduler", spec, parent)
+
+        assert result["status"] == "error"
+        assert "boom" in result["error"]
+
+        after = json.loads(dt._handle_control_action("list", None, None, parent))
+        assert after["count"] == 0
+
+    def test_schema_retry_is_skipped_if_stop_requested_after_good_summary(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        spec._delegate_output_schema = {"type": "object", "required": ["ok"]}
+        calls = []
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            calls.append(request)
+            if len(calls) == 1:
+                assert cancel_event is not None
+                cancel_event.set()
+                return cb.ClaudePRunResult(
+                    status="completed", summary='{"ok": true}', error=None,
+                    session_id=request.session_id, claude_session_id="12345678-1234-4234-8234-123456789abc",
+                    num_turns=1, cost_usd=0.0, model=request.model,
+                    duration_seconds=0.1, exit_reason="completed",
+                    tokens={"input": 1, "output": 2}, model_usage={},
+                )
+            return cb.ClaudePRunResult(
+                status="interrupted", summary=None, error="interrupted",
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=0, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="interrupted",
+                tokens={"input": 0, "output": 0}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        result = dt._run_single_child(0, "Audit the scheduler", spec, parent)
+
+        assert result["summary"] == '{"ok": true}'
+        assert result["schema_valid"] is True
+        assert len(calls) == 1
+
+    def test_claude_p_steer_rejection_names_unsupported_channel(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        started = threading.Event()
+        release = threading.Event()
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            started.set()
+            assert release.wait(timeout=2), "test did not release mocked claude-p run"
+            return cb.ClaudePRunResult(
+                status="completed", summary="done", error=None,
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=1, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="completed",
+                tokens={"input": 1, "output": 1}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        thread = threading.Thread(
+            target=lambda: dt._run_single_child(0, "Audit the scheduler", spec, parent)
+        )
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            payload = json.loads(
+                dt._handle_control_action("steer", spec._subagent_id, "focus", parent)
+            )
+            assert "does not support live steering" in payload["error"]
+            assert "finishing" not in payload["error"]
+        finally:
+            release.set()
+            thread.join(timeout=2)
+            dt._unregister_subagent(spec._subagent_id)
 
 
 # ---------------------------------------------------------------------------

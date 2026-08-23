@@ -711,6 +711,7 @@ async def _run_claude_p_async(
     env: Mapping[str, str],
     workdir: str,
     timeout_seconds: float,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[int, bytes, bytes, bool, bool]:
     """Return (returncode, stdout, stderr, timed_out, output_overflow).
 
@@ -741,8 +742,26 @@ async def _run_claude_p_async(
     stderr_task = asyncio.ensure_future(_read_capped(proc.stderr, MAX_STDERR_BYTES))
 
     timed_out = False
+    interrupted = False
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+        if cancel_event is None:
+            await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+            while proc.returncode is None:
+                if cancel_event.is_set():
+                    interrupted = True
+                    await _cancel_process(proc, process_group_id=process_group_id)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    await _cancel_process(proc, process_group_id=process_group_id)
+                    break
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=min(0.1, remaining))
+                except asyncio.TimeoutError:
+                    continue
     except asyncio.TimeoutError:
         timed_out = True
         await _cancel_process(proc, process_group_id=process_group_id)
@@ -767,6 +786,8 @@ async def _run_claude_p_async(
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         raise
     returncode = proc.returncode if proc.returncode is not None else -1
+    if interrupted and returncode == 0:
+        returncode = -1
     return returncode, stdout, stderr, timed_out, (stdout_overflow or stderr_overflow)
 
 
@@ -886,25 +907,14 @@ def run_claude_p_task(
         env = build_scrubbed_environment()
 
         async def _runner() -> tuple[int, bytes, bytes, bool, bool]:
-            task = asyncio.ensure_future(
-                _run_claude_p_async(
-                    argv,
-                    env=env,
-                    workdir=request.workdir,
-                    timeout_seconds=request.timeout_seconds,
-                )
-            )
-            if cancel_event is None:
-                return await task
-            while not task.done():
-                if cancel_event.is_set():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    return -1, b"", b"", True, False
-                await asyncio.sleep(0.1)
+            run_kwargs = {
+                "env": env,
+                "workdir": request.workdir,
+                "timeout_seconds": request.timeout_seconds,
+            }
+            if cancel_event is not None:
+                run_kwargs["cancel_event"] = cancel_event
+            task = asyncio.ensure_future(_run_claude_p_async(argv, **run_kwargs))
             return await task
 
         returncode, stdout_bytes, _stderr_bytes, timed_out, output_overflow = asyncio.run(_runner())
@@ -946,6 +956,29 @@ def run_claude_p_task(
             exit_reason="output_limit",
             tokens={"input": 0, "output": 0},
             model_usage={},
+        )
+
+    interrupted = bool(cancel_event is not None and cancel_event.is_set() and not timed_out)
+    if interrupted:
+        parsed = normalize_claude_p_output(
+            stdout_text,
+            session_id=request.session_id,
+            duration_seconds=duration,
+            fallback_model=request.model,
+        ) if stdout_text.strip() else None
+        return ClaudePRunResult(
+            status="interrupted",
+            summary=parsed.summary if parsed is not None else None,
+            error="claude -p was interrupted and terminated",
+            session_id=request.session_id,
+            claude_session_id=(parsed.claude_session_id if parsed is not None else None),
+            num_turns=(parsed.num_turns if parsed is not None else None),
+            cost_usd=(parsed.cost_usd if parsed is not None else None),
+            model=request.model,
+            duration_seconds=duration,
+            exit_reason="interrupted",
+            tokens=(parsed.tokens if parsed is not None else {"input": 0, "output": 0}),
+            model_usage=(parsed.model_usage if parsed is not None else {}),
         )
 
     if timed_out:

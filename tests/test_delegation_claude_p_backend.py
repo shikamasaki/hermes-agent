@@ -783,6 +783,35 @@ class TestProcessFailures:
         assert result.exit_reason == "timeout"
         assert "SECRET-VALUE" not in (result.error or "")
 
+    def test_stop_cancel_reports_interrupted_and_preserves_partial_json(self, monkeypatch):
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        partial = json.dumps(
+            {
+                "subtype": "success",
+                "is_error": False,
+                "result": "partial findings before stop",
+                "num_turns": 2,
+                "usage": {"input_tokens": 11, "output_tokens": 7},
+            }
+        ).encode()
+
+        async def _fake(argv, *, env, workdir, timeout_seconds, cancel_event=None):
+            assert cancel_event is not None
+            cancel_event.set()
+            return -1, partial, b"stderr SECRET-VALUE", False, False
+
+        monkeypatch.setattr(cb, "_run_claude_p_async", _fake)
+        result = cb.run_claude_p_task(
+            cb.ClaudePRunRequest(prompt="p", model="claude-opus-5"),
+            write_capable=False,
+            cancel_event=threading.Event(),
+        )
+        assert result.status == "interrupted"
+        assert result.exit_reason == "interrupted"
+        assert result.summary == "partial findings before stop"
+        assert result.tokens == {"input": 11, "output": 7}
+        assert "SECRET-VALUE" not in (result.error or "")
+
     def test_missing_cli_fails_safely(self, monkeypatch):
         monkeypatch.setattr(cb, "resolve_claude_executable", lambda: None)
         result = cb.run_claude_p_task(

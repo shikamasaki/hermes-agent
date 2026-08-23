@@ -28,6 +28,7 @@ import os
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
@@ -353,6 +354,91 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
+def _build_live_subagent_record(
+    *,
+    child: Any,
+    goal: str,
+    parent_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    accepting_steer: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Build the shared active-subagent registry record for any backend."""
+    _raw_sid = getattr(child, "_subagent_id", None)
+    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    if not _subagent_id:
+        return None
+    if owner_session_id is None:
+        try:
+            from gateway.session_context import get_session_env
+
+            owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+        except Exception:
+            owner_session_id = None
+    if owner_session_id and (owner_transport is None or owner_session_record is None):
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+    _raw_depth = getattr(child, "_delegate_depth", 1)
+    _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
+    _parent_sid = getattr(child, "_parent_subagent_id", None)
+    _owner_agent_session_id = (
+        str(getattr(child, "_parent_session_id", "") or "")
+        or str(getattr(parent_agent, "session_id", "") or "")
+    )
+    _delegation_id = getattr(child, "_delegation_id", None)
+    _model = getattr(child, "model", None)
+    return {
+        "subagent_id": _subagent_id,
+        "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+        "depth": _tui_depth,
+        "goal": goal,
+        "delegation_id": _delegation_id if isinstance(_delegation_id, str) else None,
+        "model": _model if isinstance(_model, str) else None,
+        "started_at": time.time(),
+        "status": "running",
+        "tool_count": 0,
+        "agent": child,
+        "owner_agent_session_id": _owner_agent_session_id or None,
+        "owner_session_id": owner_session_id,
+        "owner_transport": owner_transport,
+        "owner_session_record": owner_session_record,
+        "accepting_steer": bool(accepting_steer),
+    }
+
+
+@contextmanager
+def _registered_live_subagent(
+    *,
+    child: Any,
+    goal: str,
+    parent_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    accepting_steer: bool = True,
+):
+    """Register a child for the duration of its run and always unregister it."""
+    record = _build_live_subagent_record(
+        child=child,
+        goal=goal,
+        parent_agent=parent_agent,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+        accepting_steer=accepting_steer,
+    )
+    sid = record.get("subagent_id") if record else None
+    if record:
+        _register_subagent(record)
+    try:
+        yield sid if isinstance(sid, str) else None
+    finally:
+        if isinstance(sid, str):
+            _unregister_subagent(sid, agent=child)
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -556,6 +642,13 @@ def _handle_control_action(
             return tool_error(
                 "action='steer' requires a non-empty 'message' describing the "
                 "course correction."
+            )
+        agent = record.get("agent")
+        if isinstance(agent, ClaudePChildSpec):
+            return tool_error(
+                f"Subagent '{sid}' runs through claude-p, which does not support "
+                "live steering. Use action='stop' to interrupt it and delegate a "
+                "follow-up task with the new instructions."
             )
         if steer_subagent(sid, text):
             return json.dumps(
@@ -2472,7 +2565,45 @@ def _run_single_child(
     # scrubbed `claude -p` subprocess. Branch before any AIAgent bookkeeping
     # so the native path below stays byte-for-byte unchanged.
     if isinstance(child, ClaudePChildSpec):
-        return _run_claude_p_child(task_index, goal, child, parent_agent)
+        child_progress_cb = getattr(child, "tool_progress_callback", None)
+        _heartbeat_stop = threading.Event()
+
+        def _heartbeat_loop():
+            while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                if parent_agent is None:
+                    continue
+                touch = getattr(parent_agent, "_touch_activity", None)
+                if not touch:
+                    continue
+                try:
+                    summary = child.get_activity_summary()
+                    desc = summary.get("last_activity_desc") or "claude-p running"
+                    touch(f"delegate_task: subagent {desc}")
+                except Exception:
+                    pass
+
+        _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        with _registered_live_subagent(
+            child=child,
+            goal=goal,
+            parent_agent=parent_agent,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+            accepting_steer=False,
+        ):
+            try:
+                _heartbeat_thread.start()
+                if child_progress_cb:
+                    try:
+                        child_progress_cb("subagent.start", preview=goal)
+                    except Exception as exc:
+                        logger.debug("Claude-p progress start failed: %s", exc)
+                return _run_claude_p_child(task_index, goal, child, parent_agent)
+            finally:
+                _heartbeat_stop.set()
+                if _heartbeat_thread.ident is not None:
+                    _heartbeat_thread.join(timeout=5)
 
     child_start = time.monotonic()
 
@@ -2599,64 +2730,19 @@ def _run_single_child(
     # target it by subagent_id (kill, pause, status queries).  Unregistered
     # in the finally block, even when the child raises.  Test doubles that
     # hand us a MagicMock don't carry stable ids; skip registration then.
-    _raw_sid = getattr(child, "_subagent_id", None)
-    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
-    if _subagent_id:
-        if owner_session_id is None:
-            try:
-                from gateway.session_context import get_session_env
-
-                owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
-            except Exception:
-                owner_session_id = None
-        if owner_session_id and (
-            owner_transport is None or owner_session_record is None
-        ):
-            owner_transport, owner_session_record = (
-                _capture_gateway_steer_authority(owner_session_id)
-            )
-        _raw_depth = getattr(child, "_delegate_depth", 1)
-        _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
-        _parent_sid = getattr(child, "_parent_subagent_id", None)
-        # Durable ownership spine: the OWNING CONVERSATION's session id (the
-        # same lineage the delivery path routes completions by). Sourced from
-        # the child's _parent_session_id stamp so it stays correct even when
-        # parent_agent has been rebuilt between dispatch and this run.
-        _owner_agent_session_id = (
-            str(getattr(child, "_parent_session_id", "") or "")
-            or str(getattr(parent_agent, "session_id", "") or "")
-        )
-        _delegation_id = getattr(child, "_delegation_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "delegation_id": (
-                    _delegation_id if isinstance(_delegation_id, str) else None
-                ),
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-                # Durable conversation lineage for the model-facing control
-                # plane (list/steer/stop). The weakref identity chain breaks
-                # when the CLI rebuilds its AIAgent mid-session; this id is
-                # the same spine completion delivery routes by.
-                "owner_agent_session_id": _owner_agent_session_id or None,
-                # Immutable live gateway/TUI session that commissioned this
-                # child. Empty outside those hosts; RPC authority fails closed.
-                "owner_session_id": owner_session_id,
-                "owner_transport": owner_transport,
-                "owner_session_record": owner_session_record,
-            }
-        )
+    _live_record = _build_live_subagent_record(
+        child=child,
+        goal=goal,
+        parent_agent=parent_agent,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    _subagent_id = (
+        _live_record.get("subagent_id") if isinstance(_live_record, dict) else None
+    )
+    if _live_record:
+        _register_subagent(_live_record)
 
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
@@ -3559,9 +3645,17 @@ class ClaudePChildSpec:
         self._delegate_role = role
         self._delegate_route_decision = dict(route_decision or {})
         self._delegate_output_schema = output_schema
-        self._live_transcript_path = None
-        self._delegation_id = None
-        self.tool_progress_callback = None
+        self._live_transcript_path: Optional[str] = None
+        self._delegation_id: Optional[str] = None
+        self._delegate_depth = 1
+        self._parent_subagent_id: Optional[str] = None
+        self._parent_session_id: Optional[str] = None
+        self._delegate_parent_ref: Any = None
+        self._cancel_event = threading.Event()
+        self.tool_progress_callback: Any = None
+        self._api_call_count = 0
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = "claude-p starting"
         #: Set once the child process has actually been spawned. A task that
         #: has started running tools must never be rerouted — see
         #: ``_run_claude_p_child``.
@@ -3570,6 +3664,28 @@ class ClaudePChildSpec:
     @property
     def write_capable(self) -> bool:
         return bool(self.params.get("write_capable"))
+
+    def hard_interrupt(self, message: Optional[str] = None) -> None:
+        """Ask the underlying claude-p runner to cancel its subprocess."""
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = "claude-p interrupt requested"
+        self._cancel_event.set()
+
+    interrupt = hard_interrupt
+
+    def steer(self, text: str) -> bool:
+        """claude -p has no live steering channel; expose that explicitly."""
+        return False
+
+    def get_activity_summary(self) -> Dict[str, Any]:
+        """Activity token compatible with native AIAgent progress monitors."""
+        return {
+            "api_call_count": int(self._api_call_count),
+            "current_tool": "claude-p",
+            "max_iterations": int(self.params.get("max_turns") or 0),
+            "last_activity_ts": float(self._last_activity_ts),
+            "last_activity_desc": self._last_activity_desc,
+        }
 
     def close(self) -> None:  # parity with AIAgent.close()
         return None
@@ -3629,7 +3745,57 @@ def _run_claude_p_child(
     )
 
     spec.tools_started = True
-    result = run_claude_p_task(request, write_capable=spec.write_capable)
+    spec._last_activity_ts = time.time()
+    spec._last_activity_desc = "claude-p running"
+    try:
+        result = run_claude_p_task(
+            request,
+            write_capable=spec.write_capable,
+            cancel_event=spec._cancel_event,
+        )
+    except Exception as exc:
+        duration = 0.0
+        spec._last_activity_ts = time.time()
+        spec._last_activity_desc = "claude-p failed"
+        entry = {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": str(exc),
+            "api_calls": int(spec._api_call_count),
+            "duration_seconds": duration,
+            "model": request.model,
+            "exit_reason": "error",
+            "truncated": False,
+            "tokens": {"input": 0, "output": 0},
+            "tool_trace": [],
+            "_child_role": spec._delegate_role,
+            "_child_cost_usd": 0.0,
+            "cost_usd": 0.0,
+            "cost_status": "unknown",
+            "claude_session_id": None,
+        }
+        child_progress_cb = getattr(spec, "tool_progress_callback", None)
+        if child_progress_cb:
+            try:
+                child_progress_cb(
+                    "subagent.complete",
+                    preview=str(exc)[:160],
+                    status="error",
+                    duration_seconds=duration,
+                    summary=str(exc),
+                    input_tokens=0,
+                    output_tokens=0,
+                    api_calls=0,
+                    cost_usd=0.0,
+                    output_tail=[],
+                )
+            except Exception as cb_exc:
+                logger.debug("Claude-p progress failure failed: %s", cb_exc)
+        return entry
+    spec._api_call_count = int(result.num_turns or 0)
+    spec._last_activity_ts = time.time()
+    spec._last_activity_desc = f"claude-p {result.status}"
 
     schema_valid: Optional[bool] = None
     schema_errors: List[str] = []
@@ -3650,6 +3816,7 @@ def _run_claude_p_child(
         if (
             not schema_valid
             and (result.summary or "").strip()
+            and not spec._cancel_event.is_set()
             and result.claude_session_id
             and remaining_turns >= 1
             and remaining_budget >= 0.01
@@ -3667,6 +3834,7 @@ def _run_claude_p_child(
             retry = run_claude_p_task(
                 retry_request,
                 write_capable=spec.write_capable,
+                cancel_event=spec._cancel_event,
             )
             total_cost = (
                 (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
@@ -3688,6 +3856,9 @@ def _run_claude_p_child(
             schema_valid, schema_errors = validate_output(
                 result.summary or "", output_schema
             )
+            spec._api_call_count = int(result.num_turns or 0)
+            spec._last_activity_ts = time.time()
+            spec._last_activity_desc = f"claude-p {result.status}"
 
     # A pre-start failure (rate limit / overload / billing / unavailable)
     # cools the route down so the NEXT selection picks another route. This is
@@ -3731,6 +3902,26 @@ def _run_claude_p_child(
             entry["schema_retries"] = schema_retries
         if not schema_valid and schema_errors:
             entry["schema_errors"] = schema_errors
+
+    child_progress_cb = getattr(spec, "tool_progress_callback", None)
+    if child_progress_cb:
+        try:
+            child_progress_cb(
+                "subagent.complete",
+                preview=(result.summary or result.error or "")[:160],
+                status=entry["status"],
+                duration_seconds=entry["duration_seconds"],
+                summary=result.summary or result.error or "",
+                input_tokens=int(entry["tokens"].get("input", 0) or 0),
+                output_tokens=int(entry["tokens"].get("output", 0) or 0),
+                api_calls=int(entry["api_calls"] or 0),
+                cost_usd=entry["cost_usd"],
+                output_tail=[],
+            )
+            if hasattr(child_progress_cb, "_flush"):
+                child_progress_cb._flush()
+        except Exception as exc:
+            logger.debug("Claude-p progress completion failed: %s", exc)
     return entry
 
 
@@ -4207,6 +4398,29 @@ def delegate_task(
             )
             if live_deleg_id:
                 child._delegation_id = live_deleg_id
+            child._parent_session_id = getattr(parent_agent, "session_id", None)
+            try:
+                child._delegate_parent_ref = weakref.ref(parent_agent)
+            except TypeError:
+                child._delegate_parent_ref = None
+            child.tool_progress_callback = _build_child_progress_callback(
+                i,
+                t["goal"],
+                parent_agent,
+                n_tasks,
+                subagent_id=child._subagent_id,
+                parent_id=getattr(parent_agent, "_subagent_id", None),
+                depth=max(0, getattr(parent_agent, "_delegate_depth", 0)),
+                model=child.model if isinstance(child.model, str) else None,
+                toolsets=None,
+                session_ref={"session_id": child.session_id},
+            )
+            _writer = live_writers[i] if i < len(live_writers) else None
+            if _writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(
+                    getattr(child, "tool_progress_callback", None), _writer
+                )
+                child._live_transcript_path = str(_writer.path)
             children.append((i, t, child))
             continue
         try:
