@@ -17,23 +17,22 @@ owns the two halves of that contract:
   Cached usage is supplied by :mod:`agent.delegation_usage_cache`, which
   refreshes out of band.
 
-Only native backends are routable in this revision: ``openai-codex`` and
-``google-antigravity``.  CLI-shelling backends (``agy -p``, ``codex exec``,
-OpenCode, arbitrary commands) and Claude execution are deliberately not
-accepted by the validator — a config naming one fails loudly rather than
-silently degrading to a different provider.
+Only native backends are routable in this revision.  The catalog deliberately
+does not keep a fixed provider allowlist: any non-empty provider slug may be
+configured, while runtime availability and credential resolution remain the
+responsibility of the trusted adapter layer.
 """
 
 from __future__ import annotations
 
 import enum
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 __all__ = [
     "BUILTIN_CAPABILITIES",
-    "NATIVE_ROUTABLE_PROVIDERS",
     "DelegationRoute",
     "ModelClass",
     "ProviderUsage",
@@ -96,10 +95,16 @@ BUILTIN_CAPABILITIES: tuple[str, ...] = (
     "review",
 )
 
-#: Providers this PR can route to natively.  Anything else is a config error.
-NATIVE_ROUTABLE_PROVIDERS: frozenset[str] = frozenset(
-    {"openai-codex", "google-antigravity"}
-)
+_PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+
+
+def _parse_provider_slug(value: Any, *, where: str) -> str:
+    provider = _require_str({"provider": value}, "provider", where=where).lower()
+    if not _PROVIDER_SLUG_RE.fullmatch(provider):
+        raise RouteConfigError(
+            f"{where}: 'provider' must be a non-empty machine slug"
+        )
+    return provider
 
 #: Policies for a route whose usage is unknown or expired.  ``fixed_priority``
 #: keeps the route eligible at its configured priority — never treating the
@@ -256,12 +261,7 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
             f"(CLI-shelling backends are not supported)"
         )
 
-    provider = _require_str(raw, "provider", where=where).lower()
-    if provider not in NATIVE_ROUTABLE_PROVIDERS:
-        supported = ", ".join(sorted(NATIVE_ROUTABLE_PROVIDERS))
-        raise RouteConfigError(
-            f"{where}: unsupported native 'provider' {provider!r} (supported: {supported})"
-        )
+    provider = _parse_provider_slug(raw.get("provider"), where=where)
 
     window_prefixes_raw = raw.get("usage_window_prefixes") or ()
     if isinstance(window_prefixes_raw, str) or not isinstance(window_prefixes_raw, Iterable):
@@ -394,9 +394,8 @@ class UsageView:
 
     def for_route(self, route: "DelegationRoute") -> ProviderUsage:
         # Route-scoped readings take precedence because one provider account
-        # may expose independent pools (for example Antigravity Gemini versus
-        # Claude/GPT buckets).  Provider-keyed entries remain supported for
-        # simple callers and backward-compatible tests.
+        # may expose independent pools.  Provider-keyed entries remain
+        # supported for simple callers and backward-compatible tests.
         found = self.entries.get(route.id) or self.entries.get(route.provider)
         if found is None:
             return ProviderUsage(provider=route.provider)

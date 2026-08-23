@@ -15,11 +15,11 @@ from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 import tools.delegate_tool as dt
 
 
-CODEX_ROUTE = {
-    "id": "codex-standard",
+ROUTE_A = {
+    "id": "route-a-standard",
     "backend": "native",
-    "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
+    "provider": "provider-a",
+    "model": "model-a-advanced",
     "model_class": "advanced",
     "task_difficulties": ["standard", "complex"],
     "capabilities": ["coding", "reasoning", "tool_use"],
@@ -27,22 +27,22 @@ CODEX_ROUTE = {
     "reserve_remaining_percent": 15,
 }
 
-GEMINI_ROUTE = {
-    "id": "gemini-routine",
+ROUTE_B = {
+    "id": "route-b-routine",
     "backend": "native",
-    "provider": "google-antigravity",
-    "model": "gemini-3-flash-agent",
+    "provider": "provider-b",
+    "model": "model-b-balanced",
     "model_class": "balanced",
     "task_difficulties": ["routine", "standard"],
     "capabilities": ["reasoning", "tool_use", "long_context"],
     "priority": 30,
     "reserve_remaining_percent": 10,
-    "usage_window_prefixes": ["Gemini Models"],
+    "usage_window_prefixes": ["Pool A"],
 }
 
 ROUTED_CFG = {
     "routing": {"enabled": True, "usage_ttl_seconds": 300, "usage_stale_seconds": 1800},
-    "routes": [CODEX_ROUTE, GEMINI_ROUTE],
+    "routes": [ROUTE_A, ROUTE_B],
 }
 
 
@@ -60,22 +60,22 @@ def fake_runtime(monkeypatch):
 
     def _resolve(requested=None, target_model=None, **kwargs):
         calls.append({"requested": requested, "target_model": target_model})
-        if requested == "openai-codex":
+        if requested == "provider-a":
             return {
-                "provider": "openai-codex",
+                "provider": "provider-a",
                 "model": target_model,
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "api_key": "test-codex-key",
-                "api_mode": "codex_responses",
+                "base_url": "https://provider-a.example/api",
+                "api_key": "test-provider-a-key",
+                "api_mode": "mode_a",
             }
-        if requested == "google-antigravity":
+        if requested == "provider-b":
             return {
-                "provider": "google-antigravity",
+                "provider": "provider-b",
                 "model": target_model,
-                "base_url": "https://cloudcode.example/v1",
-                "api_key": "test-agy-key",
-                "api_mode": "gemini_cloudcode",
-                "project_id": "agy-project-123",
+                "base_url": "https://provider-b.example/api",
+                "api_key": "test-provider-b-key",
+                "api_mode": "mode_b",
+                "project_id": "project-b-123",
             }
         raise RuntimeError(f"no such provider {requested}")
 
@@ -89,7 +89,7 @@ def fake_runtime(monkeypatch):
 def all_available(monkeypatch):
     monkeypatch.setattr(
         dt, "_available_route_providers", lambda routes: frozenset(
-            {"openai-codex", "google-antigravity"}
+            {"provider-a", "provider-b"}
         )
     )
 
@@ -98,7 +98,7 @@ def _store_usage(provider, label, used, age=10):
     duc.store_snapshot(
         AccountUsageSnapshot(
             provider=provider,
-            source="usage_api",
+            source="usage-api",
             fetched_at=datetime.now(timezone.utc) - timedelta(seconds=age),
             windows=(AccountUsageWindow(label=label, used_percent=used),),
         )
@@ -107,10 +107,10 @@ def _store_usage(provider, label, used, age=10):
 
 class TestLegacyBehaviorUnchanged:
     def test_no_routes_uses_legacy_provider_model(self, fake_runtime):
-        cfg = {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        cfg = {"provider": "provider-a", "model": "model-a-advanced"}
         creds = dt._resolve_delegation_credentials(cfg, parent_agent=None)
-        assert creds["provider"] == "openai-codex"
-        assert creds["model"] == "gpt-5.6-sol"
+        assert creds["provider"] == "provider-a"
+        assert creds["model"] == "model-a-advanced"
         assert creds.get("route_decision") is None
 
     def test_no_config_at_all_inherits_from_parent(self):
@@ -121,10 +121,10 @@ class TestLegacyBehaviorUnchanged:
 
     def test_routing_disabled_falls_back_to_legacy(self, fake_runtime):
         cfg = {
-            "provider": "openai-codex",
+            "provider": "provider-a",
             "model": "legacy-model",
             "routing": {"enabled": False},
-            "routes": [CODEX_ROUTE, GEMINI_ROUTE],
+            "routes": [ROUTE_A, ROUTE_B],
         }
         creds = dt._resolve_delegation_credentials(cfg, parent_agent=None)
         assert creds["model"] == "legacy-model"
@@ -133,8 +133,8 @@ class TestLegacyBehaviorUnchanged:
     def test_routed_config_without_request_still_resolves(self, fake_runtime, all_available):
         """A routed config with no difficulty hint uses the 'standard' default."""
         creds = dt._resolve_delegation_credentials(ROUTED_CFG, parent_agent=None)
-        assert creds["provider"] == "openai-codex"
-        assert creds["route_decision"]["route_id"] == "codex-standard"
+        assert creds["provider"] == "provider-a"
+        assert creds["route_decision"]["route_id"] == "route-a-standard"
 
 
 class TestRoutedResolution:
@@ -160,7 +160,7 @@ class TestRoutedResolution:
         for secret in ("bob@example.com", "secret-proj", "SECRET", "https://"):
             assert secret not in message
 
-    def test_routine_task_routes_to_gemini(self, fake_runtime, all_available):
+    def test_routine_task_routes_to_route_b(self, fake_runtime, all_available):
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
@@ -169,30 +169,30 @@ class TestRoutedResolution:
                 difficulty_reason="mechanical file rename",
             ),
         )
-        assert creds["provider"] == "google-antigravity"
-        assert creds["model"] == "gemini-3-flash-agent"
-        assert creds["api_key"] == "test-agy-key"
+        assert creds["provider"] == "provider-b"
+        assert creds["model"] == "model-b-balanced"
+        assert creds["api_key"] == "test-provider-b-key"
         decision = creds["route_decision"]
-        assert decision["route_id"] == "gemini-routine"
+        assert decision["route_id"] == "route-b-routine"
         assert decision["difficulty"] == "routine"
         assert decision["difficulty_reason"] == "mechanical file rename"
 
-    def test_complex_task_routes_to_codex(self, fake_runtime, all_available):
+    def test_complex_task_routes_to_route_a(self, fake_runtime, all_available):
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.COMPLEX),
         )
-        assert creds["provider"] == "openai-codex"
-        assert creds["model"] == "gpt-5.6-sol"
+        assert creds["provider"] == "provider-a"
+        assert creds["model"] == "model-a-advanced"
 
-    def test_antigravity_project_is_propagated_to_child(self, fake_runtime, all_available):
+    def test_selected_project_is_propagated_to_child(self, fake_runtime, all_available):
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
         )
-        assert creds["provider_project_id"] == "agy-project-123"
+        assert creds["provider_project_id"] == "project-b-123"
 
     def test_resolver_asks_for_the_selected_pair_only(self, fake_runtime, all_available):
         dt._resolve_delegation_credentials(
@@ -201,31 +201,31 @@ class TestRoutedResolution:
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
         )
         assert fake_runtime == [
-            {"requested": "google-antigravity", "target_model": "gemini-3-flash-agent"}
+            {"requested": "provider-b", "target_model": "model-b-balanced"}
         ]
 
     def test_depleted_route_is_skipped_using_cached_usage(self, fake_runtime, all_available):
-        _store_usage("openai-codex", "Session", used=99.0)
-        _store_usage("google-antigravity", "Gemini Models (5h)", used=5.0)
+        _store_usage("provider-a", "Window A", used=99.0)
+        _store_usage("provider-b", "Pool A (5h)", used=5.0)
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
         )
-        assert creds["provider"] == "google-antigravity"
+        assert creds["provider"] == "provider-b"
         assert "reserve" in creds["route_decision"]["reason"]
 
     def test_window_prefixes_isolate_the_pool(self, fake_runtime, all_available):
-        """A depleted Claude pool must not disqualify the Gemini route."""
+        """A depleted secondary pool must not disqualify the selected route."""
         duc.store_snapshot(
             AccountUsageSnapshot(
-                provider="google-antigravity",
-                source="quota_summary",
+                provider="provider-b",
+                source="quota-summary",
                 fetched_at=datetime.now(timezone.utc),
                 windows=(
-                    AccountUsageWindow(label="Gemini Models (5h)", used_percent=10.0),
+                    AccountUsageWindow(label="Pool A (5h)", used_percent=10.0),
                     AccountUsageWindow(
-                        label="Claude and GPT models (5h)", used_percent=100.0
+                        label="Pool B (5h)", used_percent=100.0
                     ),
                 ),
             )
@@ -235,29 +235,29 @@ class TestRoutedResolution:
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
         )
-        assert creds["provider"] == "google-antigravity"
+        assert creds["provider"] == "provider-b"
 
     def test_explicit_route_override_wins(self, fake_runtime, all_available):
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
             request=dr.RouteRequest(
-                difficulty=dr.TaskDifficulty.STANDARD, route_id="gemini-routine"
+                difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"
             ),
         )
-        assert creds["provider"] == "google-antigravity"
+        assert creds["provider"] == "provider-b"
         assert creds["route_decision"]["explicit_override"] is True
 
     def test_unavailable_provider_is_not_selected(self, fake_runtime, monkeypatch):
         monkeypatch.setattr(
-            dt, "_available_route_providers", lambda routes: frozenset({"openai-codex"})
+            dt, "_available_route_providers", lambda routes: frozenset({"provider-a"})
         )
         creds = dt._resolve_delegation_credentials(
             ROUTED_CFG,
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
         )
-        assert creds["provider"] == "openai-codex"
+        assert creds["provider"] == "provider-a"
 
     def test_no_eligible_route_raises_actionable_error(self, fake_runtime, all_available):
         with pytest.raises(ValueError) as exc:
@@ -281,12 +281,12 @@ class TestRoutedResolution:
             parent_agent=None,
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
         )
-        assert creds["provider"] == "google-antigravity"
+        assert creds["provider"] == "provider-b"
 
     def test_stale_usage_is_used_and_schedules_one_refresh(
         self, fake_runtime, all_available, monkeypatch
     ):
-        _store_usage("google-antigravity", "Gemini Models (5h)", used=5.0, age=900)
+        _store_usage("provider-b", "Pool A (5h)", used=5.0, age=900)
         scheduled = []
         monkeypatch.setattr(duc, "_spawn_refresh", lambda p: scheduled.append(p))
         creds = dt._resolve_delegation_credentials(
@@ -295,7 +295,7 @@ class TestRoutedResolution:
             request=dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
         )
         assert creds["route_decision"]["usage_freshness"] == "stale"
-        assert scheduled.count("google-antigravity") == 1
+        assert scheduled.count("provider-b") == 1
 
 
 class TestRequestFromArgs:
@@ -306,14 +306,14 @@ class TestRequestFromArgs:
                 "difficulty_reason": "multi-file refactor with hidden coupling",
                 "required_capabilities": ["coding", "reasoning"],
                 "minimum_model_class": "advanced",
-                "route": "codex-standard",
+                "route": "route-a-standard",
             }
         )
         assert request.difficulty is dr.TaskDifficulty.COMPLEX
         assert request.difficulty_reason == "multi-file refactor with hidden coupling"
         assert request.required_capabilities == frozenset({"coding", "reasoning"})
         assert request.minimum_model_class is dr.ModelClass.ADVANCED
-        assert request.route_id == "codex-standard"
+        assert request.route_id == "route-a-standard"
 
     def test_task_fields_override_top_level(self):
         request = dt._route_request_from_args(
@@ -356,8 +356,8 @@ class TestBatchIndependentRoutes:
             )
             for task in tasks
         ]
-        assert [c["provider"] for c in picked] == ["google-antigravity", "openai-codex"]
-        assert [c["model"] for c in picked] == ["gemini-3-flash-agent", "gpt-5.6-sol"]
+        assert [c["provider"] for c in picked] == ["provider-b", "provider-a"]
+        assert [c["model"] for c in picked] == ["model-b-balanced", "model-a-advanced"]
 
     def test_per_task_credentials_are_isolated(self, fake_runtime, all_available):
         a = dt._resolve_delegation_credentials(
@@ -370,7 +370,7 @@ class TestBatchIndependentRoutes:
         )
         assert a["api_key"] != b["api_key"]
         assert a["base_url"] != b["base_url"]
-        assert a["provider_project_id"] == "agy-project-123"
+        assert a["provider_project_id"] == "project-b-123"
         assert b.get("provider_project_id") is None
 
 
@@ -408,8 +408,8 @@ class TestSchema:
 
     def test_schema_carries_no_dynamic_usage_data(self, monkeypatch, all_available):
         """Quota numbers must never enter the tool schema (prompt-cache churn)."""
-        _store_usage("openai-codex", "5h limit", used=42.0)
-        _store_usage("google-antigravity", "Gemini Models", used=77.0)
+        _store_usage("provider-a", "Window A", used=42.0)
+        _store_usage("provider-b", "Pool A", used=77.0)
         monkeypatch.setattr(dt, "_load_config", lambda: ROUTED_CFG)
 
         import json
@@ -423,8 +423,8 @@ class TestSchema:
         import json
 
         monkeypatch.setattr(dt, "_load_config", lambda: ROUTED_CFG)
-        _store_usage("openai-codex", "5h limit", used=1.0)
+        _store_usage("provider-a", "Window A", used=1.0)
         before = json.dumps(dt._build_dynamic_schema_overrides(), sort_keys=True)
-        _store_usage("openai-codex", "5h limit", used=99.0)
+        _store_usage("provider-a", "Window A", used=99.0)
         after = json.dumps(dt._build_dynamic_schema_overrides(), sort_keys=True)
         assert before == after

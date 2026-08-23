@@ -13,11 +13,11 @@ from agent import delegation_usage_cache as duc
 import tools.delegate_tool as dt
 
 
-CODEX_ROUTE = {
-    "id": "codex-standard",
+ROUTE_A = {
+    "id": "route-a-standard",
     "backend": "native",
-    "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
+    "provider": "provider-a",
+    "model": "model-a-advanced",
     "model_class": "advanced",
     "task_difficulties": ["standard", "complex"],
     "capabilities": ["coding", "reasoning", "tool_use"],
@@ -25,22 +25,22 @@ CODEX_ROUTE = {
     "reserve_remaining_percent": 15,
 }
 
-GEMINI_ROUTE = {
-    "id": "gemini-routine",
+ROUTE_B = {
+    "id": "route-b-routine",
     "backend": "native",
-    "provider": "google-antigravity",
-    "model": "gemini-3-flash-agent",
+    "provider": "provider-b",
+    "model": "model-b-balanced",
     "model_class": "balanced",
     "task_difficulties": ["routine", "standard"],
     "capabilities": ["reasoning", "tool_use", "long_context"],
     "priority": 30,
     "reserve_remaining_percent": 10,
-    "usage_window_prefixes": ["Gemini Models"],
+    "usage_window_prefixes": ["Route B Models"],
 }
 
 ROUTED_CFG = {
     "routing": {"enabled": True},
-    "routes": [CODEX_ROUTE, GEMINI_ROUTE],
+    "routes": [ROUTE_A, ROUTE_B],
     "max_concurrent_children": 4,
 }
 
@@ -48,10 +48,10 @@ ROUTED_CFG = {
 class _Parent:
     """Minimal stand-in for the parent agent."""
 
-    provider = "anthropic"
-    model = "claude-opus-5"
+    provider = "parent-provider"
+    model = "parent-model"
     api_key = "parent-secret-key"
-    base_url = "https://api.anthropic.com"
+    base_url = "https://api.parent-provider.com"
     session_id = "parent-session"
     _delegate_depth = 0
 
@@ -65,23 +65,23 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dt,
         "_available_route_providers",
-        lambda routes: frozenset({"openai-codex", "google-antigravity"}),
+        lambda routes: frozenset({"provider-a", "provider-b"}),
     )
 
     def _resolve(requested=None, target_model=None, **kwargs):
         table = {
-            "openai-codex": {
-                "provider": "openai-codex",
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "api_key": "codex-key",
-                "api_mode": "codex_responses",
+            "provider-a": {
+                "provider": "provider-a",
+                "base_url": "https://provider-a.example/api",
+                "api_key": "provider-a-key",
+                "api_mode": "mode_a",
             },
-            "google-antigravity": {
-                "provider": "google-antigravity",
-                "base_url": "https://cloudcode.example/v1",
-                "api_key": "agy-key",
-                "api_mode": "gemini_cloudcode",
-                "project_id": "agy-project-123",
+            "provider-b": {
+                "provider": "provider-b",
+                "base_url": "https://provider-b.example/api",
+                "api_key": "provider-b-key",
+                "api_mode": "mode_b",
+                "project_id": "project-b-123",
             },
         }
         if requested not in table:
@@ -134,10 +134,10 @@ class TestPerTaskRouting:
             ],
         )
         assert len(built) == 2
-        assert built[0]["override_provider"] == "google-antigravity"
-        assert built[0]["model"] == "gemini-3-flash-agent"
-        assert built[1]["override_provider"] == "openai-codex"
-        assert built[1]["model"] == "gpt-5.6-sol"
+        assert built[0]["override_provider"] == "provider-b"
+        assert built[0]["model"] == "model-b-balanced"
+        assert built[1]["override_provider"] == "provider-a"
+        assert built[1]["model"] == "model-a-advanced"
 
     def test_batch_shares_one_availability_and_usage_preflight(
         self, harness, monkeypatch
@@ -148,7 +148,7 @@ class TestPerTaskRouting:
 
         def _available(routes):
             availability_calls.append(tuple(route.id for route in routes))
-            return frozenset({"openai-codex", "google-antigravity"})
+            return frozenset({"provider-a", "provider-b"})
 
         def _usage(*args, **kwargs):
             usage_calls.append(tuple(args[0]))
@@ -173,7 +173,7 @@ class TestPerTaskRouting:
             difficulty="routine",
             difficulty_reason="mechanical summarization",
         )
-        assert built[0]["override_provider"] == "google-antigravity"
+        assert built[0]["override_provider"] == "provider-b"
 
     def test_explicit_per_task_route_overrides_difficulty(self, harness):
         built = _run(
@@ -182,7 +182,7 @@ class TestPerTaskRouting:
                 {
                     "goal": "Rename the deprecated helper across the utils package",
                     "difficulty": "routine",
-                    "route": "codex-standard",
+                    "route": "route-a-standard",
                 },
                 {
                     "goal": "Redesign the scheduler to remove the global lock",
@@ -190,7 +190,7 @@ class TestPerTaskRouting:
                 },
             ],
         )
-        assert built[0]["override_provider"] == "openai-codex"
+        assert built[0]["override_provider"] == "provider-a"
 
     def test_capabilities_route_the_task(self, harness):
         built = _run(
@@ -199,7 +199,7 @@ class TestPerTaskRouting:
             difficulty="standard",
             required_capabilities=["long_context"],
         )
-        assert built[0]["override_provider"] == "google-antigravity"
+        assert built[0]["override_provider"] == "provider-b"
 
 
 class TestChildIsolation:
@@ -210,17 +210,17 @@ class TestChildIsolation:
             difficulty="complex",
         )
         kwargs = built[0]
-        assert kwargs["override_api_key"] == "codex-key"
+        assert kwargs["override_api_key"] == "provider-a-key"
         assert kwargs["override_api_key"] != _Parent.api_key
-        assert kwargs["override_base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert kwargs["override_base_url"] == "https://provider-a.example/api"
         assert kwargs["override_provider"] != _Parent.provider
 
     def test_public_route_metadata_omits_raw_usage_and_reason_text(self):
         class _Child:
             _delegate_route_decision = {
-                "route_id": "codex-standard",
-                "provider": "openai-codex",
-                "model": "gpt-5.6-sol",
+                "route_id": "route-a-standard",
+                "provider": "provider-a",
+                "model": "model-a-advanced",
                 "model_class": "advanced",
                 "difficulty": "standard",
                 "usage_freshness": "stale",
@@ -234,9 +234,9 @@ class TestChildIsolation:
 
         metadata = dt._public_route_metadata(_Child())
         assert metadata == {
-            "id": "codex-standard",
-            "provider": "openai-codex",
-            "model": "gpt-5.6-sol",
+            "id": "route-a-standard",
+            "provider": "provider-a",
+            "model": "model-a-advanced",
             "model_class": "advanced",
             "difficulty": "standard",
             "usage_freshness": "stale",
@@ -248,23 +248,6 @@ class TestChildIsolation:
         assert "alice@example.com" not in blob
         assert "12.3456" not in blob
         assert "678.9" not in blob
-
-    def test_antigravity_project_propagates_only_to_its_own_child(self, harness):
-        built = _run(
-            harness,
-            tasks=[
-                {
-                    "goal": "Rename the deprecated helper across the utils package",
-                    "difficulty": "routine",
-                },
-                {
-                    "goal": "Redesign the scheduler to remove the global lock",
-                    "difficulty": "complex",
-                },
-            ],
-        )
-        assert built[0]["override_provider_project_id"] == "agy-project-123"
-        assert built[1]["override_provider_project_id"] is None
 
     def test_cross_provider_children_do_not_share_api_mode(self, harness):
         built = _run(
@@ -280,14 +263,14 @@ class TestChildIsolation:
                 },
             ],
         )
-        assert built[0]["override_api_mode"] == "gemini_cloudcode"
-        assert built[1]["override_api_mode"] == "codex_responses"
+        assert built[0]["override_api_mode"] == "mode_b"
+        assert built[1]["override_api_mode"] == "mode_a"
 
 
 class TestLegacyDispatchUnchanged:
     def test_legacy_config_resolves_once_for_all_tasks(self, tmp_path, monkeypatch):
         monkeypatch.setattr(duc, "_cache_path", lambda: tmp_path / "usage.json")
-        legacy_cfg = {"provider": "openai-codex", "model": "pinned-model"}
+        legacy_cfg = {"provider": "provider-a", "model": "pinned-model"}
         monkeypatch.setattr(dt, "_load_config", lambda: legacy_cfg)
 
         calls = []
@@ -295,11 +278,11 @@ class TestLegacyDispatchUnchanged:
         def _resolve(requested=None, target_model=None, **kwargs):
             calls.append(requested)
             return {
-                "provider": "openai-codex",
+                "provider": "provider-a",
                 "model": target_model,
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "api_key": "codex-key",
-                "api_mode": "codex_responses",
+                "base_url": "https://provider-a.example/api",
+                "api_key": "provider-a-key",
+                "api_mode": "mode_a",
             }
 
         monkeypatch.setattr(
@@ -325,4 +308,4 @@ class TestLegacyDispatchUnchanged:
             ],
         )
         assert [b["model"] for b in built] == ["pinned-model", "pinned-model"]
-        assert calls == ["openai-codex"]  # resolved once, not per task
+        assert calls == ["provider-a"]  # resolved once, not per task

@@ -13,10 +13,10 @@ from agent import delegation_routing as dr
 
 def _route(**overrides):
     base = {
-        "id": "codex-standard",
+        "id": "route-a-standard",
         "backend": "native",
-        "provider": "openai-codex",
-        "model": "gpt-5.6-sol",
+        "provider": "provider-a",
+        "model": "model-a-advanced",
         "model_class": "advanced",
         "task_difficulties": ["standard", "complex"],
         "capabilities": ["coding", "reasoning", "tool_use"],
@@ -39,16 +39,16 @@ class TestRouteCatalogParsing:
             "routes": [
                 _route(),
                 {
-                    "id": "gemini-routine",
+                    "id": "route-b-routine",
                     "backend": "native",
-                    "provider": "google-antigravity",
-                    "model": "gemini-3-flash-agent",
+                    "provider": "provider-b",
+                    "model": "model-b-balanced",
                     "model_class": "balanced",
                     "task_difficulties": ["routine", "standard"],
                     "capabilities": ["reasoning", "tool_use", "long_context"],
                     "priority": 30,
                     "reserve_remaining_percent": 10,
-                    "usage_window_prefixes": ["Gemini Models"],
+                    "usage_window_prefixes": ["Primary Window"],
                 },
             ],
         }
@@ -58,28 +58,28 @@ class TestRouteCatalogParsing:
         assert catalog.usage_ttl_seconds == 300
         assert catalog.usage_stale_seconds == 1800
         assert catalog.unknown_usage == "fixed_priority"
-        assert [r.id for r in catalog.routes] == ["codex-standard", "gemini-routine"]
+        assert [r.id for r in catalog.routes] == ["route-a-standard", "route-b-routine"]
 
-        gemini = catalog.routes[1]
-        assert gemini.provider == "google-antigravity"
-        assert gemini.model_class is dr.ModelClass.BALANCED
-        assert gemini.task_difficulties == (
+        route_b = catalog.routes[1]
+        assert route_b.provider == "provider-b"
+        assert route_b.model_class is dr.ModelClass.BALANCED
+        assert route_b.task_difficulties == (
             dr.TaskDifficulty.ROUTINE,
             dr.TaskDifficulty.STANDARD,
         )
-        assert gemini.capabilities == frozenset({"reasoning", "tool_use", "long_context"})
-        assert gemini.usage_window_prefixes == ("Gemini Models",)
-        assert gemini.reserve_remaining_percent == 10.0
+        assert route_b.capabilities == frozenset({"reasoning", "tool_use", "long_context"})
+        assert route_b.usage_window_prefixes == ("Primary Window",)
+        assert route_b.reserve_remaining_percent == 10.0
 
     def test_absent_routing_block_defaults_to_disabled_empty_catalog(self):
-        catalog = dr.load_route_catalog({"provider": "openai-codex", "model": "gpt-5"})
+        catalog = dr.load_route_catalog({"provider": "provider-a", "model": "gpt-5"})
         assert catalog.enabled is False
         assert catalog.routes == ()
 
     def test_disabled_routing_ignores_malformed_future_routes(self):
         catalog = dr.load_route_catalog(
             {
-                "provider": "openai-codex",
+                "provider": "provider-a",
                 "model": "gpt-5",
                 "routing": {"enabled": False},
                 "routes": [{"backend": "cli", "provider": "opencode"}],
@@ -91,7 +91,7 @@ class TestRouteCatalogParsing:
     def test_empty_routes_preserve_legacy_even_with_unused_policy_values(self):
         catalog = dr.load_route_catalog(
             {
-                "provider": "openai-codex",
+                "provider": "provider-a",
                 "model": "gpt-5",
                 "routing": {
                     "enabled": True,
@@ -117,7 +117,7 @@ class TestRouteCatalogParsing:
         "bad, msg",
         [
             ({"id": ""}, "id"),
-            ({"provider": "opencode"}, "provider"),
+            ({"provider": "not a slug"}, "provider"),
             ({"backend": "cli"}, "backend"),
             ({"model": ""}, "model"),
             ({"model_class": "turbo"}, "model_class"),
@@ -198,16 +198,16 @@ def _catalog(*routes, **routing):
 
 
 _GEMINI = {
-    "id": "gemini-routine",
+    "id": "route-b-routine",
     "backend": "native",
-    "provider": "google-antigravity",
-    "model": "gemini-3-flash-agent",
+    "provider": "provider-b",
+    "model": "model-b-balanced",
     "model_class": "balanced",
     "task_difficulties": ["routine", "standard"],
     "capabilities": ["reasoning", "tool_use", "long_context"],
     "priority": 30,
     "reserve_remaining_percent": 10,
-    "usage_window_prefixes": ["Gemini Models"],
+    "usage_window_prefixes": ["Primary Window"],
 }
 
 
@@ -225,7 +225,7 @@ def _usage(**per_provider):
     return dr.UsageView(entries)
 
 
-_ALL_AVAILABLE = frozenset({"openai-codex", "google-antigravity"})
+_ALL_AVAILABLE = frozenset({"provider-a", "provider-b"})
 
 
 class TestSelection:
@@ -234,13 +234,13 @@ class TestSelection:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
-            usage=_usage(google_antigravity=(80.0, "fresh", 10.0)),
+            usage=_usage(provider_b=(80.0, "fresh", 10.0)),
             available_providers=_ALL_AVAILABLE,
         )
         assert decision.selected is True
-        assert decision.route_id == "gemini-routine"
-        assert decision.provider == "google-antigravity"
-        assert decision.model == "gemini-3-flash-agent"
+        assert decision.route_id == "route-b-routine"
+        assert decision.provider == "provider-b"
+        assert decision.model == "model-b-balanced"
         assert decision.model_class == "balanced"
         assert decision.difficulty == "routine"
         assert decision.usage_freshness == "fresh"
@@ -254,15 +254,15 @@ class TestSelection:
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
         assert [c.id for c in catalog.routes if dr.TaskDifficulty.STANDARD in c.task_difficulties] == [
-            "codex-standard",
-            "gemini-routine",
+            "route-a-standard",
+            "route-b-routine",
         ]
 
     def test_equivalent_route_with_more_remaining_usage_wins_before_priority(self):
@@ -271,12 +271,12 @@ class TestSelection:
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(35.0, "fresh", 1.0),
-                google_antigravity=(80.0, "fresh", 1.0),
+                provider_a=(35.0, "fresh", 1.0),
+                provider_b=(80.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_minimum_model_class_filters_weaker_routes(self):
         catalog = _catalog(_route(priority=50), _GEMINI)
@@ -287,12 +287,12 @@ class TestSelection:
                 minimum_model_class=dr.ModelClass.ADVANCED,
             ),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
     def test_capabilities_filter_is_subset_match(self):
         catalog = _catalog(_route(), _GEMINI)
@@ -302,10 +302,10 @@ class TestSelection:
                 difficulty=dr.TaskDifficulty.STANDARD,
                 required_capabilities=frozenset({"long_context"}),
             ),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_no_candidate_returns_unselected_decision_with_reason(self):
         catalog = _catalog(_route())
@@ -327,10 +327,10 @@ class TestSelection:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
-            available_providers=frozenset({"google-antigravity"}),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
+            available_providers=frozenset({"provider-b"}),
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_disabled_route_excluded(self):
         catalog = _catalog(_route(enabled=False), _GEMINI)
@@ -347,7 +347,7 @@ class TestSelection:
         b = _route(id="aaa-second", priority=5)
         c = _route(id="mmm-third", priority=5)
         catalog = _catalog(a, b, c)
-        usage = _usage(openai_codex=(90.0, "fresh", 1.0))
+        usage = _usage(provider_a=(90.0, "fresh", 1.0))
         req = dr.RouteRequest(difficulty=dr.TaskDifficulty.COMPLEX)
         picks = {
             dr.select_route(catalog, req, usage=usage, available_providers=_ALL_AVAILABLE).route_id
@@ -361,12 +361,12 @@ class TestSelection:
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.considered_route_ids == ("codex-standard", "gemini-routine")
+        assert decision.considered_route_ids == ("route-a-standard", "route-b-routine")
 
 
 class TestExplicitOverride:
@@ -374,11 +374,11 @@ class TestExplicitOverride:
         catalog = _catalog(_route(priority=1), _GEMINI)
         decision = dr.select_route(
             catalog,
-            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="gemini-routine"),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
         assert decision.explicit_override is True
 
     def test_explicit_route_still_validates_capabilities(self):
@@ -387,10 +387,10 @@ class TestExplicitOverride:
             catalog,
             dr.RouteRequest(
                 difficulty=dr.TaskDifficulty.STANDARD,
-                route_id="gemini-routine",
+                route_id="route-b-routine",
                 required_capabilities=frozenset({"coding"}),
             ),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
         assert decision.selected is False
@@ -400,9 +400,9 @@ class TestExplicitOverride:
         catalog = _catalog(_route(), _GEMINI)
         decision = dr.select_route(
             catalog,
-            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="gemini-routine"),
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
             usage=_usage(),
-            available_providers=frozenset({"openai-codex"}),
+            available_providers=frozenset({"provider-a"}),
         )
         assert decision.selected is False
         assert "available" in decision.reason.lower()
@@ -411,7 +411,7 @@ class TestExplicitOverride:
         catalog = _catalog(_route(), dict(_GEMINI, enabled=False))
         decision = dr.select_route(
             catalog,
-            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="gemini-routine"),
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
             usage=_usage(),
             available_providers=_ALL_AVAILABLE,
         )
@@ -433,8 +433,8 @@ class TestExplicitOverride:
         catalog = _catalog(_GEMINI)
         decision = dr.select_route(
             catalog,
-            dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE, route_id="gemini-routine"),
-            usage=_usage(google_antigravity=(2.0, "fresh", 5.0)),
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE, route_id="route-b-routine"),
+            usage=_usage(provider_b=(2.0, "fresh", 5.0)),
             available_providers=_ALL_AVAILABLE,
         )
         assert decision.selected is True
@@ -449,22 +449,22 @@ class TestReserveThreshold:
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(5.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(5.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_remaining_exactly_at_reserve_is_allowed(self):
         catalog = _catalog(_route(priority=1))
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(openai_codex=(15.0, "fresh", 1.0)),
+            usage=_usage(provider_a=(15.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
     def test_stale_usage_below_reserve_also_excludes(self):
         catalog = _catalog(_route(priority=1), _GEMINI)
@@ -472,12 +472,12 @@ class TestReserveThreshold:
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(1.0, "stale", 900.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(1.0, "stale", 900.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_known_healthy_usage_outranks_unknown_usage(self):
         """Unknown usage stays eligible but is never treated as unlimited."""
@@ -485,10 +485,10 @@ class TestReserveThreshold:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
         assert decision.usage_freshness == "fresh"
 
     def test_all_unknown_usage_uses_fixed_priority(self):
@@ -499,7 +499,7 @@ class TestReserveThreshold:
             usage=_usage(),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
         assert decision.usage_freshness == "unknown"
 
     def test_unknown_usage_skip_policy_excludes_route(self):
@@ -507,10 +507,10 @@ class TestReserveThreshold:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_unknown_usage_does_not_outrank_known_healthy_route(self):
         """Known healthy wins even when the unknown route has better priority."""
@@ -518,10 +518,10 @@ class TestReserveThreshold:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(google_antigravity=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_b=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
 
 class TestSelectorPurity:
@@ -536,7 +536,7 @@ class TestSelectorPurity:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_a=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
         assert decision.selected is True
@@ -554,38 +554,38 @@ class TestPreferenceTier:
     """
 
     def test_tier_0_beats_tier_1_even_with_more_remaining_usage(self):
-        # Tier 1 (OpenAI) has far more remaining than tier 0 (Antigravity),
+        # Tier 1 (Provider A) has far more remaining than tier 0 (Provider B),
         # but tier must be compared before usage/priority.
-        codex = _route(preference_tier=1, priority=1)
-        gemini = dict(_GEMINI, preference_tier=0, priority=100)
-        catalog = _catalog(codex, gemini)
+        route_a = _route(preference_tier=1, priority=1)
+        route_b = dict(_GEMINI, preference_tier=0, priority=100)
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(95.0, "fresh", 1.0),
-                google_antigravity=(15.0, "fresh", 1.0),
+                provider_a=(95.0, "fresh", 1.0),
+                provider_b=(15.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
     def test_two_tier_0_routes_still_rank_by_remaining_then_priority(self):
         # Both tier 0: existing usage-aware ordering must still apply
         # unchanged (remaining desc wins over priority).
-        codex = _route(preference_tier=0, priority=1)
-        gemini = dict(_GEMINI, preference_tier=0, priority=100)
-        catalog = _catalog(codex, gemini)
+        route_a = _route(preference_tier=0, priority=1)
+        route_b = dict(_GEMINI, preference_tier=0, priority=100)
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(35.0, "fresh", 1.0),
-                google_antigravity=(80.0, "fresh", 1.0),
+                provider_a=(35.0, "fresh", 1.0),
+                provider_b=(80.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "gemini-routine"
+        assert decision.route_id == "route-b-routine"
 
         # And priority still breaks ties when remaining is equal.
         catalog2 = _catalog(
@@ -596,47 +596,47 @@ class TestPreferenceTier:
             catalog2,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision2.route_id == "codex-standard"
+        assert decision2.route_id == "route-a-standard"
 
     def test_tier_1_wins_when_all_tier_0_routes_ineligible(self):
-        # Tier 0 (Antigravity) is below its reserve; tier 1 (OpenAI) must be
+        # Tier 0 (Provider B) is below its reserve; tier 1 (Provider A) must be
         # selected as the eligible fallback.
-        codex = _route(preference_tier=1, priority=1, reserve_remaining_percent=15)
-        gemini = dict(_GEMINI, preference_tier=0, priority=1, reserve_remaining_percent=50)
-        catalog = _catalog(codex, gemini)
+        route_a = _route(preference_tier=1, priority=1, reserve_remaining_percent=15)
+        route_b = dict(_GEMINI, preference_tier=0, priority=1, reserve_remaining_percent=50)
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(10.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(10.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
     def test_tier_1_wins_when_tier_0_disabled(self):
-        codex = _route(preference_tier=1)
-        gemini = dict(_GEMINI, preference_tier=0, enabled=False)
-        catalog = _catalog(codex, gemini)
+        route_a = _route(preference_tier=1)
+        route_b = dict(_GEMINI, preference_tier=0, enabled=False)
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_a=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
 
     def test_tier_1_wins_when_tier_0_capability_ineligible(self):
-        codex = _route(preference_tier=1, capabilities=["coding", "reasoning", "tool_use", "vision"])
-        gemini = dict(_GEMINI, preference_tier=0)  # lacks "vision"
-        catalog = _catalog(codex, gemini)
+        route_a = _route(preference_tier=1, capabilities=["coding", "reasoning", "tool_use", "vision"])
+        route_b = dict(_GEMINI, preference_tier=0)  # lacks "vision"
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(
@@ -644,27 +644,27 @@ class TestPreferenceTier:
                 required_capabilities=frozenset({"vision"}),
             ),
             usage=_usage(
-                openai_codex=(90.0, "fresh", 1.0),
-                google_antigravity=(90.0, "fresh", 1.0),
+                provider_a=(90.0, "fresh", 1.0),
+                provider_b=(90.0, "fresh", 1.0),
             ),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
     def test_tier_1_wins_when_tier_0_difficulty_ineligible(self):
         # _GEMINI only serves routine/standard; frontier is tier-0-ineligible.
-        codex = _route(
+        route_a = _route(
             preference_tier=1, task_difficulties=["standard", "complex", "frontier"]
         )
-        gemini = dict(_GEMINI, preference_tier=0)
-        catalog = _catalog(codex, gemini)
+        route_b = dict(_GEMINI, preference_tier=0)
+        catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.FRONTIER),
-            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_a=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
-        assert decision.route_id == "codex-standard"
+        assert decision.route_id == "route-a-standard"
 
     def test_preference_tier_absent_defaults_to_zero(self):
         cfg = {"routing": {"enabled": True}, "routes": [_route()]}
@@ -674,7 +674,7 @@ class TestPreferenceTier:
     def test_preference_tier_defaults_to_zero_on_dataclass_directly(self):
         route = dr.DelegationRoute(
             id="r",
-            provider="openai-codex",
+            provider="provider-a",
             model="m",
             model_class=dr.ModelClass.ADVANCED,
             task_difficulties=(dr.TaskDifficulty.STANDARD,),
@@ -724,7 +724,7 @@ class TestPreferenceTier:
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
-            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            usage=_usage(provider_a=(90.0, "fresh", 1.0)),
             available_providers=_ALL_AVAILABLE,
         )
         decision_fields = {f for f in vars(decision).keys()}

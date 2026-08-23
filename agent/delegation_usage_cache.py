@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,21 +61,14 @@ _SCHEMA_VERSION = 1
 _LOCK = threading.RLock()
 _INFLIGHT: set[str] = set()
 
-_SAFE_SOURCES: dict[str, frozenset[str]] = {
-    "openai-codex": frozenset({"usage_api"}),
-    "google-antigravity": frozenset({"quota_summary"}),
-}
-_SAFE_WINDOW_LABELS: dict[str, frozenset[str]] = {
-    "openai-codex": frozenset({"Session", "Weekly"}),
-    "google-antigravity": frozenset(
-        {
-            "Gemini Models (5h)",
-            "Gemini Models (weekly)",
-            "Claude and GPT models (5h)",
-            "Claude and GPT models (weekly)",
-        }
-    ),
-}
+_PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_EMAIL_RE = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+_URL_OR_QUERY_RE = re.compile(r"(?i)(://|\bwww\.|[?&][a-z0-9_.-]+=)")
+_CREDENTIAL_MARKER_RE = re.compile(
+    r"(?i)\b(api[-_ ]?key|authorization|bearer|credential|secret|token|password)\b"
+)
+_MAX_WINDOW_LABEL_CHARS = 80
 
 
 def _cache_path() -> Path:
@@ -89,11 +83,9 @@ def _utc_now() -> datetime:
 
 
 def normalize_provider(provider: Optional[str]) -> str:
-    """Fold provider aliases onto the slug the cache keys on."""
+    """Return the canonical provider slug emitted by the provider adapter."""
     value = str(provider or "").strip().lower()
-    if value in {"antigravity", "agy", "google-agy"}:
-        return "google-antigravity"
-    return value
+    return value if _PROVIDER_SLUG_RE.fullmatch(value) else ""
 
 
 def reset_refresh_state() -> None:
@@ -123,6 +115,32 @@ def _percent(value: Any) -> Optional[float]:
     return max(0.0, min(100.0, pct))
 
 
+def _unsafe_freeform_value(value: str) -> bool:
+    return bool(
+        _EMAIL_RE.search(value)
+        or _URL_OR_QUERY_RE.search(value)
+        or _CREDENTIAL_MARKER_RE.search(value)
+    )
+
+
+def _safe_source(value: Any) -> str:
+    source = str(value or "").strip().lower()
+    if not _SOURCE_SLUG_RE.fullmatch(source) or _unsafe_freeform_value(source):
+        return ""
+    return source
+
+
+def _safe_window_label(value: Any) -> str:
+    label = str(value or "").strip()
+    if not label or len(label) > _MAX_WINDOW_LABEL_CHARS:
+        return ""
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+        return ""
+    if _unsafe_freeform_value(label):
+        return ""
+    return label
+
+
 def project_snapshot(snapshot: Any) -> dict[str, Any]:
     """Reduce an ``AccountUsageSnapshot`` to the fields safe to persist.
 
@@ -132,12 +150,10 @@ def project_snapshot(snapshot: Any) -> dict[str, Any]:
     project ids, and error URLs with embedded keys.
     """
     provider = normalize_provider(getattr(snapshot, "provider", None))
-    safe_labels = _SAFE_WINDOW_LABELS.get(provider, frozenset())
     windows: list[dict[str, Any]] = []
     for window in getattr(snapshot, "windows", ()) or ():
         used = _percent(getattr(window, "used_percent", None))
-        raw_label = str(getattr(window, "label", "") or "").strip()
-        label = raw_label if raw_label in safe_labels else ""
+        label = _safe_window_label(getattr(window, "label", ""))
         windows.append(
             {
                 "label": label,
@@ -152,8 +168,7 @@ def project_snapshot(snapshot: Any) -> dict[str, Any]:
         # no reason text.
         windows = []
     fetched_at = _iso(getattr(snapshot, "fetched_at", None)) or _iso(_utc_now())
-    raw_source = str(getattr(snapshot, "source", "") or "").strip()
-    source = raw_source if raw_source in _SAFE_SOURCES.get(provider, frozenset()) else ""
+    source = _safe_source(getattr(snapshot, "source", ""))
     return {
         "provider": provider,
         "fetched_at": fetched_at,
@@ -220,9 +235,8 @@ def _worst_remaining(
 
     The binding constraint is whichever window is closest to exhaustion, so
     the minimum is the honest reading. ``window_prefixes`` narrows to the
-    windows a route actually consumes (an Antigravity account reports Gemini
-    and Claude pools separately; a Gemini route must not be blocked by a
-    depleted Claude pool).
+    windows a route actually consumes when one provider reports multiple
+    independent pools.
     """
     candidates: list[float] = []
     for window in windows:

@@ -4005,7 +4005,6 @@ def delegate_task(
                 override_api_mode=task_creds["api_mode"],
                 override_request_overrides=task_creds.get("request_overrides"),
                 override_max_tokens=task_creds.get("max_output_tokens"),
-                override_provider_project_id=task_creds.get("provider_project_id"),
                 override_acp_command=task_creds.get("command"),
                 override_acp_args=task_creds.get("args"),
 >>>>>>> theirs
