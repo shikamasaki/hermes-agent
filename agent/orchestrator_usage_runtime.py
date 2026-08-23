@@ -28,24 +28,26 @@ def apply_orchestrator_usage_routing(
     current_runtime: Optional[Mapping[str, Any]] = None,
     full_config: Optional[Mapping[str, Any]] = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Return the model/runtime for the next turn without raising.
+    """Return the model/runtime for the next turn.
 
     ``model``/``runtime`` are the caller's base route. ``current_*`` may name
     an already-active fallback route; when omitted, the base route is current.
-    Raw resolver/cache errors are never surfaced or logged.
+    Config loading, resolver, and cache transport errors fail open. A loaded
+    but malformed enabled routing policy raises its validation error so an
+    operator cannot mistake a silently disabled policy for a working one.
     """
-    try:
-        if full_config is None:
+    if full_config is None:
+        try:
             from hermes_cli.config import load_config_readonly
 
             full_config = load_config_readonly()
-        config = parse_orchestrator_routing_config(full_config)
-    except Exception as exc:
-        logger.debug(
-            "orchestrator usage routing config unavailable (%s)",
-            type(exc).__name__,
-        )
-        return model, runtime
+        except Exception as exc:
+            logger.debug(
+                "orchestrator usage routing config unavailable (%s)",
+                type(exc).__name__,
+            )
+            return model, runtime
+    config = parse_orchestrator_routing_config(full_config)
 
     if not config.enabled:
         return model, runtime

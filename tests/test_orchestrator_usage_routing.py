@@ -341,8 +341,26 @@ class TestDecision:
             assert banned.lower() not in decision.reason.lower()
 
 class TestNonBlockingCacheUsage:
-    """Prove the decision path only ever reads through build_usage_view and
-    never calls the network-touching refresh/fetch entry points itself."""
+    """Prove the decision path only reads the cache and never calls network fetchers."""
+
+    def test_runtime_surfaces_malformed_enabled_policy(self):
+        from agent.orchestrator_usage_routing import OrchestratorRoutingConfigError
+        from agent.orchestrator_usage_runtime import apply_orchestrator_usage_routing
+
+        malformed = {
+            "agent": {
+                "orchestrator_usage_routing": {
+                    "enabled": True,
+                    "primary_provider": "Bad Provider!",
+                }
+            }
+        }
+        with pytest.raises(OrchestratorRoutingConfigError):
+            apply_orchestrator_usage_routing(
+                model="model-primary",
+                runtime={"provider": "provider-primary"},
+                full_config=malformed,
+            )
 
     def test_decision_path_never_calls_fetch_or_refresh(self, monkeypatch):
         import agent.account_usage as account_usage_mod
