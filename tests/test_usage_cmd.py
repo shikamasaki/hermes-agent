@@ -192,6 +192,39 @@ class TestRenderCachedUsage:
         assert row["windows"][0]["reset_at"] == "2026-08-30T12:00:00+00:00"
         assert row["source"] == "source_a"
 
+    def test_recent_window_without_percentages_is_still_rendered(self, cache):
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+        cache.store_snapshot(
+            AccountUsageSnapshot(
+                provider="provider-a",
+                source="source_a",
+                fetched_at=datetime.now(timezone.utc),
+                windows=(
+                    AccountUsageWindow(
+                        label="Session",
+                        used_percent=None,
+                        reset_at=datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+                    ),
+                ),
+            )
+        )
+
+        rows = usage_cmd.build_usage_rows(["provider-a"], refresh=False)
+
+        assert rows[0]["status"] == "unknown"
+        assert rows[0]["freshness"] == "unknown"
+        assert rows[0]["age_seconds"] is not None
+        assert rows[0]["source"] == "source_a"
+        assert rows[0]["windows"] == [
+            {
+                "label": "Session",
+                "used_percent": None,
+                "remaining_percent": None,
+                "reset_at": "2026-08-30T12:00:00+00:00",
+            }
+        ]
+
     def test_stale_window_marked_stale(self, cache):
         old = datetime.now(timezone.utc) - timedelta(seconds=1000)
         _store(cache, "provider-a", used=10.0, fetched_at=old)

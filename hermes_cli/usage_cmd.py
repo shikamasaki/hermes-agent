@@ -161,7 +161,10 @@ def build_usage_rows(
         raw_record = raw_providers.get(provider)
         windows: list[dict[str, Any]] = []
         source = ""
-        if usage.freshness in ("fresh", "stale") and isinstance(raw_record, dict):
+        recent_record = (
+            usage.age_seconds is not None and usage.age_seconds <= stale_seconds
+        )
+        if recent_record and isinstance(raw_record, dict):
             source = str(raw_record.get("source") or "")
             for window in raw_record.get("windows") or []:
                 if not isinstance(window, dict):
