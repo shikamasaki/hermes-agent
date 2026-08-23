@@ -608,6 +608,23 @@ class TestPreferenceTier:
         )
         assert decision2.route_id == "route-a-standard"
 
+    def test_priority_mode_keeps_order_when_usage_changes(self):
+        catalog = _catalog(
+            _route(preference_tier=0, priority=1, reserve_remaining_percent=0),
+            dict(_ROUTE_B, preference_tier=0, priority=100),
+            prefer_remaining_usage=False,
+        )
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(
+                provider_a=(0.0, "fresh", 1.0),
+                provider_b=(100.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "route-a-standard"
+
     def test_tier_1_wins_when_all_tier_0_routes_ineligible(self):
         # Tier 0 (Provider B) is below its reserve; tier 1 (Provider A) must be
         # selected as the eligible fallback.

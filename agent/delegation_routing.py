@@ -144,6 +144,7 @@ class RouteCatalog:
     usage_ttl_seconds: int = DEFAULT_USAGE_TTL_SECONDS
     usage_stale_seconds: int = DEFAULT_USAGE_STALE_SECONDS
     unknown_usage: str = "fixed_priority"
+    prefer_remaining_usage: bool = True
 
     @property
     def active(self) -> bool:
@@ -336,6 +337,12 @@ def load_route_catalog(delegation_cfg: Optional[Mapping[str, Any]]) -> RouteCata
             f"delegation.routing.unknown_usage={unknown_usage!r} is invalid (expected: {valid})"
         )
 
+    prefer_remaining_usage = routing.get("prefer_remaining_usage", True)
+    if not isinstance(prefer_remaining_usage, bool):
+        raise RouteConfigError(
+            "delegation.routing.prefer_remaining_usage must be a boolean"
+        )
+
     usage_ttl_seconds = _parse_int(
         routing.get("usage_ttl_seconds"),
         "usage_ttl_seconds",
@@ -360,6 +367,7 @@ def load_route_catalog(delegation_cfg: Optional[Mapping[str, Any]]) -> RouteCata
         usage_ttl_seconds=usage_ttl_seconds,
         usage_stale_seconds=usage_stale_seconds,
         unknown_usage=unknown_usage,
+        prefer_remaining_usage=prefer_remaining_usage,
     )
 
 
@@ -610,6 +618,8 @@ def select_route(
     # competes only when no route has a usable fresh/stale reading.  Priority
     # and route id make equal readings deterministic.
     def _rank(route: DelegationRoute) -> tuple[Any, ...]:
+        if not catalog.prefer_remaining_usage:
+            return (route.preference_tier, route.priority, route.id)
         route_usage = usage.for_route(route)
         if route_usage.usable and route_usage.remaining_percent is not None:
             return (
