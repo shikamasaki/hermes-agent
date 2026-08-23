@@ -100,10 +100,9 @@ BUILTIN_CAPABILITIES: tuple[str, ...] = (
 
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
-#: The single external-CLI backend this PR supports: Claude Code print mode
-#: (``claude -p``), used only to consume a Claude Pro/Max subscription. Its
-#: provider slug is fixed and does not belong to ``NATIVE_ROUTABLE_PROVIDERS``
-#: — it is never dispatched through the native in-process agent path.
+#: The single external-CLI backend this local integration supports: Claude Code
+#: print mode (``claude -p``), used only with the subscription provider slug.
+#: It is never dispatched through the native in-process agent path.
 CLAUDE_P_BACKEND = "claude-p"
 CLAUDE_P_PROVIDER = "claude-p"
 

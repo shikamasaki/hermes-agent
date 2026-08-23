@@ -1323,7 +1323,7 @@ class TestRouteSelection:
         assert decision.usage_freshness == "unknown"
         assert decision.usage_remaining_percent is None
 
-    def test_claude_usage_stays_unknown_without_refresh_probe(
+    def test_claude_unknown_usage_schedules_subscription_refresh(
         self, monkeypatch, tmp_path
     ):
         catalog = self._catalog([CLAUDE_ROUTE])
@@ -1336,7 +1336,7 @@ class TestRouteSelection:
             stale_seconds=1800,
         )
         assert view.for_route(catalog.routes[0]).freshness == "unknown"
-        assert refreshes == []
+        assert refreshes == ["claude-p"]
         assert not (tmp_path / "usage.json").exists()
 
     def test_auto_routing_uses_fixed_priority_when_usage_unknown(self):
