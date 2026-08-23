@@ -14,6 +14,7 @@ import json
 import signal
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1314,6 +1315,37 @@ class TestProcessFailures:
 
         assert result.status == "interrupted"
         assert result.summary == "partial streamed summary"
+
+    def test_restricted_run_injects_private_gate_settings_and_cleans_them(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        captured = {}
+        payload = json.dumps(
+            {"subtype": "success", "is_error": False, "result": "done"}
+        ).encode()
+
+        async def _fake(argv, *, env, workdir, timeout_seconds):
+            settings_path = Path(argv[argv.index("--settings") + 1])
+            captured["path"] = settings_path
+            captured["mode"] = settings_path.stat().st_mode & 0o777
+            captured["settings"] = json.loads(settings_path.read_text())
+            return 0, payload, b"", False, False
+
+        monkeypatch.setattr(cb, "_run_claude_p_async", _fake)
+        result = cb.run_claude_p_task(
+            cb.ClaudePRunRequest(
+                prompt="p", model="m", workdir=str(tmp_path), tool_profile="coding"
+            ),
+            write_capable=True,
+        )
+
+        assert result.status == "completed"
+        assert captured["mode"] == 0o600
+        hook = captured["settings"]["hooks"]["PreToolUse"][0]["hooks"][0]
+        assert hook["type"] == "command"
+        assert "claude_p_tool_gate.py" in " ".join(hook["args"])
+        assert not captured["path"].exists()
 
     def test_missing_cli_fails_safely(self, monkeypatch):
         monkeypatch.setattr(cb, "resolve_claude_executable", lambda: None)

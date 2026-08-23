@@ -41,10 +41,13 @@ import math
 import os
 import shutil
 import signal
+import sys
+import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -476,6 +479,42 @@ def reset_workdir_locks() -> None:
         _workdir_locks.clear()
 
 
+def _create_restricted_settings(profile: str, workdir: str) -> tuple[str, str]:
+    """Create a private one-run PreToolUse policy settings file."""
+    directory = tempfile.mkdtemp(prefix="hermes-claude-p-")
+    os.chmod(directory, 0o700)
+    settings_path = os.path.join(directory, "settings.json")
+    gate_script = str(Path(__file__).with_name("claude_p_tool_gate.py").resolve())
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": sys.executable,
+                            "args": [
+                                gate_script,
+                                "--profile",
+                                profile,
+                                "--workdir",
+                                os.path.abspath(workdir),
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    fd = os.open(settings_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, json.dumps(settings, separators=(",", ":")).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return settings_path, directory
+
+
 # ---------------------------------------------------------------------------
 # Argv construction — pure, shell-free, one argv element per logical field.
 # ---------------------------------------------------------------------------
@@ -496,6 +535,7 @@ class ClaudePRunRequest:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     resume_session_id: Optional[str] = None
     auto_approve: bool = False
+    settings_path: Optional[str] = None
 
 
 def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[str]:
@@ -552,6 +592,8 @@ def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[
             "",
             "--disable-slash-commands",
         ]
+        if request.settings_path:
+            argv += ["--settings", request.settings_path]
     argv += [
         "--output-format",
         "stream-json",
@@ -1322,6 +1364,7 @@ def run_claude_p_task(
 
     lock = workdir_lock_for(request.workdir) if write_capable else None
     acquired = False
+    settings_dir: Optional[str] = None
     try:
         if lock is not None:
             while True:
@@ -1345,6 +1388,12 @@ def run_claude_p_task(
                     acquired = True
                     break
 
+        profile = resolve_tool_profile(request.tool_profile)
+        if not profile.passthrough:
+            settings_path, settings_dir = _create_restricted_settings(
+                profile.name, request.workdir
+            )
+            request = replace(request, settings_path=settings_path)
         argv = build_claude_p_argv(request, executable=executable)
         env = build_scrubbed_environment()
 
@@ -1396,6 +1445,8 @@ def run_claude_p_task(
             model_usage={},
         )
     finally:
+        if settings_dir:
+            shutil.rmtree(settings_dir, ignore_errors=True)
         if acquired and lock is not None:
             lock.release()
 
