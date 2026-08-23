@@ -350,6 +350,22 @@ class TestEnvironmentScrub:
         assert "CODEX_API_KEY" not in env
         assert "ANTIGRAVITY_ACCESS_TOKEN" not in env
 
+    def test_same_user_identity_is_preserved_for_macos_keychain_oauth(self):
+        """Claude Max auth lookup needs the invoking account name on macOS."""
+        env = cb.build_scrubbed_environment(
+            {
+                "HOME": "/Users/dev",
+                "PATH": "/usr/bin:/bin",
+                "USER": "dev",
+                "LOGNAME": "dev",
+                "ANTHROPIC_API_KEY": "must-not-leak",
+            }
+        )
+
+        assert env["USER"] == "dev"
+        assert env["LOGNAME"] == "dev"
+        assert "ANTHROPIC_API_KEY" not in env
+
 
 # ---------------------------------------------------------------------------
 # 4. Auth status projection

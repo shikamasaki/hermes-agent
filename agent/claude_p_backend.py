@@ -209,6 +209,8 @@ def _bounded_float(value: Any, *, default: float, ceiling: float, floor: float =
 _ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "HOME",
+        "USER",
+        "LOGNAME",
         "PATH",
         "LANG",
         "LC_ALL",
