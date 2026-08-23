@@ -4472,6 +4472,11 @@ def delegate_task(
             )
             if live_deleg_id:
                 child._delegation_id = live_deleg_id
+            parent_depth = getattr(parent_agent, "_delegate_depth", 0)
+            child._delegate_depth = (
+                max(0, parent_depth) + 1 if isinstance(parent_depth, int) else 1
+            )
+            child._parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
             child._parent_session_id = getattr(parent_agent, "session_id", None)
             try:
                 child._delegate_parent_ref = weakref.ref(parent_agent)
@@ -5740,7 +5745,7 @@ _ROUTE_DESCRIPTION = (
     "Optional explicit route id from delegation.routes — an override that "
     "pins this task to one configured provider:model pair and skips "
     "difficulty-based selection. The route is still validated (enabled, "
-    "native backend, provider available, capabilities satisfied), but it may "
+    "supported backend, provider available, capabilities satisfied), but it may "
     "run a route below its usage reserve. Prefer describing 'difficulty' and "
     "'required_capabilities' and letting Hermes route."
 )

@@ -106,6 +106,20 @@ class TestParseConfig:
         parsed = parse_orchestrator_routing_config(cfg)
         assert parsed.enabled is False
 
+    @pytest.mark.parametrize("bad", ["false", "true", 0, 1])
+    def test_enabled_rejects_non_boolean_values(self, bad):
+        from agent.orchestrator_usage_routing import (
+            OrchestratorRoutingConfigError,
+            parse_orchestrator_routing_config,
+        )
+
+        cfg = {
+            "agent": {
+                "orchestrator_usage_routing": _valid_config(enabled=bad)
+            }
+        }
+        with pytest.raises(OrchestratorRoutingConfigError, match="enabled.*boolean"):
+            parse_orchestrator_routing_config(cfg)
 
     def test_rejects_invalid_provider_slug(self):
         from agent.orchestrator_usage_routing import (

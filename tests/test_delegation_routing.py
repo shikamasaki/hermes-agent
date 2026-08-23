@@ -93,6 +93,23 @@ class TestRouteCatalogParsing:
         assert catalog.enabled is False
         assert catalog.routes == ()
 
+    @pytest.mark.parametrize("bad", ["false", "true", 0, 1])
+    def test_routing_enabled_rejects_non_boolean_values(self, bad):
+        with pytest.raises(dr.RouteConfigError, match="enabled.*boolean"):
+            dr.load_route_catalog(
+                {"routing": {"enabled": bad}, "routes": [_route()]}
+            )
+
+    @pytest.mark.parametrize("bad", ["false", "true", 0, 1])
+    def test_route_enabled_rejects_non_boolean_values(self, bad):
+        with pytest.raises(dr.RouteConfigError, match="enabled.*boolean"):
+            dr.load_route_catalog(
+                {
+                    "routing": {"enabled": True},
+                    "routes": [_route(enabled=bad)],
+                }
+            )
+
     def test_empty_routes_preserve_legacy_even_with_unused_policy_values(self):
         catalog = dr.load_route_catalog(
             {

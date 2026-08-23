@@ -151,6 +151,14 @@ def _parse_positive_int(raw: Any, key: str, *, where: str) -> int:
     return value
 
 
+def _parse_bool(raw: Any, key: str, *, where: str, default: bool) -> bool:
+    if raw is None:
+        return default
+    if not isinstance(raw, bool):
+        raise OrchestratorRoutingConfigError(f"{where}: '{key}' must be a boolean")
+    return raw
+
+
 def _parse_window_prefixes(raw: Any, *, where: str) -> tuple[str, ...]:
     if raw is None:
         return ()
@@ -197,7 +205,8 @@ def parse_orchestrator_routing_config(
 
     # Inert-when-disabled, BEFORE validating the rest — same idiom as
     # delegation_routing.load_route_catalog's routing.enabled gate.
-    if not bool(block.get("enabled", False)):
+    enabled = _parse_bool(block.get("enabled"), "enabled", where=where, default=False)
+    if not enabled:
         return OrchestratorRoutingConfig(enabled=False)
 
     primary_provider = _require_native_provider(

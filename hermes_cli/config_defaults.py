@@ -1992,6 +1992,16 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # Optional usage-aware provider:model route catalog. Disabled and empty
+        # by default so legacy delegation.provider/model behavior is unchanged.
+        "routing": {
+            "enabled": False,
+            "usage_ttl_seconds": 300,
+            "usage_stale_seconds": 1800,
+            "unknown_usage": "fixed_priority",
+            "prefer_remaining_usage": True,
+        },
+        "routes": [],
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these

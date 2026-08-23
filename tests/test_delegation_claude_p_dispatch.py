@@ -185,6 +185,31 @@ class TestClaudePDispatch:
         assert spec.params["model"] == "claude-opus-5"
         assert spec.write_capable is False
 
+    def test_nested_claude_child_inherits_parent_identity_and_depth(
+        self, harness, monkeypatch
+    ):
+        _stub_claude_success(monkeypatch)
+        monkeypatch.setattr(
+            dt,
+            "_load_config",
+            lambda: {**MIXED_CFG, "max_spawn_depth": 3},
+        )
+        parent = _Parent()
+        parent._delegate_depth = 1
+        setattr(parent, "_subagent_id", "parent-subagent")
+
+        dt.delegate_task(
+            parent_agent=parent,
+            background=False,
+            goal="Review the scheduler",
+            difficulty="complex",
+        )
+
+        spec = harness["ran"][0][1]
+        assert isinstance(spec, dt.ClaudePChildSpec)
+        assert spec._parent_subagent_id == "parent-subagent"
+        assert spec._delegate_depth == 2
+
     def test_subagent_auto_approve_is_captured_into_claude_p_run_params(self, harness, monkeypatch):
         cfg = {
             **MIXED_CFG,

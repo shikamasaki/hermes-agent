@@ -109,6 +109,27 @@ class TestDiscoverConfiguredProviders:
         assert "custom" not in providers
         assert "" not in providers
 
+    def test_discovers_enabled_orchestrator_routing_providers(self):
+        config = {
+            "agent": {
+                "orchestrator_usage_routing": {
+                    "enabled": True,
+                    "primary_provider": "Provider-A",
+                    "primary_model": "model-a",
+                    "fallback_provider": "provider-b",
+                    "fallback_model": "model-b",
+                    "switch_at_remaining_percent": 10,
+                    "restore_above_remaining_percent": 10,
+                    "usage_ttl_seconds": 900,
+                    "usage_stale_seconds": 7200,
+                }
+            }
+        }
+
+        providers = usage_cmd.discover_configured_providers(config)
+
+        assert providers == ("provider-a", "provider-b")
+
     def test_orchestrator_routing_disabled_contributes_nothing(self):
         config = {
             "agent": {

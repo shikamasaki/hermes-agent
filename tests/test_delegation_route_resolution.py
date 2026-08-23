@@ -383,6 +383,12 @@ class TestSchema:
         for field in ("route", "difficulty", "difficulty_reason", "required_capabilities"):
             assert field in task_props, f"tasks[].'{field}' missing from schema"
 
+    def test_route_description_names_supported_backends(self):
+        props = dt.DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        description = props["route"]["description"].lower()
+        assert "supported backend" in description
+        assert "native backend" not in description
+
     def test_difficulty_enum_matches_taxonomy(self):
         props = dt.DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         assert props["difficulty"]["enum"] == ["routine", "standard", "complex", "frontier"]

@@ -303,6 +303,14 @@ def _parse_strict_nonnegative_int(raw: Any, key: str, *, where: str, default: in
     return raw
 
 
+def _parse_bool(raw: Any, key: str, *, where: str, default: bool) -> bool:
+    if raw is None:
+        return default
+    if not isinstance(raw, bool):
+        raise RouteConfigError(f"{where}: '{key}' must be a boolean")
+    return raw
+
+
 def _parse_bounded_int(
     raw: Any, key: str, *, where: str, default: int, ceiling: int, minimum: int = 1
 ) -> int:
@@ -427,7 +435,7 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
             default=DEFAULT_CLAUDE_P_COOLDOWN_SECONDS,
             ceiling=MAX_CLAUDE_P_COOLDOWN_SECONDS,
         ),
-        enabled=bool(raw.get("enabled", True)),
+        enabled=_parse_bool(raw.get("enabled"), "enabled", where=where, default=True),
     )
 
 
@@ -444,7 +452,13 @@ def load_route_catalog(delegation_cfg: Optional[Mapping[str, Any]]) -> RouteCata
     # A disabled catalog must be inert.  In particular, staged/future route
     # entries may name backends this build does not support; validating them
     # while routing is off would break the legacy provider/model path.
-    if not bool(routing.get("enabled", False)):
+    routing_enabled = _parse_bool(
+        routing.get("enabled"),
+        "enabled",
+        where="delegation.routing",
+        default=False,
+    )
+    if not routing_enabled:
         return RouteCatalog()
 
     routes_raw = cfg.get("routes")

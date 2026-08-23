@@ -77,6 +77,18 @@ def discover_configured_providers(config: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(model_cfg, Mapping):
         _add(model_cfg.get("provider"))
 
+    try:
+        from agent.orchestrator_usage_routing import parse_orchestrator_routing_config
+
+        orchestrator = parse_orchestrator_routing_config(cfg)
+    except Exception:
+        # Usage reporting must remain available even when an optional routing
+        # block is malformed; config validation surfaces that error elsewhere.
+        orchestrator = None
+    if orchestrator is not None and orchestrator.enabled:
+        _add(orchestrator.primary_provider)
+        _add(orchestrator.fallback_provider)
+
     delegation_cfg = cfg.get("delegation")
     if isinstance(delegation_cfg, Mapping):
         # Preserve legacy delegation.provider/model configurations when no

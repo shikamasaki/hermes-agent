@@ -1062,8 +1062,8 @@ async def _run_claude_p_async(
     timeout_seconds: float,
     cancel_event: Optional[threading.Event] = None,
     event_callback: Optional[ClaudePEventCallback] = None,
-) -> tuple[int, bytes, bytes, bool, bool]:
-    """Return (returncode, stdout, stderr, timed_out, output_overflow).
+) -> tuple[int, bytes, bytes, bool, bool, bool]:
+    """Return (returncode, stdout, stderr, timed_out, output_overflow, interrupted).
 
     Never ``shell=True``. On POSIX the child leads its own process group
     (``start_new_session=True``) so a timeout/cancellation can terminate the
@@ -1146,7 +1146,14 @@ async def _run_claude_p_async(
     returncode = proc.returncode if proc.returncode is not None else -1
     if interrupted and returncode == 0:
         returncode = -1
-    return returncode, stdout, stderr, timed_out, (stdout_overflow or stderr_overflow)
+    return (
+        returncode,
+        stdout,
+        stderr,
+        timed_out,
+        (stdout_overflow or stderr_overflow),
+        interrupted,
+    )
 
 
 async def _cancel_process(
@@ -1283,7 +1290,7 @@ def run_claude_p_task(
         argv = build_claude_p_argv(request, executable=executable)
         env = build_scrubbed_environment()
 
-        async def _runner() -> tuple[int, bytes, bytes, bool, bool]:
+        async def _runner() -> tuple:
             run_kwargs = {
                 "env": env,
                 "workdir": request.workdir,
@@ -1296,7 +1303,23 @@ def run_claude_p_task(
             task = asyncio.ensure_future(_run_claude_p_async(argv, **run_kwargs))
             return await task
 
-        returncode, stdout_bytes, _stderr_bytes, timed_out, output_overflow = asyncio.run(_runner())
+        run_result = asyncio.run(_runner())
+        if len(run_result) == 6:
+            (
+                returncode,
+                stdout_bytes,
+                _stderr_bytes,
+                timed_out,
+                output_overflow,
+                interrupted,
+            ) = run_result
+        else:
+            # Backward compatibility for third-party/test doubles that still
+            # implement the historical five-item runner contract.
+            returncode, stdout_bytes, _stderr_bytes, timed_out, output_overflow = run_result
+            interrupted = bool(
+                cancel_event is not None and cancel_event.is_set() and not timed_out
+            )
     except Exception as exc:
         duration = time.monotonic() - start
         logger.debug("claude-p spawn failed: %s", type(exc).__name__)
@@ -1321,7 +1344,6 @@ def run_claude_p_task(
     duration = time.monotonic() - start
     stdout_text = stdout_bytes.decode("utf-8", errors="replace")
 
-    interrupted = bool(cancel_event is not None and cancel_event.is_set() and not timed_out)
     if interrupted:
         parsed = normalize_claude_p_stream(
             stdout_text,
