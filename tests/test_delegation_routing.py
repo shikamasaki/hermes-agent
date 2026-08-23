@@ -28,6 +28,11 @@ def _route(**overrides):
 
 
 class TestRouteCatalogParsing:
+    def test_rejects_non_machine_safe_route_id(self):
+        route = _route(id="https://example.invalid/?token=SECRET user@example.com")
+        with pytest.raises(dr.RouteConfigError, match="machine slug"):
+            _catalog(route)
+
     def test_parses_contract_example(self):
         cfg = {
             "routing": {
@@ -197,7 +202,7 @@ def _catalog(*routes, **routing):
     return dr.load_route_catalog(cfg)
 
 
-_GEMINI = {
+_ROUTE_B = {
     "id": "route-b-routine",
     "backend": "native",
     "provider": "provider-b",
@@ -230,7 +235,7 @@ _ALL_AVAILABLE = frozenset({"provider-a", "provider-b"})
 
 class TestSelection:
     def test_selects_matching_difficulty_and_returns_decision(self):
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE),
@@ -249,7 +254,7 @@ class TestSelection:
 
     def test_difficulty_equivalence_across_providers(self):
         """Equivalent routes with equal usage fall back to priority."""
-        catalog = _catalog(_route(priority=10), _GEMINI)
+        catalog = _catalog(_route(priority=10), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -266,7 +271,7 @@ class TestSelection:
         ]
 
     def test_equivalent_route_with_more_remaining_usage_wins_before_priority(self):
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -279,7 +284,7 @@ class TestSelection:
         assert decision.route_id == "route-b-routine"
 
     def test_minimum_model_class_filters_weaker_routes(self):
-        catalog = _catalog(_route(priority=50), _GEMINI)
+        catalog = _catalog(_route(priority=50), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(
@@ -295,7 +300,7 @@ class TestSelection:
         assert decision.route_id == "route-a-standard"
 
     def test_capabilities_filter_is_subset_match(self):
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(
@@ -323,7 +328,7 @@ class TestSelection:
         assert "capabilit" in decision.reason.lower()
 
     def test_unavailable_provider_excluded(self):
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -333,7 +338,7 @@ class TestSelection:
         assert decision.route_id == "route-b-routine"
 
     def test_disabled_route_excluded(self):
-        catalog = _catalog(_route(enabled=False), _GEMINI)
+        catalog = _catalog(_route(enabled=False), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.COMPLEX),
@@ -356,7 +361,7 @@ class TestSelection:
         assert picks == {"aaa-second"}
 
     def test_ranked_candidates_are_stably_ordered(self):
-        catalog = _catalog(_route(priority=20), _GEMINI)
+        catalog = _catalog(_route(priority=20), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -371,7 +376,7 @@ class TestSelection:
 
 class TestExplicitOverride:
     def test_explicit_route_wins_and_is_marked(self):
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
@@ -382,7 +387,7 @@ class TestExplicitOverride:
         assert decision.explicit_override is True
 
     def test_explicit_route_still_validates_capabilities(self):
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(
@@ -397,7 +402,7 @@ class TestExplicitOverride:
         assert "capabilit" in decision.reason.lower()
 
     def test_explicit_route_rejected_when_provider_unavailable(self):
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
@@ -408,7 +413,7 @@ class TestExplicitOverride:
         assert "available" in decision.reason.lower()
 
     def test_explicit_route_rejected_when_disabled(self):
-        catalog = _catalog(_route(), dict(_GEMINI, enabled=False))
+        catalog = _catalog(_route(), dict(_ROUTE_B, enabled=False))
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD, route_id="route-b-routine"),
@@ -430,7 +435,7 @@ class TestExplicitOverride:
         assert "nope" in decision.reason
 
     def test_explicit_override_bypasses_reserve_but_says_so(self):
-        catalog = _catalog(_GEMINI)
+        catalog = _catalog(_ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.ROUTINE, route_id="route-b-routine"),
@@ -444,7 +449,7 @@ class TestExplicitOverride:
 
 class TestReserveThreshold:
     def test_route_below_reserve_is_excluded(self):
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -467,7 +472,7 @@ class TestReserveThreshold:
         assert decision.route_id == "route-a-standard"
 
     def test_stale_usage_below_reserve_also_excludes(self):
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -481,7 +486,7 @@ class TestReserveThreshold:
 
     def test_known_healthy_usage_outranks_unknown_usage(self):
         """Unknown usage stays eligible but is never treated as unlimited."""
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -492,7 +497,7 @@ class TestReserveThreshold:
         assert decision.usage_freshness == "fresh"
 
     def test_all_unknown_usage_uses_fixed_priority(self):
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -503,7 +508,7 @@ class TestReserveThreshold:
         assert decision.usage_freshness == "unknown"
 
     def test_unknown_usage_skip_policy_excludes_route(self):
-        catalog = _catalog(_route(priority=1), _GEMINI, unknown_usage="skip")
+        catalog = _catalog(_route(priority=1), _ROUTE_B, unknown_usage="skip")
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -514,7 +519,7 @@ class TestReserveThreshold:
 
     def test_unknown_usage_does_not_outrank_known_healthy_route(self):
         """Known healthy wins even when the unknown route has better priority."""
-        catalog = _catalog(_route(priority=1), _GEMINI)
+        catalog = _catalog(_route(priority=1), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -532,7 +537,7 @@ class TestSelectorPurity:
             raise AssertionError("selector must not fetch usage")
 
         monkeypatch.setattr(au, "fetch_account_usage", _boom)
-        catalog = _catalog(_route(), _GEMINI)
+        catalog = _catalog(_route(), _ROUTE_B)
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
@@ -557,7 +562,7 @@ class TestPreferenceTier:
         # Tier 1 (Provider A) has far more remaining than tier 0 (Provider B),
         # but tier must be compared before usage/priority.
         route_a = _route(preference_tier=1, priority=1)
-        route_b = dict(_GEMINI, preference_tier=0, priority=100)
+        route_b = dict(_ROUTE_B, preference_tier=0, priority=100)
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -574,7 +579,7 @@ class TestPreferenceTier:
         # Both tier 0: existing usage-aware ordering must still apply
         # unchanged (remaining desc wins over priority).
         route_a = _route(preference_tier=0, priority=1)
-        route_b = dict(_GEMINI, preference_tier=0, priority=100)
+        route_b = dict(_ROUTE_B, preference_tier=0, priority=100)
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -590,7 +595,7 @@ class TestPreferenceTier:
         # And priority still breaks ties when remaining is equal.
         catalog2 = _catalog(
             _route(preference_tier=0, priority=1),
-            dict(_GEMINI, preference_tier=0, priority=100),
+            dict(_ROUTE_B, preference_tier=0, priority=100),
         )
         decision2 = dr.select_route(
             catalog2,
@@ -607,7 +612,7 @@ class TestPreferenceTier:
         # Tier 0 (Provider B) is below its reserve; tier 1 (Provider A) must be
         # selected as the eligible fallback.
         route_a = _route(preference_tier=1, priority=1, reserve_remaining_percent=15)
-        route_b = dict(_GEMINI, preference_tier=0, priority=1, reserve_remaining_percent=50)
+        route_b = dict(_ROUTE_B, preference_tier=0, priority=1, reserve_remaining_percent=50)
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -622,7 +627,7 @@ class TestPreferenceTier:
 
     def test_tier_1_wins_when_tier_0_disabled(self):
         route_a = _route(preference_tier=1)
-        route_b = dict(_GEMINI, preference_tier=0, enabled=False)
+        route_b = dict(_ROUTE_B, preference_tier=0, enabled=False)
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -635,7 +640,7 @@ class TestPreferenceTier:
 
     def test_tier_1_wins_when_tier_0_capability_ineligible(self):
         route_a = _route(preference_tier=1, capabilities=["coding", "reasoning", "tool_use", "vision"])
-        route_b = dict(_GEMINI, preference_tier=0)  # lacks "vision"
+        route_b = dict(_ROUTE_B, preference_tier=0)  # lacks "vision"
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -652,11 +657,11 @@ class TestPreferenceTier:
         assert decision.route_id == "route-a-standard"
 
     def test_tier_1_wins_when_tier_0_difficulty_ineligible(self):
-        # _GEMINI only serves routine/standard; frontier is tier-0-ineligible.
+        # _ROUTE_B only serves routine/standard; frontier is tier-0-ineligible.
         route_a = _route(
             preference_tier=1, task_difficulties=["standard", "complex", "frontier"]
         )
-        route_b = dict(_GEMINI, preference_tier=0)
+        route_b = dict(_ROUTE_B, preference_tier=0)
         catalog = _catalog(route_a, route_b)
         decision = dr.select_route(
             catalog,
@@ -720,7 +725,7 @@ class TestPreferenceTier:
         alongside raw usage/identity data. RouteDecision's documented public
         fields remain exactly what they were before this feature.
         """
-        catalog = _catalog(_route(preference_tier=0), dict(_GEMINI, preference_tier=1))
+        catalog = _catalog(_route(preference_tier=0), dict(_ROUTE_B, preference_tier=1))
         decision = dr.select_route(
             catalog,
             dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),

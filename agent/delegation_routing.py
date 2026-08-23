@@ -252,6 +252,10 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
         raise RouteConfigError(f"{where}: each route must be a mapping")
 
     route_id = _require_str(raw, "id", where=where)
+    if not _PROVIDER_SLUG_RE.fullmatch(route_id):
+        raise RouteConfigError(
+            f"{where}: 'id' must be a non-empty machine slug"
+        )
     where = f"delegation.routes[{index}] (id={route_id!r})"
 
     backend = str(raw.get("backend") or "native").strip().lower()
