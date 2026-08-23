@@ -540,3 +540,192 @@ class TestSelectorPurity:
             available_providers=_ALL_AVAILABLE,
         )
         assert decision.selected is True
+
+
+class TestPreferenceTier:
+    """Task-side (delegate_task) provider preference tiers.
+
+    Requirement: delegate_task must support generic preference grouping across
+    configured routes. ``preference_tier`` is an
+    optional nonnegative int, default 0, ranked BEFORE all usage/priority
+    fields. Within one tier the existing usage-aware ordering (known
+    remaining desc, then priority, then id) is unchanged. The contract is
+    enforced purely by which tier a route's config assigns it.
+    """
+
+    def test_tier_0_beats_tier_1_even_with_more_remaining_usage(self):
+        # Tier 1 (OpenAI) has far more remaining than tier 0 (Antigravity),
+        # but tier must be compared before usage/priority.
+        codex = _route(preference_tier=1, priority=1)
+        gemini = dict(_GEMINI, preference_tier=0, priority=100)
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(
+                openai_codex=(95.0, "fresh", 1.0),
+                google_antigravity=(15.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "gemini-routine"
+
+    def test_two_tier_0_routes_still_rank_by_remaining_then_priority(self):
+        # Both tier 0: existing usage-aware ordering must still apply
+        # unchanged (remaining desc wins over priority).
+        codex = _route(preference_tier=0, priority=1)
+        gemini = dict(_GEMINI, preference_tier=0, priority=100)
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(
+                openai_codex=(35.0, "fresh", 1.0),
+                google_antigravity=(80.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "gemini-routine"
+
+        # And priority still breaks ties when remaining is equal.
+        catalog2 = _catalog(
+            _route(preference_tier=0, priority=1),
+            dict(_GEMINI, preference_tier=0, priority=100),
+        )
+        decision2 = dr.select_route(
+            catalog2,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(
+                openai_codex=(90.0, "fresh", 1.0),
+                google_antigravity=(90.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision2.route_id == "codex-standard"
+
+    def test_tier_1_wins_when_all_tier_0_routes_ineligible(self):
+        # Tier 0 (Antigravity) is below its reserve; tier 1 (OpenAI) must be
+        # selected as the eligible fallback.
+        codex = _route(preference_tier=1, priority=1, reserve_remaining_percent=15)
+        gemini = dict(_GEMINI, preference_tier=0, priority=1, reserve_remaining_percent=50)
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(
+                openai_codex=(90.0, "fresh", 1.0),
+                google_antigravity=(10.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "codex-standard"
+
+    def test_tier_1_wins_when_tier_0_disabled(self):
+        codex = _route(preference_tier=1)
+        gemini = dict(_GEMINI, preference_tier=0, enabled=False)
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "codex-standard"
+
+
+    def test_tier_1_wins_when_tier_0_capability_ineligible(self):
+        codex = _route(preference_tier=1, capabilities=["coding", "reasoning", "tool_use", "vision"])
+        gemini = dict(_GEMINI, preference_tier=0)  # lacks "vision"
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(
+                difficulty=dr.TaskDifficulty.STANDARD,
+                required_capabilities=frozenset({"vision"}),
+            ),
+            usage=_usage(
+                openai_codex=(90.0, "fresh", 1.0),
+                google_antigravity=(90.0, "fresh", 1.0),
+            ),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "codex-standard"
+
+    def test_tier_1_wins_when_tier_0_difficulty_ineligible(self):
+        # _GEMINI only serves routine/standard; frontier is tier-0-ineligible.
+        codex = _route(
+            preference_tier=1, task_difficulties=["standard", "complex", "frontier"]
+        )
+        gemini = dict(_GEMINI, preference_tier=0)
+        catalog = _catalog(codex, gemini)
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.FRONTIER),
+            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            available_providers=_ALL_AVAILABLE,
+        )
+        assert decision.route_id == "codex-standard"
+
+    def test_preference_tier_absent_defaults_to_zero(self):
+        cfg = {"routing": {"enabled": True}, "routes": [_route()]}
+        catalog = dr.load_route_catalog(cfg)
+        assert catalog.routes[0].preference_tier == 0
+
+    def test_preference_tier_defaults_to_zero_on_dataclass_directly(self):
+        route = dr.DelegationRoute(
+            id="r",
+            provider="openai-codex",
+            model="m",
+            model_class=dr.ModelClass.ADVANCED,
+            task_difficulties=(dr.TaskDifficulty.STANDARD,),
+        )
+        assert route.preference_tier == 0
+
+    @pytest.mark.parametrize(
+        "bad_tier",
+        [-1, -5, 1.5, "high", "1", "0.5", float("nan"), float("inf")],
+    )
+    def test_negative_or_non_integer_preference_tier_is_rejected(self, bad_tier):
+        cfg = {
+            "routing": {"enabled": True},
+            "routes": [_route(preference_tier=bad_tier)],
+        }
+        with pytest.raises(dr.RouteConfigError) as exc:
+            dr.load_route_catalog(cfg)
+        assert "preference_tier" in str(exc.value)
+
+    def test_bool_preference_tier_is_rejected(self):
+        # bool is an int subclass in Python; must not silently coerce to 0/1.
+        cfg = {
+            "routing": {"enabled": True},
+            "routes": [_route(preference_tier=True)],
+        }
+        with pytest.raises(dr.RouteConfigError) as exc:
+            dr.load_route_catalog(cfg)
+        assert "preference_tier" in str(exc.value)
+
+    def test_positive_integer_preference_tier_is_accepted(self):
+        cfg = {
+            "routing": {"enabled": True},
+            "routes": [_route(preference_tier=2)],
+        }
+        catalog = dr.load_route_catalog(cfg)
+        assert catalog.routes[0].preference_tier == 2
+
+    def test_route_decision_never_carries_usage_identity_via_tier_fields(self):
+        """Public RouteDecision surface stays usage/identity-free for tiering.
+
+        preference_tier is a plain config-time integer on DelegationRoute; it
+        must never be threaded onto RouteDecision (or any public surface)
+        alongside raw usage/identity data. RouteDecision's documented public
+        fields remain exactly what they were before this feature.
+        """
+        catalog = _catalog(_route(preference_tier=0), dict(_GEMINI, preference_tier=1))
+        decision = dr.select_route(
+            catalog,
+            dr.RouteRequest(difficulty=dr.TaskDifficulty.STANDARD),
+            usage=_usage(openai_codex=(90.0, "fresh", 1.0)),
+            available_providers=_ALL_AVAILABLE,
+        )
+        decision_fields = {f for f in vars(decision).keys()}
+        assert "preference_tier" not in decision_fields

@@ -122,6 +122,8 @@ class DelegationRoute:
     task_difficulties: tuple[TaskDifficulty, ...]
     capabilities: frozenset[str] = frozenset()
     priority: int = 100
+    # Generic preference group: lower tiers rank before usage and priority.
+    preference_tier: int = 0
     reserve_remaining_percent: float = 0.0
     usage_window_prefixes: tuple[str, ...] = ()
     backend: str = "native"
@@ -225,6 +227,20 @@ def _parse_int(raw: Any, key: str, *, where: str, default: int, minimum: int = 0
     return value
 
 
+def _parse_strict_nonnegative_int(
+    raw: Any, key: str, *, where: str, default: int = 0
+) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise RouteConfigError(
+            f"{where}: '{key}'={raw!r} must be a nonnegative integer"
+        )
+    if raw < 0:
+        raise RouteConfigError(f"{where}: '{key}'={raw!r} must be >= 0")
+    return raw
+
+
 def _parse_route(raw: Any, index: int) -> DelegationRoute:
     where = f"delegation.routes[{index}]"
     if not isinstance(raw, Mapping):
@@ -259,6 +275,9 @@ def _parse_route(raw: Any, index: int) -> DelegationRoute:
         task_difficulties=_parse_difficulties(raw.get("task_difficulties"), where=where),
         capabilities=_parse_capabilities(raw.get("capabilities"), where=where),
         priority=_parse_int(raw.get("priority"), "priority", where=where, default=100),
+        preference_tier=_parse_strict_nonnegative_int(
+            raw.get("preference_tier"), "preference_tier", where=where, default=0
+        ),
         reserve_remaining_percent=_parse_percent(
             raw.get("reserve_remaining_percent"), "reserve_remaining_percent", where=where
         ),
@@ -581,16 +600,23 @@ def select_route(
             continue
         eligible.append(route)
 
-    # Usage-aware total ordering.  Once difficulty/model-class/capability and
-    # reserve constraints are satisfied, prefer the route with the most known
+    # Preference tier ranks before the existing usage-aware total ordering.
+    # Once difficulty/model-class/capability and reserve constraints are
+    # satisfied, prefer the route with the most known
     # remaining allowance.  Unknown usage is never treated as unlimited: it
     # competes only when no route has a usable fresh/stale reading.  Priority
     # and route id make equal readings deterministic.
     def _rank(route: DelegationRoute) -> tuple[Any, ...]:
         route_usage = usage.for_route(route)
         if route_usage.usable and route_usage.remaining_percent is not None:
-            return (0, -route_usage.remaining_percent, route.priority, route.id)
-        return (1, 0.0, route.priority, route.id)
+            return (
+                route.preference_tier,
+                0,
+                -route_usage.remaining_percent,
+                route.priority,
+                route.id,
+            )
+        return (route.preference_tier, 1, 0.0, route.priority, route.id)
 
     eligible.sort(key=_rank)
     considered = tuple(r.id for r in eligible)
