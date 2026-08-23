@@ -5127,13 +5127,16 @@ _DIFFICULTY_REASON_DESCRIPTION = (
 )
 
 _REQUIRED_CAPABILITIES_DESCRIPTION = (
-    "Capabilities the assigned model must have; matched as a subset, so ask "
-    "only for what the task genuinely needs. Built-in values: 'coding' "
-    "(writing/editing code), 'reasoning' (multi-step analysis), 'tool_use' "
-    "(reliable multi-tool sequences), 'long_context' (large files or many "
-    "files at once), 'vision' (images, screenshots, diagrams), 'review' "
-    "(critique and correctness checking). Over-requesting narrows the "
-    "eligible routes and can leave none."
+    "Capabilities or arbitrary config-defined purpose tags the assigned route "
+    "must have; matched as a subset, so ask only for what the task genuinely "
+    "needs. Built-in capability values: 'coding' (writing/editing code), "
+    "'reasoning' (multi-step analysis), 'tool_use' (reliable multi-tool "
+    "sequences), 'long_context' (large files or many files at once), 'vision' "
+    "(images, screenshots, diagrams), and 'review' (critique and correctness "
+    "checking). Arbitrary tags such as 'purpose:research', 'source:web', or "
+    "'domain:finance' are also accepted when matching routes declare them in "
+    "config; adding a new purpose tag requires config only, not a code change. "
+    "Over-requesting narrows the eligible routes and can leave none."
 )
 
 _MINIMUM_MODEL_CLASS_DESCRIPTION = (

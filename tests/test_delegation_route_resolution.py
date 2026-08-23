@@ -402,6 +402,9 @@ class TestSchema:
         caps_doc = props["required_capabilities"]["description"].lower()
         for cap in ("coding", "reasoning", "tool_use", "long_context", "vision", "review"):
             assert cap in caps_doc
+        assert "arbitrary" in caps_doc
+        assert "purpose:" in caps_doc
+        assert "config" in caps_doc
 
     def test_schema_carries_no_dynamic_usage_data(self, monkeypatch, all_available):
         """Quota numbers must never enter the tool schema (prompt-cache churn)."""
