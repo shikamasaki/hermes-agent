@@ -1,17 +1,17 @@
-"""CLI integration tests for main-orchestrator usage-aware routing (Agy fallback).
+"""CLI integration tests for main-orchestrator usage-aware routing (Fallback fallback).
 
 ``HermesCLI._resolve_turn_agent_config`` (hermes_cli/cli_agent_setup_mixin.py)
 is the per-turn hook that decides model/runtime/signature before
 ``_init_agent`` rebuilds ``self.agent``. These tests prove that when
 ``agent.orchestrator_usage_routing`` is enabled and configured, that hook:
 
-* switches to the Agy fallback (native google-antigravity /
-  gemini-3.1-pro-high) when the cached Codex remaining is <= the configured
+* switches to the Fallback fallback (native provider-fallback /
+  model-fallback) when the cached Primary remaining is <= the configured
   threshold;
-* fails CLOSED to the current/primary Codex runtime if Agy runtime/auth
+* fails CLOSED to the current/primary Primary runtime if Fallback runtime/auth
   resolution raises (never exposes the exception, never raises out of the
   turn hook);
-* recovers back to Codex on a fresh good reading after being on Agy;
+* recovers back to Primary on a fresh good reading after being on Fallback;
 * preserves the existing `/fast` request_overrides behavior for whichever
   model ends up selected.
 
@@ -26,10 +26,10 @@ from unittest.mock import patch
 
 from agent.delegation_routing import ProviderUsage
 
-PRIMARY_PROVIDER = "openai-codex"
-PRIMARY_MODEL = "gpt-5.6-sol"
-FALLBACK_PROVIDER = "google-antigravity"
-FALLBACK_MODEL = "gemini-3.1-pro-high"
+PRIMARY_PROVIDER = "provider-primary"
+PRIMARY_MODEL = "model-primary"
+FALLBACK_PROVIDER = "provider-fallback"
+FALLBACK_MODEL = "model-fallback"
 
 _ROUTING_CONFIG = {
     "agent": {
@@ -56,7 +56,7 @@ def _make_shell(provider=PRIMARY_PROVIDER, model=PRIMARY_MODEL, service_tier=Non
         base_url="https://example.invalid",
         provider=provider,
         requested_provider=provider,
-        api_mode="codex_responses",
+        api_mode="primary_responses",
         acp_command=None,
         acp_args=[],
         _credential_pool=None,
@@ -80,17 +80,17 @@ def _bound(shell):
     return HermesCLI._resolve_turn_agent_config.__get__(shell)
 
 
-def _agy_runtime():
+def _fallback_runtime():
     return {
         "provider": FALLBACK_PROVIDER,
         "requested_provider": FALLBACK_PROVIDER,
-        "api_key": "agy-key",
-        "base_url": "https://antigravity.example.invalid",
+        "api_key": "fallback-key",
+        "base_url": "https://fallback.example.invalid",
         "api_mode": "antigravity",
         "command": None,
         "args": [],
         "credential_pool": None,
-        "project_id": "agy-project",
+        "project_id": "fallback-project",
         "model": FALLBACK_MODEL,
     }
 
@@ -98,7 +98,7 @@ def _agy_runtime():
 def test_cli_route_signature_is_stable_and_project_sensitive():
     from hermes_cli.cli_agent_setup_mixin import _agent_route_signature
 
-    runtime = _agy_runtime()
+    runtime = _fallback_runtime()
     first = _agent_route_signature(FALLBACK_MODEL, runtime)
     second = _agent_route_signature(FALLBACK_MODEL, dict(runtime))
     changed = _agent_route_signature(
@@ -110,7 +110,7 @@ def test_cli_route_signature_is_stable_and_project_sensitive():
     assert len(first) == 8
 
 
-class TestCliSwitchesToAgyOnLowUsage:
+class TestCliSwitchesToFallbackOnLowUsage:
     def test_low_remaining_switches_signature_and_provider(self):
         shell = _make_shell()
         usage = ProviderUsage(
@@ -124,14 +124,14 @@ class TestCliSwitchesToAgyOnLowUsage:
             ),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value=_agy_runtime(),
+                return_value=_fallback_runtime(),
             ),
         ):
             route = _bound(shell)("hi")
 
         assert route["model"] == FALLBACK_MODEL
         assert route["runtime"]["provider"] == FALLBACK_PROVIDER
-        assert route["runtime"]["project_id"] == "agy-project"
+        assert route["runtime"]["project_id"] == "fallback-project"
         assert FALLBACK_MODEL in route["signature"]
         assert FALLBACK_PROVIDER in route["signature"]
 
@@ -157,7 +157,7 @@ class TestCliSwitchesToAgyOnLowUsage:
         assert route["runtime"]["provider"] == PRIMARY_PROVIDER
         resolver.assert_not_called()
 
-    def test_healthy_remaining_stays_on_codex(self):
+    def test_healthy_remaining_stays_on_primary(self):
         shell = _make_shell()
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=80.0, freshness="fresh", age_seconds=10
@@ -178,8 +178,8 @@ class TestCliSwitchesToAgyOnLowUsage:
         mock_resolve.assert_not_called()
 
 
-class TestCliFailsClosedOnAgyAuthFailure:
-    def test_agy_resolution_raises_falls_back_to_current_codex_runtime(self):
+class TestCliFailsClosedOnFallbackAuthFailure:
+    def test_fallback_resolution_raises_falls_back_to_current_primary_runtime(self):
         shell = _make_shell()
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=2.0, freshness="fresh", age_seconds=10
@@ -202,7 +202,7 @@ class TestCliFailsClosedOnAgyAuthFailure:
         assert route["runtime"]["provider"] == PRIMARY_PROVIDER
         assert route["runtime"]["api_key"] == "sk-test"
 
-    def test_agy_resolution_raise_message_never_reaches_route(self):
+    def test_fallback_resolution_raise_message_never_reaches_route(self):
         """The raw exception text must not leak into the route dict at all."""
         shell = _make_shell()
         usage = ProviderUsage(
@@ -226,18 +226,18 @@ class TestCliFailsClosedOnAgyAuthFailure:
         assert secret_text not in serialized
 
 
-class TestCliRecoversToCodexOnFreshGoodReading:
-    def test_on_agy_fresh_good_reading_recovers(self):
+class TestCliRecoversToPrimaryOnFreshGoodReading:
+    def test_on_fallback_fresh_good_reading_recovers(self):
         shell = _make_shell(provider=FALLBACK_PROVIDER, model=FALLBACK_MODEL)
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=90.0, freshness="fresh", age_seconds=5
         )
-        codex_runtime = {
+        primary_runtime = {
             "provider": PRIMARY_PROVIDER,
             "requested_provider": PRIMARY_PROVIDER,
-            "api_key": "codex-key",
-            "base_url": "https://codex.example.invalid",
-            "api_mode": "codex_responses",
+            "api_key": "primary-key",
+            "base_url": "https://primary.example.invalid",
+            "api_mode": "primary_responses",
             "command": None,
             "args": [],
             "credential_pool": None,
@@ -251,7 +251,7 @@ class TestCliRecoversToCodexOnFreshGoodReading:
             ),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value=codex_runtime,
+                return_value=primary_runtime,
             ),
         ):
             route = _bound(shell)("hi")
@@ -259,7 +259,7 @@ class TestCliRecoversToCodexOnFreshGoodReading:
         assert route["model"] == PRIMARY_MODEL
         assert route["runtime"]["provider"] == PRIMARY_PROVIDER
 
-    def test_on_agy_stale_good_reading_does_not_recover(self):
+    def test_on_fallback_stale_good_reading_does_not_recover(self):
         shell = _make_shell(provider=FALLBACK_PROVIDER, model=FALLBACK_MODEL)
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=90.0, freshness="stale", age_seconds=5000
@@ -288,18 +288,18 @@ class TestCliCurrentIdentityFollowsActiveAgentNotShellConfig:
     recorded is ``self.agent.provider`` / ``self.agent.model``, set when the
     live ``AIAgent`` was constructed on a prior (possibly switched) turn.
     ``_apply_orchestrator_usage_routing`` must read identity from
-    ``self.agent`` when present so it can tell "already on Agy" apart from
+    ``self.agent`` when present so it can tell "already on Fallback" apart from
     "still on the configured primary", while still using ``self.provider`` /
     ``self.model`` (i.e. ``runtime``) as the BASE target to recover to.
     """
 
-    def test_unknown_reading_while_active_agent_is_agy_stays_on_agy(self):
+    def test_unknown_reading_while_active_agent_is_fallback_stays_on_fallback(self):
         # Shell config (self.provider/self.model) is still the primary
-        # Codex — only self.agent reflects the actual live route (Agy).
+        # Primary — only self.agent reflects the actual live route (Fallback).
         shell = _make_shell(
             provider=PRIMARY_PROVIDER,
             model=PRIMARY_MODEL,
-            agent=SimpleNamespace(**_agy_runtime()),
+            agent=SimpleNamespace(**_fallback_runtime()),
         )
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=None, freshness="unknown", age_seconds=None
@@ -316,14 +316,14 @@ class TestCliCurrentIdentityFollowsActiveAgentNotShellConfig:
         ):
             route = _bound(shell)("hi")
 
-        # Preserve the already-active Agy runtime. Unknown usage must not
-        # re-resolve auth and must never fall back to Codex.
+        # Preserve the already-active Fallback runtime. Unknown usage must not
+        # re-resolve auth and must never fall back to Primary.
         assert route["model"] == FALLBACK_MODEL
         assert route["runtime"]["provider"] == FALLBACK_PROVIDER
-        assert route["runtime"]["api_key"] == "agy-key"
+        assert route["runtime"]["api_key"] == "fallback-key"
         mock_resolve.assert_not_called()
 
-    def test_fresh_good_reading_while_active_agent_is_agy_restores_base_codex(self):
+    def test_fresh_good_reading_while_active_agent_is_fallback_restores_base_primary(self):
         shell = _make_shell(
             provider=PRIMARY_PROVIDER,
             model=PRIMARY_MODEL,
@@ -332,12 +332,12 @@ class TestCliCurrentIdentityFollowsActiveAgentNotShellConfig:
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=95.0, freshness="fresh", age_seconds=5
         )
-        codex_runtime = {
+        primary_runtime = {
             "provider": PRIMARY_PROVIDER,
             "requested_provider": PRIMARY_PROVIDER,
-            "api_key": "codex-key",
-            "base_url": "https://codex.example.invalid",
-            "api_mode": "codex_responses",
+            "api_key": "primary-key",
+            "base_url": "https://primary.example.invalid",
+            "api_mode": "primary_responses",
             "command": None,
             "args": [],
             "credential_pool": None,
@@ -351,15 +351,15 @@ class TestCliCurrentIdentityFollowsActiveAgentNotShellConfig:
             ),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value=codex_runtime,
+                return_value=primary_runtime,
             ) as mock_resolve,
         ):
             route = _bound(shell)("hi")
 
         assert route["model"] == PRIMARY_MODEL
         assert route["runtime"]["provider"] == PRIMARY_PROVIDER
-        # The decision target (Codex) matches the BASE runtime already in
-        # hand (self.provider/self.model, unaffected by the earlier Agy
+        # The decision target (Primary) matches the BASE runtime already in
+        # hand (self.provider/self.model, unaffected by the earlier Fallback
         # switch) — no re-resolution is needed to recover.
         mock_resolve.assert_not_called()
 
@@ -387,7 +387,7 @@ class TestCliCurrentIdentityFollowsActiveAgentNotShellConfig:
 
 
 class TestCliPreservesFastModeOverrides:
-    def test_fast_overrides_preserved_when_switched_to_agy(self):
+    def test_fast_overrides_preserved_when_switched_to_fallback(self):
         shell = _make_shell(service_tier="priority")
         usage = ProviderUsage(
             provider=PRIMARY_PROVIDER, remaining_percent=1.0, freshness="fresh", age_seconds=1
@@ -400,7 +400,7 @@ class TestCliPreservesFastModeOverrides:
             ),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value=_agy_runtime(),
+                return_value=_fallback_runtime(),
             ),
             patch(
                 "hermes_cli.models.resolve_fast_mode_overrides",

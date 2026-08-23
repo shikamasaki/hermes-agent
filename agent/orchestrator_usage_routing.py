@@ -18,11 +18,6 @@ Design constraints (mirrored from ``agent.delegation_routing``):
   ``agent.delegation_usage_cache.refresh_provider_now`` /
   ``agent.account_usage.fetch_account_usage`` itself — callers read the
   cache (via ``build_usage_view``) and pass the result in.
-* ``claude-p`` can never be named or selected as the orchestrator here — it
-  is a child-worker-only backend (see ``agent.delegation_routing.
-  CLAUDE_P_PROVIDER``). Config naming it as primary or fallback is a hard,
-  loud error, and the decision function itself never returns it even if a
-  caller passes it in as "current" through some future misconfiguration.
 * Fallback ("Agy") is entered when the cached PRIMARY provider's remaining
   percent is ``<= switch_at_remaining_percent``. Recovery back to the
   primary only happens on a FRESH reading strictly above
@@ -37,7 +32,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from agent.delegation_routing import CLAUDE_P_PROVIDER, NATIVE_ROUTABLE_PROVIDERS, ProviderUsage
+from agent.delegation_routing import NATIVE_ROUTABLE_PROVIDERS, ProviderUsage
 
 __all__ = [
     "DEFAULT_RESTORE_ABOVE_REMAINING_PERCENT",
@@ -167,11 +162,6 @@ def _parse_window_prefixes(raw: Any, *, where: str) -> tuple[str, ...]:
 
 def _require_native_provider(value: str, key: str, *, where: str) -> str:
     normalized = value.strip().lower()
-    if normalized == CLAUDE_P_PROVIDER:
-        raise OrchestratorRoutingConfigError(
-            f"{where}: '{key}'={value!r} is not allowed — claude-p is a "
-            f"child-worker-only backend and can never be the main orchestrator"
-        )
     if normalized not in NATIVE_ROUTABLE_PROVIDERS:
         supported = ", ".join(sorted(NATIVE_ROUTABLE_PROVIDERS))
         raise OrchestratorRoutingConfigError(
@@ -304,8 +294,6 @@ def decide_orchestrator_route(
         )
 
     current = _normalize_provider(current_provider)
-    # Defense in depth: claude-p must never be selectable here even if a
-    # caller's "current provider" bookkeeping was corrupted upstream.
     on_fallback = current == config.fallback_provider
 
     if usage.freshness != "fresh":

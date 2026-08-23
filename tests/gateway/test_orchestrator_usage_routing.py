@@ -7,10 +7,10 @@ from unittest.mock import patch
 from agent.delegation_routing import ProviderUsage
 from gateway.run import GatewayRunner
 
-PRIMARY_PROVIDER = "openai-codex"
-PRIMARY_MODEL = "gpt-5.6-sol"
-FALLBACK_PROVIDER = "google-antigravity"
-FALLBACK_MODEL = "gemini-3.1-pro-high"
+PRIMARY_PROVIDER = "provider-primary"
+PRIMARY_MODEL = "model-primary"
+FALLBACK_PROVIDER = "provider-fallback"
+FALLBACK_MODEL = "model-fallback"
 
 CONFIG = {
     "agent": {
@@ -39,16 +39,16 @@ def _runner():
 def _runtime(provider=PRIMARY_PROVIDER):
     fallback = provider == FALLBACK_PROVIDER
     return {
-        "api_key": "agy-key" if fallback else "codex-key",
-        "base_url": "https://agy.invalid" if fallback else "https://codex.invalid",
+        "api_key": "fallback-key" if fallback else "primary-key",
+        "base_url": "https://fallback.invalid" if fallback else "https://primary.invalid",
         "provider": provider,
         "requested_provider": provider,
-        "api_mode": "antigravity" if fallback else "codex_responses",
+        "api_mode": "antigravity" if fallback else "primary_responses",
         "command": None,
         "args": [],
         "credential_pool": None,
         "max_tokens": 1234,
-        "provider_project_id": "agy-project" if fallback else None,
+        "provider_project_id": "fallback-project" if fallback else None,
     }
 
 
@@ -94,7 +94,7 @@ def _route(
     return route, runtime_resolve
 
 
-def test_low_codex_switches_to_agy_at_turn_boundary():
+def test_low_primary_switches_to_fallback_at_turn_boundary():
     route, resolver = _route(
         current_provider=PRIMARY_PROVIDER,
         current_model=PRIMARY_MODEL,
@@ -103,7 +103,7 @@ def test_low_codex_switches_to_agy_at_turn_boundary():
     )
     assert route["model"] == FALLBACK_MODEL
     assert route["runtime"]["provider"] == FALLBACK_PROVIDER
-    assert route["runtime"]["provider_project_id"] == "agy-project"
+    assert route["runtime"]["provider_project_id"] == "fallback-project"
     resolver.assert_called_once_with(
         requested=FALLBACK_PROVIDER, target_model=FALLBACK_MODEL
     )
@@ -120,9 +120,9 @@ def test_explicit_non_policy_model_is_not_overridden():
             model=PRIMARY_MODEL,
             provider=PRIMARY_PROVIDER,
             requested_provider=PRIMARY_PROVIDER,
-            api_key="codex-key",
-            base_url="https://codex.invalid",
-            api_mode="codex_responses",
+            api_key="primary-key",
+            base_url="https://primary.invalid",
+            api_mode="primary_responses",
             acp_command=None,
             acp_args=[],
             _credential_pool=None,
@@ -135,7 +135,7 @@ def test_explicit_non_policy_model_is_not_overridden():
     resolver.assert_not_called()
 
 
-def test_fresh_reset_above_ten_restores_codex():
+def test_fresh_reset_above_ten_restores_primary():
     route, resolver = _route(
         current_provider=FALLBACK_PROVIDER,
         current_model=FALLBACK_MODEL,
@@ -150,7 +150,7 @@ def test_fresh_reset_above_ten_restores_codex():
     )
 
 
-def test_stale_good_reading_preserves_current_agy_without_resolution():
+def test_stale_good_reading_preserves_current_fallback_without_resolution():
     route, resolver = _route(
         current_provider=FALLBACK_PROVIDER,
         current_model=FALLBACK_MODEL,
@@ -162,7 +162,7 @@ def test_stale_good_reading_preserves_current_agy_without_resolution():
     resolver.assert_not_called()
 
 
-def test_unknown_preserves_current_agy_without_resolution():
+def test_unknown_preserves_current_fallback_without_resolution():
     route, resolver = _route(
         current_provider=FALLBACK_PROVIDER,
         current_model=FALLBACK_MODEL,
@@ -173,7 +173,7 @@ def test_unknown_preserves_current_agy_without_resolution():
     resolver.assert_not_called()
 
 
-def test_unknown_preserves_cached_session_agy_when_base_is_codex():
+def test_unknown_preserves_cached_session_fallback_when_base_is_primary():
     route, resolver = _route(
         current_provider=PRIMARY_PROVIDER,
         current_model=PRIMARY_MODEL,
@@ -183,8 +183,8 @@ def test_unknown_preserves_cached_session_agy_when_base_is_codex():
             model=FALLBACK_MODEL,
             provider=FALLBACK_PROVIDER,
             requested_provider=FALLBACK_PROVIDER,
-            api_key="agy-key",
-            base_url="https://agy.invalid",
+            api_key="fallback-key",
+            base_url="https://fallback.invalid",
             api_mode="antigravity",
             acp_command=None,
             acp_args=[],
@@ -254,19 +254,19 @@ def test_cached_agent_session_rotation_rejects_stale_or_different_agent():
     assert runner._agent_cache["chat:one"] == original
 
 
-def test_rotated_session_unknown_usage_keeps_cached_agy():
+def test_rotated_session_unknown_usage_keeps_cached_fallback():
     runner = _runner()
     agent = SimpleNamespace(
         model=FALLBACK_MODEL,
         provider=FALLBACK_PROVIDER,
         requested_provider=FALLBACK_PROVIDER,
-        api_key="agy-key",
-        base_url="https://agy.invalid",
+        api_key="fallback-key",
+        base_url="https://fallback.invalid",
         api_mode="antigravity",
         acp_command=None,
         acp_args=[],
         _credential_pool=None,
-        provider_project_id="agy-project",
+        provider_project_id="fallback-project",
         max_tokens=1234,
     )
     runner._agent_cache_lock = threading.Lock()
@@ -297,8 +297,8 @@ def test_gateway_session_cache_drives_unknown_hold_then_fresh_recovery():
         model=FALLBACK_MODEL,
         provider=FALLBACK_PROVIDER,
         requested_provider=FALLBACK_PROVIDER,
-        api_key="agy-key",
-        base_url="https://agy.invalid",
+        api_key="fallback-key",
+        base_url="https://fallback.invalid",
         api_mode="antigravity",
         acp_command=None,
         acp_args=[],

@@ -2,9 +2,9 @@
 
 ``agent/orchestrator_usage_routing.py`` decides, per turn, whether the main
 interactive orchestrator (CLI or gateway) should run on its configured
-primary native provider/model (openai-codex / gpt-5.6-sol) or fall over to
-a secondary native provider/model (google-antigravity / gemini-3.1-pro-high,
-the "Agy" fallback) when the cached primary-provider usage reading is low.
+primary native provider/model (provider-primary / model-primary) or fall over to
+a secondary native provider/model (provider-fallback / model-fallback,
+the "Fallback" fallback) when the cached primary-provider usage reading is low.
 
 This module must stay a pure, side-effect-free decision function: it is fed
 an already-resolved ``ProviderUsage`` reading (from
@@ -20,17 +20,17 @@ import math
 
 import pytest
 
-from agent.delegation_routing import CLAUDE_P_PROVIDER, ProviderUsage
+from agent.delegation_routing import ProviderUsage
 
 # Imported lazily inside fixtures/tests below where useful so the module's
 # ImportError (in the RED phase, before the module exists) is captured by
 # the specific test rather than collection-time failure for the whole file.
 
 
-PRIMARY_PROVIDER = "openai-codex"
-PRIMARY_MODEL = "gpt-5.6-sol"
-FALLBACK_PROVIDER = "google-antigravity"
-FALLBACK_MODEL = "gemini-3.1-pro-high"
+PRIMARY_PROVIDER = "provider-primary"
+PRIMARY_MODEL = "model-primary"
+FALLBACK_PROVIDER = "provider-fallback"
+FALLBACK_MODEL = "model-fallback"
 
 
 def _valid_config(**overrides):
@@ -96,7 +96,7 @@ class TestParseConfig:
             "agent": {
                 "orchestrator_usage_routing": {
                     "enabled": False,
-                    "primary_provider": "claude-p",  # would be a hard error if validated
+                    "primary_provider": "unsupported",  # would be a hard error if validated
                     "switch_at_remaining_percent": "not-a-number",
                     "usage_stale_seconds": 1,
                     "usage_ttl_seconds": 900,
@@ -106,25 +106,6 @@ class TestParseConfig:
         parsed = parse_orchestrator_routing_config(cfg)
         assert parsed.enabled is False
 
-    def test_rejects_claude_p_as_primary(self):
-        from agent.orchestrator_usage_routing import (
-            OrchestratorRoutingConfigError,
-            parse_orchestrator_routing_config,
-        )
-
-        cfg = {"agent": {"orchestrator_usage_routing": _valid_config(primary_provider=CLAUDE_P_PROVIDER)}}
-        with pytest.raises(OrchestratorRoutingConfigError):
-            parse_orchestrator_routing_config(cfg)
-
-    def test_rejects_claude_p_as_fallback(self):
-        from agent.orchestrator_usage_routing import (
-            OrchestratorRoutingConfigError,
-            parse_orchestrator_routing_config,
-        )
-
-        cfg = {"agent": {"orchestrator_usage_routing": _valid_config(fallback_provider="claude-p")}}
-        with pytest.raises(OrchestratorRoutingConfigError):
-            parse_orchestrator_routing_config(cfg)
 
     def test_rejects_unsupported_native_provider(self):
         from agent.orchestrator_usage_routing import (
@@ -237,7 +218,7 @@ class TestDecision:
             current_model=current_model,
         )
 
-    def test_remaining_exactly_at_threshold_switches_to_agy(self):
+    def test_remaining_exactly_at_threshold_switches_to_fallback(self):
         decision = self._decide(
             current_provider=PRIMARY_PROVIDER,
             usage=_usage(10.0, "fresh", age_seconds=10),
@@ -245,7 +226,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_remaining_below_threshold_switches_to_agy(self):
+    def test_remaining_below_threshold_switches_to_fallback(self):
         decision = self._decide(
             current_provider=PRIMARY_PROVIDER,
             usage=_usage(3.0, "fresh", age_seconds=10),
@@ -253,7 +234,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_stale_low_reading_while_on_codex_stays_on_codex(self):
+    def test_stale_low_reading_while_on_primary_stays_on_primary(self):
         decision = self._decide(
             current_provider=PRIMARY_PROVIDER,
             usage=_usage(3.0, "stale", age_seconds=5000),
@@ -262,7 +243,7 @@ class TestDecision:
         assert decision.model == PRIMARY_MODEL
         assert decision.switched is False
 
-    def test_remaining_above_threshold_fresh_stays_on_codex(self):
+    def test_remaining_above_threshold_fresh_stays_on_primary(self):
         decision = self._decide(
             current_provider=PRIMARY_PROVIDER,
             usage=_usage(50.0, "fresh", age_seconds=10),
@@ -270,7 +251,7 @@ class TestDecision:
         assert decision.provider == PRIMARY_PROVIDER
         assert decision.model == PRIMARY_MODEL
 
-    def test_on_agy_fresh_exactly_ten_does_not_recover(self):
+    def test_on_fallback_fresh_exactly_ten_does_not_recover(self):
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
             usage=_usage(10.0, "fresh", age_seconds=10),
@@ -278,7 +259,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_on_agy_fresh_good_reading_recovers_to_codex(self):
+    def test_on_fallback_fresh_good_reading_recovers_to_primary(self):
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
             usage=_usage(50.0, "fresh", age_seconds=10),
@@ -286,7 +267,7 @@ class TestDecision:
         assert decision.provider == PRIMARY_PROVIDER
         assert decision.model == PRIMARY_MODEL
 
-    def test_on_agy_stale_good_reading_does_not_recover(self):
+    def test_on_fallback_stale_good_reading_does_not_recover(self):
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
             usage=_usage(50.0, "stale", age_seconds=5000),
@@ -294,7 +275,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_on_agy_stale_low_reading_stays_agy(self):
+    def test_on_fallback_stale_low_reading_stays_fallback(self):
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
             usage=_usage(5.0, "stale", age_seconds=5000),
@@ -302,7 +283,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_unknown_at_startup_no_prior_route_stays_codex(self):
+    def test_unknown_at_startup_no_prior_route_stays_primary(self):
         decision = self._decide(
             current_provider=None,
             usage=_usage(None, "unknown"),
@@ -310,7 +291,7 @@ class TestDecision:
         assert decision.provider == PRIMARY_PROVIDER
         assert decision.model == PRIMARY_MODEL
 
-    def test_unknown_while_currently_agy_stays_agy(self):
+    def test_unknown_while_currently_fallback_stays_fallback(self):
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
             usage=_usage(None, "unknown"),
@@ -318,7 +299,7 @@ class TestDecision:
         assert decision.provider == FALLBACK_PROVIDER
         assert decision.model == FALLBACK_MODEL
 
-    def test_unknown_while_currently_codex_stays_codex(self):
+    def test_unknown_while_currently_primary_stays_primary(self):
         decision = self._decide(
             current_provider=PRIMARY_PROVIDER,
             usage=_usage(None, "unknown"),
@@ -339,7 +320,7 @@ class TestDecision:
         assert decision.model == PRIMARY_MODEL
         assert decision.switched is False
 
-    def test_disabled_stays_on_agy_if_that_was_current(self):
+    def test_disabled_stays_on_fallback_if_that_was_current(self):
         cfg = self._config(enabled=False)
         decision = self._decide(
             current_provider=FALLBACK_PROVIDER,
@@ -358,17 +339,6 @@ class TestDecision:
         )
         for banned in ("sk-", "Bearer ", "api_key", "token", "Authorization"):
             assert banned.lower() not in decision.reason.lower()
-
-    def test_decision_never_targets_claude_p_even_with_bad_current_provider(self):
-        """Defense in depth: even if some caller passes claude-p as the
-        'current' provider (a misconfiguration bug elsewhere), the decision
-        must never *select* claude-p as the target."""
-        decision = self._decide(
-            current_provider=CLAUDE_P_PROVIDER,
-            usage=_usage(50.0, "fresh", age_seconds=10),
-        )
-        assert decision.provider != CLAUDE_P_PROVIDER
-
 
 class TestNonBlockingCacheUsage:
     """Prove the decision path only ever reads through build_usage_view and
