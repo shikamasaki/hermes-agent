@@ -84,24 +84,77 @@ def resolve_claude_executable() -> Optional[str]:
 # Tool profiles — fixed, least-privilege allowlists. Never an arbitrary string.
 # ---------------------------------------------------------------------------
 
+CODING_BASH_ALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash(git status)",
+    "Bash(git status *)",
+    "Bash(git diff)",
+    "Bash(git diff *)",
+    "Bash(git log)",
+    "Bash(git log *)",
+    "Bash(git show)",
+    "Bash(git show *)",
+    "Bash(uv run pytest)",
+    "Bash(uv run pytest *)",
+    "Bash(uv run mypy)",
+    "Bash(uv run mypy *)",
+    "Bash(uv run ruff)",
+    "Bash(uv run ruff *)",
+    "Bash(pytest)",
+    "Bash(pytest *)",
+    "Bash(python -m pytest)",
+    "Bash(python -m pytest *)",
+    "Bash(scripts/run_tests.sh)",
+    "Bash(scripts/run_tests.sh *)",
+    "Bash(venv/bin/ruff check *)",
+    "Bash(venv/bin/python -m compileall *)",
+    "Bash(npm test)",
+    "Bash(npm run test)",
+    "Bash(npm run lint)",
+    "Bash(npm run typecheck)",
+    "Bash(npm run build)",
+    "Bash(pnpm test)",
+    "Bash(pnpm run test)",
+    "Bash(pnpm run lint)",
+    "Bash(pnpm run typecheck)",
+    "Bash(pnpm run build)",
+    "Bash(yarn test)",
+    "Bash(yarn run test)",
+    "Bash(yarn run lint)",
+    "Bash(yarn run typecheck)",
+    "Bash(yarn run build)",
+    "Bash(cargo test)",
+    "Bash(cargo test *)",
+    "Bash(cargo check)",
+    "Bash(cargo check *)",
+    "Bash(cargo clippy)",
+    "Bash(cargo clippy *)",
+    "Bash(go test)",
+    "Bash(go test *)",
+    "Bash(make test)",
+    "Bash(make lint)",
+    "Bash(make check)",
+)
+
 TOOL_PROFILES: Mapping[str, Optional[str]] = {
     # Claude Code normal Task passthrough.  No Hermes-added CLI tool/settings
     # restrictions are emitted for this profile; Claude's own defaults apply.
     "default": None,
     "read_only": "Read(./**)",
     "review": "Read(./**)",
-    "coding": "Read(./**),Edit(./**),Write(./**)",
+    "coding": ",".join(
+        ("Read(./**)", "Edit(./**)", "Write(./**)", *CODING_BASH_ALLOWED_TOOLS)
+    ),
 }
 
 PROFILE_TOOL_SETS: Mapping[str, Optional[str]] = {
     "default": None,
     "read_only": "Read",
     "review": "Read",
-    "coding": "Read,Edit,Write",
+    "coding": "Read,Edit,Write,Bash",
 }
 
-# Fixed negative rules provide defense in depth if a future profile ever adds
-# Bash back; current profiles expose no shell tool at all.
+# Fixed negative rules provide defense in depth for the coding profile's
+# least-privilege Bash rules while read_only/review expose no shell tool.
 DISALLOWED_TOOLS: tuple[str, ...] = (
     "Bash(git commit *)",
     "Bash(git push *)",
@@ -451,8 +504,10 @@ def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[
     The prompt is exactly one argv element — never split, never
     interpolated into a shell string. Never includes ``--bare``,
     ``--permission-mode bypassPermissions``, plugin/MCP overrides, browser
-    integration, or push/publish/deploy/PR commands. Permission bypass is
-    emitted only from an explicit ``auto_approve`` run parameter.
+    integration, or push/publish/deploy/PR commands. Full permission bypass is
+    confined to the explicit ``default`` passthrough profile. Restricted
+    profiles use ``dontAsk`` plus a fixed allowlist, so unmatched tools fail
+    closed instead of waiting for an interactive approval.
     """
     profile = resolve_tool_profile(request.tool_profile)
     effort = map_difficulty_to_effort(request.difficulty)
@@ -479,10 +534,13 @@ def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[
             floor=0.01,
         )
         argv += ["--max-budget-usd", f"{max_budget:.2f}"]
-    if request.auto_approve:
-        argv.append("--dangerously-skip-permissions")
-    if not profile.passthrough:
+    if profile.passthrough:
+        if request.auto_approve:
+            argv.append("--dangerously-skip-permissions")
+    else:
         argv += [
+            "--permission-mode",
+            "dontAsk",
             "--allowedTools",
             profile.allowed_tools or "",
             "--tools",

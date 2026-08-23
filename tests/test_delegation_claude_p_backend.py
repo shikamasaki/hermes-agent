@@ -211,6 +211,7 @@ class TestArgvConstruction:
             "--max-turns",
             "--max-budget-usd",
             "--dangerously-skip-permissions",
+            "--permission-mode",
             "--allowedTools",
             "--tools",
             "--disallowedTools",
@@ -276,6 +277,8 @@ class TestArgvConstruction:
             "25",
             "--max-budget-usd",
             "3.50",
+            "--permission-mode",
+            "dontAsk",
             "--allowedTools",
             "Read(./**)",
             "--tools",
@@ -304,7 +307,6 @@ class TestArgvConstruction:
             "--bare",
             "--dangerously-skip-permissions",
             "bypassPermissions",
-            "--permission-mode",
             "--mcp-config",
             "--plugin",
         ],
@@ -341,10 +343,117 @@ class TestArgvConstruction:
         assert cb.TOOL_PROFILES["read_only"] == "Read(./**)"
         assert "Write" not in cb.TOOL_PROFILES["read_only"]
         assert "Write" not in cb.TOOL_PROFILES["review"]
+        assert "Bash" not in cb.TOOL_PROFILES["read_only"]
+        assert "Bash" not in cb.TOOL_PROFILES["review"]
         assert "Write" in cb.TOOL_PROFILES["coding"]
-        assert all("Bash" not in tools for tools in cb.PROFILE_TOOL_SETS.values() if tools)
+        assert "Bash(" in cb.TOOL_PROFILES["coding"]
+        assert cb.PROFILE_TOOL_SETS["read_only"] == "Read"
+        assert cb.PROFILE_TOOL_SETS["review"] == "Read"
+        assert cb.PROFILE_TOOL_SETS["coding"] == "Read,Edit,Write,Bash"
         assert all("Read(./**)" in rules for rules in cb.TOOL_PROFILES.values() if rules)
         assert all("Read" != rules for rules in cb.TOOL_PROFILES.values() if rules)
+
+    def test_coding_profile_allows_only_bounded_verification_bash(self):
+        allowed = cb.TOOL_PROFILES["coding"].split(",")
+        assert "Bash" not in allowed
+        for command_rule in (
+            "Bash(git status)",
+            "Bash(git status *)",
+            "Bash(git diff)",
+            "Bash(git diff *)",
+            "Bash(git log)",
+            "Bash(git log *)",
+            "Bash(git show)",
+            "Bash(git show *)",
+            "Bash(uv run pytest)",
+            "Bash(uv run pytest *)",
+            "Bash(uv run mypy)",
+            "Bash(uv run mypy *)",
+            "Bash(uv run ruff)",
+            "Bash(uv run ruff *)",
+            "Bash(pytest)",
+            "Bash(pytest *)",
+            "Bash(python -m pytest)",
+            "Bash(python -m pytest *)",
+            "Bash(scripts/run_tests.sh)",
+            "Bash(scripts/run_tests.sh *)",
+            "Bash(venv/bin/ruff check *)",
+            "Bash(venv/bin/python -m compileall *)",
+            "Bash(npm test)",
+            "Bash(npm run test)",
+            "Bash(npm run lint)",
+            "Bash(npm run typecheck)",
+            "Bash(npm run build)",
+            "Bash(pnpm test)",
+            "Bash(pnpm run test)",
+            "Bash(pnpm run lint)",
+            "Bash(pnpm run typecheck)",
+            "Bash(pnpm run build)",
+            "Bash(yarn test)",
+            "Bash(yarn run test)",
+            "Bash(yarn run lint)",
+            "Bash(yarn run typecheck)",
+            "Bash(yarn run build)",
+            "Bash(cargo test)",
+            "Bash(cargo test *)",
+            "Bash(cargo check)",
+            "Bash(cargo check *)",
+            "Bash(cargo clippy)",
+            "Bash(cargo clippy *)",
+            "Bash(go test)",
+            "Bash(go test *)",
+            "Bash(make test)",
+            "Bash(make lint)",
+            "Bash(make check)",
+        ):
+            assert command_rule in allowed
+        for forbidden_rule in (
+            "Bash(git commit *)",
+            "Bash(git push *)",
+            "Bash(gh pr *)",
+            "Bash(npm publish *)",
+            "Bash(curl *)",
+            "Bash(aws *)",
+            "Bash(kubectl *)",
+        ):
+            assert forbidden_rule not in allowed
+
+    def test_restricted_review_and_read_only_profiles_do_not_expose_bash_in_argv(self):
+        for profile in ("read_only", "review"):
+            argv = cb.build_claude_p_argv(
+                cb.ClaudePRunRequest(
+                    prompt="x", model="m", tool_profile=profile, auto_approve=True
+                ),
+                executable="claude",
+            )
+            assert "Bash" not in argv[argv.index("--tools") + 1]
+            assert "Bash(" not in argv[argv.index("--allowedTools") + 1]
+            assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+            assert "--dangerously-skip-permissions" not in argv
+
+    def test_coding_argv_emits_bounded_bash_tools_and_deny_rules(self):
+        argv = cb.build_claude_p_argv(
+            cb.ClaudePRunRequest(
+                prompt="x", model="m", tool_profile="coding", auto_approve=True
+            ),
+            executable="claude",
+        )
+
+        assert argv[argv.index("--tools") + 1] == "Read,Edit,Write,Bash"
+        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+        assert "--dangerously-skip-permissions" not in argv
+        allowed = argv[argv.index("--allowedTools") + 1]
+        assert allowed == cb.TOOL_PROFILES["coding"]
+        assert "Bash" not in allowed.split(",")
+        assert "Bash(pytest *)" in allowed.split(",")
+        assert "Bash(npm run build)" in allowed.split(",")
+        assert "Bash(git push *)" not in allowed.split(",")
+        disallowed = argv[argv.index("--disallowedTools") + 1 : argv.index("--strict-mcp-config")]
+        for deny_rule in (
+            "Bash(git commit *)",
+            "Bash(git push *)",
+        ):
+            assert deny_rule in disallowed
 
     def test_unknown_profile_raises_rather_than_downgrading_silently(self):
         with pytest.raises(ValueError, match="unknown claude-p tool profile"):
@@ -423,6 +532,7 @@ class TestArgvConstruction:
         assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
         assert "--tools" in argv
         assert "--disallowedTools" in argv
+        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
         assert "--max-budget-usd" in argv
         assert argv[argv.index("--output-format") + 1] == "stream-json"
 
