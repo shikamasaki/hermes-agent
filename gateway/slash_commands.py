@@ -5328,6 +5328,25 @@ class GatewaySlashCommandsMixin:
         except Exception:
             return []
 
+    async def _usage_providers(self, *, refresh: bool) -> str:
+        """`/usage providers [refresh]` — list configured providers' cached usage.
+
+        Delegates discovery + rendering entirely to the shared, secret-safe
+        `hermes_cli.usage_cmd` service (the same one the CLI's `/usage
+        providers` and `hermes usage` use) — no provider discovery/rendering
+        logic is duplicated here. Config load and (when refresh=True) the
+        bounded synchronous provider refresh are blocking calls, so the
+        whole render runs off the event loop via asyncio.to_thread.
+        """
+        from hermes_cli import usage_cmd
+
+        def _render() -> str:
+            config = usage_cmd._load_active_config()
+            providers = usage_cmd.discover_configured_providers(config)
+            return usage_cmd.render_text(providers, refresh=refresh)
+
+        return await asyncio.to_thread(_render)
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
@@ -5345,6 +5364,10 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         args = [a.lower() for a in raw_args.split()] if raw_args else []
         wants_reset = bool(args) and args[0] == "reset"
+        wants_providers = bool(args) and args[0] == "providers"
+        if wants_providers:
+            refresh = len(args) > 1 and args[1] == "refresh"
+            return await self._usage_providers(refresh=refresh)
         if args and not wants_reset:
             return t("gateway.usage.unknown_subcommand", args=raw_args)
 

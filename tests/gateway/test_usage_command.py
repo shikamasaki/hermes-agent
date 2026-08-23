@@ -232,6 +232,136 @@ class TestUsageReset:
         assert seen["api_key"] == "tok"
 
 
+class TestUsageProviders:
+    """`/usage providers [refresh]` — delegates entirely to the shared,
+    secret-safe `hermes_cli.usage_cmd` service, off the event loop.
+    """
+
+    def _event(self, args):
+        event = MagicMock()
+        event.get_command_args.return_value = args
+        return event
+
+    @pytest.mark.asyncio
+    async def test_providers_calls_shared_service_with_refresh_false(self, monkeypatch):
+        runner = _make_runner(SK)
+        calls = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd._load_active_config",
+            lambda: {"model": {"provider": "openai-codex"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd.discover_configured_providers",
+            lambda config: ("openai-codex",),
+        )
+
+        def fake_render_text(providers, *, refresh, **kwargs):
+            calls["providers"] = tuple(providers)
+            calls["refresh"] = refresh
+            return "openai-codex: unknown (unknown, age=unknown)"
+
+        monkeypatch.setattr("hermes_cli.usage_cmd.render_text", fake_render_text)
+
+        result = await runner._handle_usage_command(self._event("providers"))
+
+        assert calls["providers"] == ("openai-codex",)
+        assert calls["refresh"] is False
+        assert result == "openai-codex: unknown (unknown, age=unknown)"
+
+    @pytest.mark.asyncio
+    async def test_providers_refresh_calls_shared_service_with_refresh_true(self, monkeypatch):
+        runner = _make_runner(SK)
+        calls = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd._load_active_config",
+            lambda: {"model": {"provider": "openai-codex"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd.discover_configured_providers",
+            lambda config: ("openai-codex",),
+        )
+
+        def fake_render_text(providers, *, refresh, **kwargs):
+            calls["refresh"] = refresh
+            return "refreshed"
+
+        monkeypatch.setattr("hermes_cli.usage_cmd.render_text", fake_render_text)
+
+        result = await runner._handle_usage_command(self._event("providers refresh"))
+
+        assert calls["refresh"] is True
+        assert result == "refreshed"
+
+    @pytest.mark.asyncio
+    async def test_refresh_is_explicit_only_not_any_truthy_token(self, monkeypatch):
+        """`/usage providers <anything-but-'refresh'>` must NOT enable refresh."""
+        runner = _make_runner(SK)
+        calls = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd._load_active_config",
+            lambda: {"model": {"provider": "openai-codex"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd.discover_configured_providers",
+            lambda config: ("openai-codex",),
+        )
+
+        def fake_render_text(providers, *, refresh, **kwargs):
+            calls["refresh"] = refresh
+            return "text"
+
+        monkeypatch.setattr("hermes_cli.usage_cmd.render_text", fake_render_text)
+
+        await runner._handle_usage_command(self._event("providers now"))
+
+        assert calls["refresh"] is False
+
+    @pytest.mark.asyncio
+    async def test_providers_runs_off_the_event_loop(self, monkeypatch):
+        """The shared-service call must go through asyncio.to_thread, never
+        block the gateway event loop directly."""
+        runner = _make_runner(SK)
+        to_thread_calls = []
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(fn)
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.slash_commands.asyncio.to_thread", fake_to_thread)
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd._load_active_config",
+            lambda: {},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd.discover_configured_providers",
+            lambda config: (),
+        )
+
+        result = await runner._handle_usage_command(self._event("providers"))
+
+        assert to_thread_calls, "expected the providers render to run via asyncio.to_thread"
+        assert result == "No configured providers with usage data."
+
+    @pytest.mark.asyncio
+    async def test_providers_output_never_leaks_secret_fields(self, monkeypatch):
+        """End-to-end through the real hermes_cli.usage_cmd.render_text —
+        no test doubles for rendering — asserting the safe-output contract.
+        """
+        runner = _make_runner(SK)
+        monkeypatch.setattr(
+            "hermes_cli.usage_cmd._load_active_config",
+            lambda: {"model": {"provider": "openai-codex"}},
+        )
+
+        result = await runner._handle_usage_command(self._event("providers"))
+
+        for leaked in ("api_key", "Authorization", "base_url", "credential", "token"):
+            assert leaked not in result, f"providers output leaked {leaked!r}"
+
+
 class TestUsageContextBreakdown:
     """The /usage output includes the per-category context breakdown."""
 

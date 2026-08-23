@@ -1,7 +1,7 @@
 """``hermes usage`` — read-only usage listing for every configured provider.
 
 Discovers which providers are configured (main model, delegation routes,
-orchestrator usage routing primary/fallback, auxiliary task assignments),
+and auxiliary task assignments),
 then renders whatever :mod:`agent.delegation_usage_cache` already has
 cached for each — never a live provider call on this path. ``--refresh``
 opts into one bounded, synchronous ``refresh_provider_now`` call per
@@ -28,7 +28,7 @@ from agent.delegation_routing import (
     DEFAULT_USAGE_TTL_SECONDS,
     load_route_catalog,
 )
-from agent.orchestrator_usage_routing import parse_orchestrator_routing_config
+
 
 __all__ = [
     "discover_configured_providers",
@@ -59,8 +59,7 @@ def discover_configured_providers(config: Mapping[str, Any]) -> tuple[str, ...]:
     """Generically discover every provider slug named by active config.
 
     Sources, in order: ``model.provider``, ``delegation.routes[].provider``
-    (via the same validated catalog parser routing uses), ``agent.
-    orchestrator_usage_routing`` primary/fallback, and every ``auxiliary.
+    (via the same validated catalog parser routing uses), and every ``auxiliary.
     <task>.provider`` assignment. Placeholders (``""``/``"auto"``/
     ``"custom"``) are dropped; aliases are normalized so the same account
     never appears twice under different spellings. Order is stable
@@ -95,13 +94,6 @@ def discover_configured_providers(config: Mapping[str, Any]) -> tuple[str, ...]:
             for route in catalog.routes:
                 _add(route.provider)
 
-    try:
-        orchestrator_cfg = parse_orchestrator_routing_config(cfg)
-    except Exception:
-        orchestrator_cfg = None
-    if orchestrator_cfg is not None and orchestrator_cfg.enabled:
-        _add(orchestrator_cfg.primary_provider)
-        _add(orchestrator_cfg.fallback_provider)
 
     auxiliary_cfg = cfg.get("auxiliary")
     if isinstance(auxiliary_cfg, Mapping):

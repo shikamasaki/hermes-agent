@@ -18,8 +18,8 @@ def build_usage_parser(subparsers, *, cmd_usage: Callable) -> None:
         help="Show cached usage status for every configured provider",
         description=(
             "Read-only usage listing across every provider discovered from "
-            "active config (main model, delegation routes, orchestrator "
-            "usage routing, auxiliary task assignments). Renders whatever "
+            "active config (main model, delegation routes, auxiliary task "
+            "assignments). Renders whatever "
             "is safely cached; never makes a live provider call unless "
             "--refresh is passed."
         ),

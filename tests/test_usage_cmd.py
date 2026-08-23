@@ -65,44 +65,6 @@ class TestDiscoverConfiguredProviders:
         providers = usage_cmd.discover_configured_providers(config)
         assert providers == ("openai-codex",)
 
-    def test_discovers_claude_p_route_provider(self):
-        config = {
-            "delegation": {
-                "routing": {"enabled": True},
-                "routes": [
-                    {
-                        "id": "r1",
-                        "provider": "claude-p",
-                        "backend": "claude-p",
-                        "model": "claude",
-                        "model_class": "advanced",
-                        "task_difficulties": ["standard"],
-                    },
-                ],
-            }
-        }
-        providers = usage_cmd.discover_configured_providers(config)
-        assert "claude-p" in providers
-
-    def test_discovers_orchestrator_usage_routing_primary_and_fallback(self):
-        config = {
-            "agent": {
-                "orchestrator_usage_routing": {
-                    "enabled": True,
-                    "primary_provider": "openai-codex",
-                    "primary_model": "gpt-5",
-                    "fallback_provider": "google-antigravity",
-                    "fallback_model": "gemini-3",
-                    "switch_at_remaining_percent": 10.0,
-                    "restore_above_remaining_percent": 10.0,
-                    "usage_ttl_seconds": 900,
-                    "usage_stale_seconds": 7200,
-                }
-            }
-        }
-        providers = usage_cmd.discover_configured_providers(config)
-        assert "openai-codex" in providers
-        assert "google-antigravity" in providers
 
     def test_discovers_auxiliary_provider_assignments(self):
         config = {

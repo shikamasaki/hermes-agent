@@ -13465,21 +13465,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
 
     def _handle_usage_command(self, cmd_original: str):
-        """Dispatch `/usage [reset [--force]]`.
+        """Dispatch `/usage [reset [--force] | providers [refresh]]`.
 
         Bare `/usage` keeps the classic display. `/usage reset` redeems one
         banked Codex rate-limit reset credit (guarded: refuses when limits
-        aren't exhausted unless --force).
+        aren't exhausted unless --force). `/usage providers [refresh]` lists
+        every configured provider's cached usage via the shared, secret-safe
+        `hermes_cli.usage_cmd` service (`refresh` opts into one bounded,
+        synchronous refresh before rendering).
         """
         parts = cmd_original.split()
         args = [p.lower() for p in parts[1:]]
         if args and args[0] == "reset":
             self._usage_reset(force="--force" in args[1:])
             return
+        if args and args[0] == "providers":
+            self._usage_providers(refresh=len(args) > 1 and args[1] == "refresh")
+            return
         if args:
-            print(f"  Unknown /usage subcommand: {' '.join(parts[1:])}. Try /usage or /usage reset [--force].")
+            print(f"  Unknown /usage subcommand: {' '.join(parts[1:])}. Try /usage, /usage reset [--force], or /usage providers [refresh].")
             return
         self._show_usage()
+
+    def _usage_providers(self, refresh: bool = False) -> None:
+        """`/usage providers [refresh]` — list configured providers' cached usage.
+
+        Renders text-only output produced by the shared, secret-safe
+        `hermes_cli.usage_cmd` service — never a live provider call except
+        the single bounded `refresh_provider_now` pass `refresh=True` opts
+        into inside `build_usage_rows`.
+        """
+        from hermes_cli import usage_cmd
+
+        config = usage_cmd._load_active_config()
+        providers = usage_cmd.discover_configured_providers(config)
+        print(usage_cmd.render_text(providers, refresh=refresh))
 
     def _usage_reset(self, force: bool = False):
         """`/usage reset [--force]` — redeem one banked Codex reset credit."""
