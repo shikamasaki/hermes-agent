@@ -4915,6 +4915,7 @@ def delegate_task(
             # sync-path heartbeat monitor.
             parts = []
             in_tool = False
+            direct_api_terminal_phase = None
             for _c in _child_agents:
                 try:
                     _summary = _c.get_activity_summary()
@@ -4927,9 +4928,13 @@ def delegate_task(
                         )
                     )
                     in_tool = in_tool or bool(_tool)
+                    direct_api_terminal_phase = (
+                        direct_api_terminal_phase
+                        or _summary.get("direct_api_terminal_phase")
+                    )
                 except Exception:
                     parts.append(None)
-            return tuple(parts), in_tool
+            return tuple(parts), in_tool, direct_api_terminal_phase
 
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(

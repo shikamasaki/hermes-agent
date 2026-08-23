@@ -98,6 +98,42 @@ def test_watchdog_abort_never_surfaces_as_interrupted_error():
         direct_api_call(agent, {"model": "m", "messages": []})
 
 
+def test_unabortable_stale_call_exposes_terminal_lifecycle_signal():
+    """The async lifecycle must see staleness even when no socket can close."""
+    agent = _make_agent(stale_timeout=0.1)
+    agent._direct_api_terminal_phase = None
+    release = threading.Event()
+    fake_client = MagicMock()
+
+    def _blocked(**_kwargs):
+        release.wait(timeout=5)
+        raise ConnectionError("released")
+
+    fake_client.chat.completions.create.side_effect = _blocked
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = lambda *_a, **_k: None
+    done = threading.Event()
+
+    def _run():
+        try:
+            direct_api_call(agent, {"model": "m", "messages": []})
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    deadline = time.time() + 1.0
+    while not getattr(agent, "_direct_api_terminal_phase", None) and time.time() < deadline:
+        time.sleep(0.01)
+    try:
+        assert agent._direct_api_terminal_phase == "provider_stale"
+    finally:
+        release.set()
+        assert done.wait(timeout=2)
+
+
 def test_watchdog_kill_feeds_the_cross_turn_stale_circuit_breaker():
     """Without a bump the #58962 breaker can never trip for cron sessions."""
     agent = _make_agent(stale_timeout=0.2)

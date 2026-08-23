@@ -790,7 +790,8 @@ def dispatch_async_delegation(
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
     progress_fn
-        Optional zero-arg callable returning ``(token, in_tool)`` where
+        Optional zero-arg callable returning ``(token, in_tool)`` or
+        ``(token, in_tool, terminal_phase)`` where
         ``token`` is any comparable snapshot of the child's progress (api
         call count + current tool) and ``in_tool`` says whether the child is
         currently inside a tool call. Sampled by the stale monitor; a frozen
@@ -1284,11 +1285,31 @@ def _stale_monitor_loop() -> None:
                     continue
                 any_monitorable = True
                 try:
-                    token, in_tool = progress_fn()
+                    sample = progress_fn()
+                    token, in_tool = sample[:2]
+                    terminal_phase = sample[2] if len(sample) >= 3 else None
                 except Exception:
                     # An unreadable child must not look permanently healthy —
                     # keep the last timestamp running instead of refreshing it.
-                    token, in_tool = record.get("_progress_token"), False
+                    token, in_tool, terminal_phase = (
+                        record.get("_progress_token"), False, False
+                    )
+                if terminal_phase:
+                    record["status"] = "stalling"
+                    record["_interrupted_at"] = now
+                    record["_stall_quiet_seconds"] = 0.0
+                    record["_stall_threshold_seconds"] = 0.0
+                    record["_stall_in_tool"] = bool(in_tool)
+                    record["_stall_terminal_phase"] = str(terminal_phase)
+                    stalled.append(
+                        (
+                            record["delegation_id"],
+                            bool(record.get("is_batch")),
+                            0.0,
+                            in_tool,
+                        )
+                    )
+                    continue
                 if token != record.get("_progress_token"):
                     record["_progress_token"] = token
                     record["_progress_ts"] = now
@@ -1374,7 +1395,9 @@ def _finalize_stalled(delegation_id: str) -> None:
         "stalled_after_quiet_seconds": quiet_seconds,
         "stall_threshold_seconds": threshold_seconds,
         "stall_phase": (
-            "in_tool" if stall_in_tool
+            event_record.get("_stall_terminal_phase")
+            if event_record.get("_stall_terminal_phase")
+            else "in_tool" if stall_in_tool
             else "idle" if stall_in_tool is not None
             else None
         ),
@@ -1489,7 +1512,8 @@ def list_async_delegations() -> List[Dict[str, Any]]:
         if fn is None:
             continue
         try:
-            token, in_tool = fn()
+            sample = fn()
+            token, in_tool = sample[:2]
         except Exception:
             continue
         activity = _children_activity_from_token(token, now)
