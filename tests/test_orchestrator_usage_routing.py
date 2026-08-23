@@ -107,13 +107,13 @@ class TestParseConfig:
         assert parsed.enabled is False
 
 
-    def test_rejects_unsupported_native_provider(self):
+    def test_rejects_invalid_provider_slug(self):
         from agent.orchestrator_usage_routing import (
             OrchestratorRoutingConfigError,
             parse_orchestrator_routing_config,
         )
 
-        cfg = {"agent": {"orchestrator_usage_routing": _valid_config(primary_provider="anthropic")}}
+        cfg = {"agent": {"orchestrator_usage_routing": _valid_config(primary_provider="Bad Provider!")}}
         with pytest.raises(OrchestratorRoutingConfigError):
             parse_orchestrator_routing_config(cfg)
 

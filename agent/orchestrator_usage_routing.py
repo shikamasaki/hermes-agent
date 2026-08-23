@@ -5,7 +5,7 @@ This is deliberately narrow in scope: it decides which native provider/model
 not which model a delegated sub-agent runs on (see
 :mod:`agent.delegation_routing` for that). The two concerns share the same
 usage-cache substrate (:mod:`agent.delegation_usage_cache`) but are
-independent knobs: an operator may run the orchestrator on Codex while
+independent knobs: an operator may run the orchestrator on one provider while
 delegating sub-tasks anywhere, or vice versa.
 
 Design constraints (mirrored from ``agent.delegation_routing``):
@@ -18,7 +18,7 @@ Design constraints (mirrored from ``agent.delegation_routing``):
   ``agent.delegation_usage_cache.refresh_provider_now`` /
   ``agent.account_usage.fetch_account_usage`` itself — callers read the
   cache (via ``build_usage_view``) and pass the result in.
-* Fallback ("Agy") is entered when the cached PRIMARY provider's remaining
+* Fallback is entered when the cached PRIMARY provider's remaining
   percent is ``<= switch_at_remaining_percent``. Recovery back to the
   primary only happens on a FRESH reading strictly above
   ``restore_above_remaining_percent`` — a stale good reading, or any
@@ -29,10 +29,11 @@ Design constraints (mirrored from ``agent.delegation_routing``):
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from agent.delegation_routing import NATIVE_ROUTABLE_PROVIDERS, ProviderUsage
+from agent.delegation_routing import ProviderUsage
 
 __all__ = [
     "DEFAULT_RESTORE_ABOVE_REMAINING_PERCENT",
@@ -162,10 +163,9 @@ def _parse_window_prefixes(raw: Any, *, where: str) -> tuple[str, ...]:
 
 def _require_native_provider(value: str, key: str, *, where: str) -> str:
     normalized = value.strip().lower()
-    if normalized not in NATIVE_ROUTABLE_PROVIDERS:
-        supported = ", ".join(sorted(NATIVE_ROUTABLE_PROVIDERS))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", normalized):
         raise OrchestratorRoutingConfigError(
-            f"{where}: unsupported '{key}' {value!r} (supported: {supported})"
+            f"{where}: '{key}' must be a nonempty machine-safe provider slug"
         )
     return normalized
 
@@ -275,7 +275,7 @@ def decide_orchestrator_route(
     *which provider* is selected.
     """
     primary = (config.primary_provider, config.primary_model, "primary orchestrator")
-    fallback = (config.fallback_provider, config.fallback_model, "Agy fallback")
+    fallback = (config.fallback_provider, config.fallback_model, "fallback orchestrator")
 
     if not config.enabled:
         # Fully inert: keep whatever is currently active. At startup (no

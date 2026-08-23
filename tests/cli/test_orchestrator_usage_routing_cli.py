@@ -86,7 +86,7 @@ def _fallback_runtime():
         "requested_provider": FALLBACK_PROVIDER,
         "api_key": "fallback-key",
         "base_url": "https://fallback.example.invalid",
-        "api_mode": "antigravity",
+        "api_mode": "fallback_mode",
         "command": None,
         "args": [],
         "credential_pool": None,
