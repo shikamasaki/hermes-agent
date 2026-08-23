@@ -162,6 +162,36 @@ class TestClaudePRouteConfig:
         assert route.timeout_seconds == dr.MAX_CLAUDE_P_TIMEOUT_SECONDS
         assert route.cooldown_seconds == dr.MAX_CLAUDE_P_COOLDOWN_SECONDS
 
+    def test_default_passthrough_route_omits_task_usd_cap_when_unset(self):
+        catalog = dr.load_route_catalog(
+            {
+                "routing": {"enabled": True},
+                "routes": [
+                    {
+                        **CLAUDE_ROUTE,
+                        "tool_profile": "default",
+                        "capabilities": ["coding", "reasoning", "review"],
+                    }
+                ],
+            }
+        )
+        route = catalog.routes[0]
+        assert route.tool_profile == "default"
+        assert route.write_capable is True
+        assert route.max_turns == dr.DEFAULT_CLAUDE_P_MAX_TURNS
+        assert route.max_budget_usd is None
+
+    def test_default_passthrough_route_preserves_explicit_usd_cap_for_legacy_configs(self):
+        catalog = dr.load_route_catalog(
+            {
+                "routing": {"enabled": True},
+                "routes": [
+                    {**CLAUDE_ROUTE, "tool_profile": "default", "max_budget_usd": 1.25}
+                ],
+            }
+        )
+        assert catalog.routes[0].max_budget_usd == pytest.approx(1.25)
+
 
 # ---------------------------------------------------------------------------
 # 2. Argv construction — exact, shell-free, bounded
@@ -169,6 +199,60 @@ class TestClaudePRouteConfig:
 
 
 class TestArgvConstruction:
+
+    def test_argv_flags_are_pinned_to_installed_claude_help_contract(self):
+        # Verified locally with only diagnostics (no model/network call):
+        # `claude --help` lists every flag below, and `claude auth --help`
+        # lists auth/status for the availability probe.
+        accepted_flags = {
+            "-p",
+            "--model",
+            "--effort",
+            "--max-turns",
+            "--max-budget-usd",
+            "--dangerously-skip-permissions",
+            "--allowedTools",
+            "--tools",
+            "--disallowedTools",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "--disable-slash-commands",
+            "--output-format",
+            "--verbose",
+            "--include-partial-messages",
+            "--include-hook-events",
+            "--resume",
+            "--session-id",
+        }
+        accepted_efforts = {"low", "medium", "high", "xhigh", "max"}
+        argv = cb.build_claude_p_argv(
+            cb.ClaudePRunRequest(
+                prompt="p",
+                model="claude-opus-5",
+                difficulty="frontier",
+                tool_profile="coding",
+                auto_approve=True,
+            ),
+            executable="claude",
+        )
+
+        emitted_flags = {item for item in argv[1:] if item.startswith("-")}
+        assert emitted_flags <= accepted_flags
+        assert argv[argv.index("--effort") + 1] in accepted_efforts
+
+    def test_auth_probe_command_is_pinned_to_installed_auth_help_contract(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        import hermes_cli._subprocess_compat as sc
+
+        def _fake_probe(argv, timeout, env=None):
+            captured.append(argv)
+            return _FakeCompleted(0, json.dumps({"authenticated": True, "authMethod": "claude.ai"}))
+
+        monkeypatch.setattr(sc, "bounded_probe_run", _fake_probe)
+        assert cb.check_claude_availability().available is True
+        assert captured == [["/usr/bin/claude", "auth", "status", "--json"]]
+
     def test_argv_is_exact_and_prompt_is_one_element(self):
         request = cb.ClaudePRunRequest(
             prompt="Audit auth.py; do not run `rm -rf /` $(whoami)",
@@ -203,7 +287,10 @@ class TestArgvConstruction:
             "",
             "--disable-slash-commands",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--include-hook-events",
             "--session-id",
             request.session_id,
         ]
@@ -255,13 +342,220 @@ class TestArgvConstruction:
         assert "Write" not in cb.TOOL_PROFILES["read_only"]
         assert "Write" not in cb.TOOL_PROFILES["review"]
         assert "Write" in cb.TOOL_PROFILES["coding"]
-        assert all("Bash" not in tools for tools in cb.PROFILE_TOOL_SETS.values())
-        assert all("Read(./**)" in rules for rules in cb.TOOL_PROFILES.values())
-        assert all("Read" != rules for rules in cb.TOOL_PROFILES.values())
+        assert all("Bash" not in tools for tools in cb.PROFILE_TOOL_SETS.values() if tools)
+        assert all("Read(./**)" in rules for rules in cb.TOOL_PROFILES.values() if rules)
+        assert all("Read" != rules for rules in cb.TOOL_PROFILES.values() if rules)
 
     def test_unknown_profile_raises_rather_than_downgrading_silently(self):
         with pytest.raises(ValueError, match="unknown claude-p tool profile"):
             cb.resolve_tool_profile("everything")
+
+    def test_default_passthrough_argv_omits_hermes_tool_and_settings_restrictions(self):
+        request = cb.ClaudePRunRequest(
+            prompt="Implement the task",
+            model="claude-sonnet-5",
+            difficulty="standard",
+            tool_profile="default",
+            max_turns=40,
+            max_budget_usd=None,
+            auto_approve=False,
+        )
+
+        argv = cb.build_claude_p_argv(request, executable="claude")
+
+        assert argv == [
+            "claude",
+            "-p",
+            "Implement the task",
+            "--model",
+            "claude-sonnet-5",
+            "--effort",
+            "medium",
+            "--max-turns",
+            "40",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--include-hook-events",
+            "--session-id",
+            request.session_id,
+        ]
+        for forbidden in (
+            "--allowedTools",
+            "--tools",
+            "--disallowedTools",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "--disable-slash-commands",
+            "--max-budget-usd",
+            "--dangerously-skip-permissions",
+            "--bare",
+        ):
+            assert forbidden not in argv
+
+    def test_default_passthrough_auto_approve_maps_to_claude_permission_bypass(self):
+        request = cb.ClaudePRunRequest(
+            prompt="Implement the task",
+            model="claude-sonnet-5",
+            tool_profile="default",
+            max_budget_usd=None,
+            auto_approve=True,
+        )
+
+        argv = cb.build_claude_p_argv(request, executable="claude")
+
+        assert "--dangerously-skip-permissions" in argv
+        assert "--bare" not in argv
+
+    def test_restricted_profile_keeps_backward_compatible_tool_limits(self):
+        request = cb.ClaudePRunRequest(
+            prompt="Review only",
+            model="claude-opus-5",
+            tool_profile="review",
+            max_turns=3,
+            max_budget_usd=0.5,
+        )
+
+        argv = cb.build_claude_p_argv(request, executable="claude")
+
+        assert "--allowedTools" in argv
+        assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
+        assert "--tools" in argv
+        assert "--disallowedTools" in argv
+        assert "--max-budget-usd" in argv
+        assert argv[argv.index("--output-format") + 1] == "stream-json"
+
+
+class TestStreamJsonEvents:
+    def test_streaming_text_tool_usage_and_final_result_are_safe_and_normalized(self):
+        events = []
+        lines = [
+            {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello "}}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "agent/claude_p_backend.py", "token": "SECRET"}}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "SECRET result text", "is_error": False}]}},
+            {"type": "result", "subtype": "success", "result": "done", "session_id": "12345678-1234-4234-8234-123456789abc", "num_turns": 2, "total_cost_usd": 0.12, "usage": {"input_tokens": 10, "output_tokens": 5}},
+        ]
+
+        result = cb.normalize_claude_p_stream(
+            "\n".join(json.dumps(line) for line in lines),
+            session_id="local",
+            duration_seconds=1.25,
+            fallback_model="claude-sonnet-5",
+            event_callback=lambda event_type, **kwargs: events.append((event_type, kwargs)),
+        )
+
+        assert result.status == "completed"
+        assert result.summary == "done"
+        assert ("subagent.text", {"preview": "Hello "}) in events
+        tool_start = [event for event in events if event[0] == "tool.started"][-1][1]
+        assert tool_start["tool"] == "Read"
+        assert tool_start["input_summary"]["targets"] == {"file_path": "agent/claude_p_backend.py"}
+        assert "SECRET" not in repr(tool_start)
+        tool_complete = [event for event in events if event[0] == "tool.completed"][-1][1]
+        assert tool_complete["tool"] == "Read"
+        assert "SECRET" not in repr(tool_complete)
+        activity = [event for event in events if event[0] == "subagent.activity"][-1][1]
+        assert activity["input_tokens"] == 10
+        assert activity["output_tokens"] == 5
+
+
+    def test_text_with_token_words_is_relayed_as_normal_output(self):
+        events = []
+        raw = "\n".join([
+            json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Rotate the token variable name"}}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "ok"}),
+        ])
+
+        cb.normalize_claude_p_stream(
+            raw,
+            session_id="local",
+            duration_seconds=0.1,
+            fallback_model="claude-sonnet-5",
+            event_callback=lambda event_type, **kwargs: events.append((event_type, kwargs)),
+        )
+
+        assert ("subagent.text", {"preview": "Rotate the token variable name"}) in events
+
+    def test_tool_events_use_live_transcript_names_and_activity_ticks_every_event(self):
+        events = []
+        raw = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.py"}}]}}),
+            json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "ok"}),
+        ])
+
+        cb.normalize_claude_p_stream(
+            raw,
+            session_id="local",
+            duration_seconds=0.1,
+            fallback_model="claude-sonnet-5",
+            event_callback=lambda event_type, **kwargs: events.append((event_type, kwargs)),
+        )
+
+        names = [name for name, _ in events]
+        assert "tool.started" in names
+        assert "tool.completed" in names
+        assert names.count("subagent.activity") >= 3
+
+    def test_incremental_reader_keeps_utf8_split_lines_and_final_over_overflow(self):
+        async def _scenario():
+            reader = asyncio.StreamReader()
+            events = []
+            text_line = json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "snowman ☃"}}}, ensure_ascii=False).encode("utf-8") + b"\n"
+            final_line = json.dumps({"type": "result", "subtype": "success", "result": "final survives", "usage": {"input_tokens": 1}}).encode("utf-8") + b"\n"
+            reader.feed_data(text_line[: text_line.index("☃".encode("utf-8")) + 1])
+            reader.feed_data(text_line[text_line.index("☃".encode("utf-8")) + 1:])
+            reader.feed_data(b"x" * (cb.MAX_STDOUT_BYTES + 10))
+            reader.feed_data(final_line)
+            reader.feed_eof()
+            stdout, overflow = await cb._read_stream_json_capped(reader, 32, event_callback=lambda event_type, **kwargs: events.append((event_type, kwargs)))
+            return stdout.decode("utf-8", errors="replace"), overflow, events
+
+        stdout, overflow, events = asyncio.run(_scenario())
+
+        assert overflow is True
+        assert "final survives" in stdout
+        assert ("subagent.text", {"preview": "snowman ☃"}) in events
+
+    def test_output_overflow_with_observed_final_result_preserves_summary(self, monkeypatch):
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        final = json.dumps({"type": "result", "subtype": "success", "result": "kept", "session_id": "12345678-1234-4234-8234-123456789abc", "total_cost_usd": 0.5, "usage": {"input_tokens": 4, "output_tokens": 2}}).encode()
+
+        async def _fake(argv, *, env, workdir, timeout_seconds):
+            return 0, b"noise\n" + final, b"", False, True
+
+        monkeypatch.setattr(cb, "_run_claude_p_async", _fake)
+        result = cb.run_claude_p_task(cb.ClaudePRunRequest(prompt="p", model="claude-opus-5"), write_capable=False)
+
+        assert result.status == "completed"
+        assert result.summary == "kept"
+        assert result.cost_usd == pytest.approx(0.5)
+        assert result.tokens == {"input": 4, "output": 2}
+
+    def test_malformed_oversized_thinking_and_secrets_are_not_relayed(self):
+        events = []
+        secret = "SECRET-TOKEN-VALUE"
+        raw = "\n".join(
+            [
+                "{not json " + secret,
+                json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": secret}}}),
+                "x" * (cb.MAX_STREAM_EVENT_BYTES + 1),
+                json.dumps({"type": "result", "subtype": "success", "result": "ok"}),
+            ]
+        )
+
+        result = cb.normalize_claude_p_stream(
+            raw,
+            session_id="local",
+            duration_seconds=0.1,
+            fallback_model="claude-sonnet-5",
+            event_callback=lambda event_type, **kwargs: events.append((event_type, kwargs)),
+        )
+
+        assert result.status == "completed"
+        assert result.summary == "ok"
+        assert secret not in repr(events)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +857,38 @@ class TestResultNormalization:
         assert "example.com" not in repr(result.model_usage)
         assert "acct-secret" not in repr(result.model_usage)
 
+
+    def test_model_usage_preserves_full_reported_model_id_and_cache_tokens(self):
+        payload = json.dumps(
+            {
+                "subtype": "success",
+                "result": "ok",
+                "modelUsage": {
+                    "claude-opus-5-20260801": {
+                        "inputTokens": 10,
+                        "outputTokens": 3,
+                        "cacheReadInputTokens": 7,
+                        "cacheCreationInputTokens": 2,
+                        "costUSD": 0.01,
+                    }
+                },
+            }
+        )
+
+        result = cb.normalize_claude_p_output(
+            payload, session_id="s", duration_seconds=1.0, fallback_model="claude-opus-5"
+        )
+
+        assert result.model_usage == {
+            "claude-opus-5-20260801": {
+                "inputTokens": 10,
+                "outputTokens": 3,
+                "cacheReadInputTokens": 7,
+                "cacheCreationInputTokens": 2,
+                "costUSD": 0.01,
+            }
+        }
+
     def test_malformed_output_fails_safely_without_raw_text(self):
         raw = "Traceback (most recent call last): SECRET-TOKEN-VALUE leaked here"
         result = cb.normalize_claude_p_output(raw, session_id="s", duration_seconds=1.0)
@@ -811,6 +1137,50 @@ class TestProcessFailures:
         assert result.summary == "partial findings before stop"
         assert result.tokens == {"input": 11, "output": 7}
         assert "SECRET-VALUE" not in (result.error or "")
+
+    def test_interrupt_takes_precedence_over_output_overflow(self, monkeypatch):
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        partial = json.dumps(
+            {"type": "result", "subtype": "success", "result": "partial before stop"}
+        ).encode()
+
+        async def _fake(argv, *, env, workdir, timeout_seconds, cancel_event=None):
+            assert cancel_event is not None
+            cancel_event.set()
+            return -1, partial, b"", False, True
+
+        monkeypatch.setattr(cb, "_run_claude_p_async", _fake)
+        result = cb.run_claude_p_task(
+            cb.ClaudePRunRequest(prompt="p", model="claude-opus-5"),
+            write_capable=False,
+            cancel_event=threading.Event(),
+        )
+
+        assert result.status == "interrupted"
+        assert result.exit_reason == "interrupted"
+        assert result.summary == "partial before stop"
+
+
+    def test_interrupted_run_uses_streamed_text_when_no_final_result(self, monkeypatch):
+        monkeypatch.setattr(cb, "resolve_claude_executable", lambda: "/usr/bin/claude")
+        cancel = threading.Event()
+        line = json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial streamed summary"}}}).encode()
+
+        async def _fake(argv, *, env, workdir, timeout_seconds, cancel_event=None):
+            cancel.set()
+            if cancel_event is not None:
+                cancel_event.set()
+            return -1, line + b"\n", b"", False, False
+
+        monkeypatch.setattr(cb, "_run_claude_p_async", _fake)
+        result = cb.run_claude_p_task(
+            cb.ClaudePRunRequest(prompt="p", model="claude-opus-5"),
+            write_capable=False,
+            cancel_event=cancel,
+        )
+
+        assert result.status == "interrupted"
+        assert result.summary == "partial streamed summary"
 
     def test_missing_cli_fails_safely(self, monkeypatch):
         monkeypatch.setattr(cb, "resolve_claude_executable", lambda: None)

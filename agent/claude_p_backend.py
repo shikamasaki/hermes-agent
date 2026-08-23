@@ -15,9 +15,10 @@ Hard safety rules enforced throughout this module:
 * The executable is resolved once via ``shutil.which("claude")``; there is
   no config knob to point at an arbitrary path in this revision.
 * ``--bare`` is never passed (it skips OAuth and forces API-key auth,
-  defeating the entire point of this backend). ``--dangerously-skip-permissions``,
-  ``--permission-mode bypassPermissions``, plugins, MCP overrides, browser
-  integration, and push/publish/deploy/PR commands are never passed either.
+  defeating the entire point of this backend). ``--dangerously-skip-permissions``
+  is passed only when the caller captured an explicit validated
+  ``delegation.subagent_auto_approve=true`` decision. Plugins, MCP overrides,
+  browser integration, and push/publish/deploy/PR commands are never passed.
 * The child's environment is a fresh, minimal projection of the parent's —
   every ``*_API_KEY``/``*_TOKEN``/cloud-credential variable is stripped so a
   parent's (or a native provider's) credentials can never leak into the
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import codecs
 import logging
 import math
 import os
@@ -43,7 +45,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,8 @@ __all__ = [
     "check_claude_availability",
     "is_route_in_cooldown",
     "note_route_failure",
+    "normalize_claude_p_output",
+    "normalize_claude_p_stream",
     "resolve_claude_executable",
     "run_claude_p_task",
     "workdir_lock_for",
@@ -80,13 +84,17 @@ def resolve_claude_executable() -> Optional[str]:
 # Tool profiles — fixed, least-privilege allowlists. Never an arbitrary string.
 # ---------------------------------------------------------------------------
 
-TOOL_PROFILES: Mapping[str, str] = {
+TOOL_PROFILES: Mapping[str, Optional[str]] = {
+    # Claude Code normal Task passthrough.  No Hermes-added CLI tool/settings
+    # restrictions are emitted for this profile; Claude's own defaults apply.
+    "default": None,
     "read_only": "Read(./**)",
     "review": "Read(./**)",
     "coding": "Read(./**),Edit(./**),Write(./**)",
 }
 
-PROFILE_TOOL_SETS: Mapping[str, str] = {
+PROFILE_TOOL_SETS: Mapping[str, Optional[str]] = {
+    "default": None,
     "read_only": "Read",
     "review": "Read",
     "coding": "Read,Edit,Write",
@@ -120,8 +128,12 @@ class ClaudePToolProfile:
     """Validated tool profile resolved from route config."""
 
     name: str
-    allowed_tools: str
-    tools: str
+    allowed_tools: Optional[str]
+    tools: Optional[str]
+
+    @property
+    def passthrough(self) -> bool:
+        return self.name == "default"
 
 
 def resolve_tool_profile(name: Optional[str]) -> ClaudePToolProfile:
@@ -168,6 +180,7 @@ MAX_BUDGET_USD_CEILING = 50.0
 MAX_TIMEOUT_SECONDS_CEILING = 3600
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
+MAX_STREAM_EVENT_BYTES = 512 * 1024
 PROCESS_TERMINATE_GRACE_SECONDS = 5.0
 PROCESS_KILL_GRACE_SECONDS = 5.0
 PIPE_DRAIN_GRACE_SECONDS = 5.0
@@ -424,11 +437,12 @@ class ClaudePRunRequest:
     difficulty: str = "standard"
     workdir: str = "."
     tool_profile: str = DEFAULT_TOOL_PROFILE
-    max_turns: int = DEFAULT_MAX_TURNS
-    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD
+    max_turns: Optional[int] = DEFAULT_MAX_TURNS
+    max_budget_usd: Optional[float] = DEFAULT_MAX_BUDGET_USD
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     resume_session_id: Optional[str] = None
+    auto_approve: bool = False
 
 
 def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[str]:
@@ -436,16 +450,12 @@ def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[
 
     The prompt is exactly one argv element — never split, never
     interpolated into a shell string. Never includes ``--bare``,
-    ``--dangerously-skip-permissions``, ``--permission-mode bypassPermissions``,
-    plugin/MCP overrides, browser integration, or push/publish/deploy/PR
-    commands.
+    ``--permission-mode bypassPermissions``, plugin/MCP overrides, browser
+    integration, or push/publish/deploy/PR commands. Permission bypass is
+    emitted only from an explicit ``auto_approve`` run parameter.
     """
     profile = resolve_tool_profile(request.tool_profile)
     effort = map_difficulty_to_effort(request.difficulty)
-    max_turns = _bounded_int(request.max_turns, default=DEFAULT_MAX_TURNS, ceiling=MAX_TURNS_CEILING)
-    max_budget = _bounded_float(
-        request.max_budget_usd, default=DEFAULT_MAX_BUDGET_USD, ceiling=MAX_BUDGET_USD_CEILING, floor=0.01
-    )
 
     argv = [
         executable,
@@ -455,22 +465,41 @@ def build_claude_p_argv(request: ClaudePRunRequest, *, executable: str) -> list[
         request.model,
         "--effort",
         effort,
-        "--max-turns",
-        str(max_turns),
-        "--max-budget-usd",
-        f"{max_budget:.2f}",
-        "--allowedTools",
-        profile.allowed_tools,
-        "--tools",
-        profile.tools,
-        "--disallowedTools",
-        *DISALLOWED_TOOLS,
-        "--strict-mcp-config",
-        "--setting-sources",
-        "",
-        "--disable-slash-commands",
+    ]
+    if request.max_turns is not None:
+        max_turns = _bounded_int(
+            request.max_turns, default=DEFAULT_MAX_TURNS, ceiling=MAX_TURNS_CEILING
+        )
+        argv += ["--max-turns", str(max_turns)]
+    if request.max_budget_usd is not None:
+        max_budget = _bounded_float(
+            request.max_budget_usd,
+            default=DEFAULT_MAX_BUDGET_USD,
+            ceiling=MAX_BUDGET_USD_CEILING,
+            floor=0.01,
+        )
+        argv += ["--max-budget-usd", f"{max_budget:.2f}"]
+    if request.auto_approve:
+        argv.append("--dangerously-skip-permissions")
+    if not profile.passthrough:
+        argv += [
+            "--allowedTools",
+            profile.allowed_tools or "",
+            "--tools",
+            profile.tools or "",
+            "--disallowedTools",
+            *DISALLOWED_TOOLS,
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+        ]
+    argv += [
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--include-hook-events",
     ]
     if request.resume_session_id:
         resume_id = _safe_uuid(request.resume_session_id)
@@ -567,10 +596,31 @@ def _safe_uuid(value: Any) -> Optional[str]:
 
 
 def _safe_model_usage(raw: Any, model: Optional[str]) -> dict[str, Any]:
-    """Project Claude telemetry to fixed numeric fields under configured model."""
-    if not isinstance(raw, dict) or not model:
+    """Project Claude telemetry to fixed numeric fields under the reported model.
+
+    Claude Code may key modelUsage by a full model id even when Hermes routed
+    through an alias. Prefer an exact match, otherwise accept a single
+    Claude-looking reported model id; never preserve identity-looking arbitrary
+    keys.
+    """
+    if not isinstance(raw, dict):
         return {}
-    candidate = raw.get(model)
+    selected_key: Optional[str] = None
+    if model and isinstance(raw.get(model), dict):
+        selected_key = model
+    else:
+        candidates = [
+            str(key)
+            for key, value in raw.items()
+            if isinstance(key, str)
+            and key.startswith("claude-")
+            and isinstance(value, dict)
+        ]
+        if len(candidates) == 1:
+            selected_key = candidates[0]
+    if not selected_key:
+        return {}
+    candidate = raw.get(selected_key)
     if not isinstance(candidate, dict):
         return {}
     projected: dict[str, int | float] = {}
@@ -586,7 +636,7 @@ def _safe_model_usage(raw: Any, model: Optional[str]) -> dict[str, Any]:
     cost = _safe_nonnegative_float(candidate.get("costUSD"))
     if cost is not None:
         projected["costUSD"] = cost
-    return {model: projected} if projected else {}
+    return {selected_key: projected} if projected else {}
 
 
 def normalize_claude_p_output(
@@ -671,6 +721,215 @@ def normalize_claude_p_output(
     )
 
 
+ClaudePEventCallback = Callable[..., None]
+
+_SECRET_MARKERS = ("SECRET", "TOKEN", "API_KEY", "PASSWORD", "PRIVATE_KEY", "CREDENTIAL")
+
+
+def _contains_secret_marker(text: Any) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    upper = text.upper()
+    return any(marker in upper for marker in _SECRET_MARKERS)
+
+
+def _safe_event_text(text: Any, *, max_chars: int = 4000) -> Optional[str]:
+    if not isinstance(text, str) or not text:
+        return None
+    # Assistant text is already Claude's user-visible output. Do not suppress
+    # legitimate prose merely because it mentions words like "token" or
+    # "secret"; raw stderr/env/argv/thinking are the channels we never relay.
+    return text[:max_chars]
+
+
+def _emit_safe_event(event_callback: Optional[ClaudePEventCallback], event_type: str, **kwargs: Any) -> None:
+    if event_callback is None:
+        return
+    try:
+        event_callback(event_type, **kwargs)
+    except Exception:
+        logger.debug("claude-p stream callback failed for %s", event_type)
+
+
+def _safe_tool_input_summary(raw_input: Any) -> dict[str, Any]:
+    if not isinstance(raw_input, dict):
+        return {"argument_keys": [], "targets": {}}
+    keys = sorted(str(key)[:128] for key in raw_input)[:64]
+    target_keys = {
+        "cwd", "destination_path", "directory", "dst", "endpoint", "file_path",
+        "new_path", "old_path", "path", "source_path", "src", "target_path", "url", "urls",
+    }
+    url_keys = {"endpoint", "url", "urls"}
+
+    def _clean(key: str, value: Any) -> Any:
+        if isinstance(value, list):
+            cleaned = [_clean(key, item) for item in value[:16]]
+            cleaned = [item for item in cleaned if item is not None]
+            return cleaned or None
+        if not isinstance(value, str) or not value or _contains_secret_marker(value):
+            return None
+        bounded = value[:1024]
+        if key in url_keys:
+            from urllib.parse import urlsplit, urlunsplit
+
+            try:
+                parsed = urlsplit(bounded)
+                if parsed.scheme and parsed.netloc and parsed.hostname:
+                    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+                    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+                    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+            except ValueError:
+                return None
+        return bounded
+
+    targets: dict[str, Any] = {}
+    for key, value in raw_input.items():
+        k = str(key).lower()
+        if k in target_keys:
+            cleaned = _clean(k, value)
+            if cleaned is not None:
+                targets[k] = cleaned
+    return {"argument_keys": keys, "targets": targets}
+
+
+def _iter_content_blocks(obj: Mapping[str, Any]) -> list[Any]:
+    message = obj.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            return content
+    content = obj.get("content")
+    return content if isinstance(content, list) else []
+
+
+def _handle_stream_event_obj(
+    obj: Mapping[str, Any],
+    *,
+    event_callback: Optional[ClaudePEventCallback],
+    tool_names: dict[str, str],
+) -> Optional[dict[str, Any]]:
+    """Project one Claude stream-json object to safe live events.
+
+    Returns a final result object when *obj* is the terminal Claude result.
+    Raw malformed lines, raw stderr, thinking/reasoning deltas, tool payloads,
+    and credential-looking text are deliberately ignored.
+    """
+    obj_type = str(obj.get("type") or "")
+    _emit_safe_event(event_callback, "subagent.activity")
+    if obj_type == "result" or obj.get("subtype") in {
+        "success", "error_max_turns", "error_budget", "error_max_budget_usd", "error_during_execution"
+    }:
+        usage_raw = obj.get("usage")
+        usage = usage_raw if isinstance(usage_raw, dict) else {}
+        _emit_safe_event(
+            event_callback,
+            "subagent.activity",
+            input_tokens=_safe_nonnegative_int(usage.get("input_tokens", 0)),
+            output_tokens=_safe_nonnegative_int(usage.get("output_tokens", 0)),
+        )
+        return dict(obj)
+
+    event = obj.get("event") if isinstance(obj.get("event"), dict) else obj
+    delta = event.get("delta") if isinstance(event, dict) and isinstance(event.get("delta"), dict) else None
+    if delta and delta.get("type") == "text_delta":
+        text = _safe_event_text(delta.get("text"))
+        if text is not None:
+            _emit_safe_event(event_callback, "subagent.text", preview=text)
+        return None
+
+    for block in _iter_content_blocks(obj):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            tool_id = str(block.get("id") or "")
+            tool_name = str(block.get("name") or "tool")[:256]
+            if tool_id:
+                tool_names[tool_id] = tool_name
+            _emit_safe_event(
+                event_callback,
+                "tool.started",
+                tool=tool_name,
+                tool_id=tool_id or None,
+                input_summary=_safe_tool_input_summary(block.get("input")),
+            )
+        elif block.get("type") == "tool_result":
+            tool_id = str(block.get("tool_use_id") or "")
+            tool_name = tool_names.get(tool_id, "tool")
+            _emit_safe_event(
+                event_callback,
+                "tool.completed",
+                tool=tool_name,
+                tool_id=tool_id or None,
+                status="error" if bool(block.get("is_error")) else "ok",
+            )
+    return None
+
+
+def normalize_claude_p_stream(
+    raw_stdout: str,
+    *,
+    session_id: str,
+    duration_seconds: float,
+    fallback_model: Optional[str] = None,
+    event_callback: Optional[ClaudePEventCallback] = None,
+) -> ClaudePRunResult:
+    """Normalize Claude Code ``stream-json`` stdout and relay safe live events."""
+    tool_names: dict[str, str] = {}
+    final: Optional[dict[str, Any]] = None
+    text_chunks: list[str] = []
+    for raw_line in raw_stdout.splitlines():
+        if not raw_line:
+            continue
+        oversized = len(raw_line.encode("utf-8", errors="ignore")) > MAX_STREAM_EVENT_BYTES
+        if oversized and '"result"' not in raw_line and '"subtype"' not in raw_line:
+            continue
+        try:
+            obj = json.loads(raw_line)
+        except ValueError:
+            obj = _find_final_json_object(raw_line) if oversized else None
+            if obj is None:
+                continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event") if isinstance(obj.get("event"), dict) else obj
+        delta = event.get("delta") if isinstance(event, dict) and isinstance(event.get("delta"), dict) else None
+        if delta and delta.get("type") == "text_delta":
+            text = _safe_event_text(delta.get("text"), max_chars=8000)
+            if text:
+                text_chunks.append(text)
+        maybe_final = _handle_stream_event_obj(
+            obj, event_callback=event_callback, tool_names=tool_names
+        )
+        if maybe_final is not None:
+            final = maybe_final
+    if final is None:
+        if text_chunks:
+            summary = "".join(text_chunks)[:16000]
+            return ClaudePRunResult(
+                status="error",
+                summary=summary,
+                error="claude -p produced no parseable JSON result",
+                session_id=session_id,
+                claude_session_id=None,
+                num_turns=None,
+                cost_usd=None,
+                model=fallback_model,
+                duration_seconds=duration_seconds,
+                exit_reason="malformed_output",
+                tokens={"input": 0, "output": 0},
+                model_usage={},
+            )
+        return normalize_claude_p_output(
+            "", session_id=session_id, duration_seconds=duration_seconds, fallback_model=fallback_model
+        )
+    return normalize_claude_p_output(
+        json.dumps(final),
+        session_id=session_id,
+        duration_seconds=duration_seconds,
+        fallback_model=fallback_model,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process execution — bounded, cancellable, byte-capped, group-terminated.
 # ---------------------------------------------------------------------------
@@ -696,6 +955,96 @@ async def _read_capped(stream: asyncio.StreamReader, cap: int) -> tuple[bytes, b
     return bytes(retained), overflow
 
 
+async def _read_stream_json_capped(
+    stream: asyncio.StreamReader,
+    cap: int,
+    *,
+    event_callback: Optional[ClaudePEventCallback] = None,
+) -> tuple[bytes, bool]:
+    """Drain stdout while incrementally relaying safe stream-json events.
+
+    Retains the bounded head for diagnostics but also keeps the last terminal
+    result line separately.  Claude Code emits newline-delimited JSON; parsing
+    only complete newline records avoids gluing unrelated objects together, and
+    an incremental decoder preserves UTF-8 characters split across pipe reads.
+    """
+    retained = bytearray()
+    overflow = False
+    pending = ""
+    final_line: Optional[str] = None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    tool_names: dict[str, str] = {}
+
+    def _process_line(line: str) -> None:
+        nonlocal final_line
+        if not line:
+            return
+        line_bytes_len = len(line.encode("utf-8", errors="ignore"))
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+            # If an oversized/malformed unterminated line precedes Claude's
+            # terminal result, salvage the last embedded result object instead
+            # of discarding the already-observed final summary.
+            for marker in ('{"type": "result"', '{"type":"result"'):
+                idx = line.rfind(marker)
+                if idx != -1:
+                    try:
+                        candidate = json.loads(line[idx:])
+                    except ValueError:
+                        candidate = None
+                    if isinstance(candidate, dict):
+                        obj = candidate
+                        break
+            if obj is None:
+                return
+        if not isinstance(obj, dict):
+            return
+        maybe_final = _handle_stream_event_obj(
+            obj, event_callback=event_callback, tool_names=tool_names
+        )
+        if maybe_final is not None:
+            # Preserve the terminal result even if stdout already exceeded the
+            # aggregate cap or the result line itself exceeds the event cap.
+            final_line = json.dumps(maybe_final, ensure_ascii=False)
+        elif line_bytes_len > MAX_STREAM_EVENT_BYTES:
+            return
+
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        room = cap - len(retained)
+        if room > 0:
+            retained.extend(chunk[:room])
+        if len(chunk) > room:
+            overflow = True
+        pending += decoder.decode(chunk, final=False)
+        pending_bytes = pending.encode("utf-8", errors="ignore")
+        pending_cap = cap + MAX_STREAM_EVENT_BYTES
+        if len(pending_bytes) > pending_cap:
+            # Bound malformed/no-newline records while retaining the tail where
+            # a later terminal result record can still be recovered.
+            overflow = True
+            pending = pending_bytes[-pending_cap:].decode("utf-8", errors="ignore")
+        *lines, pending = pending.split("\n")
+        for line in lines:
+            # Non-final oversized stream events are ignored after parsing fails;
+            # terminal results are still preserved by _process_line.
+            if len(line.encode("utf-8", errors="ignore")) > MAX_STREAM_EVENT_BYTES and '"result"' not in line and '"subtype"' not in line:
+                continue
+            _process_line(line)
+
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        _process_line(pending)
+
+    if final_line is not None and final_line not in retained.decode("utf-8", errors="ignore"):
+        retained.extend(b"\n")
+        retained.extend(final_line.encode("utf-8"))
+    return bytes(retained), overflow
+
 def _signal_process_group(process_group_id: int, sig: signal.Signals) -> None:
     if os.name == "nt":
         return
@@ -712,6 +1061,7 @@ async def _run_claude_p_async(
     workdir: str,
     timeout_seconds: float,
     cancel_event: Optional[threading.Event] = None,
+    event_callback: Optional[ClaudePEventCallback] = None,
 ) -> tuple[int, bytes, bytes, bool, bool]:
     """Return (returncode, stdout, stderr, timed_out, output_overflow).
 
@@ -738,7 +1088,15 @@ async def _run_claude_p_async(
     # longer work while descendants still retain stdout/stderr pipe handles.
     process_group_id = proc.pid if os.name != "nt" else None
 
-    stdout_task = asyncio.ensure_future(_read_capped(proc.stdout, MAX_STDOUT_BYTES))
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    if hasattr(proc.stdout, "read"):
+        stdout_task = asyncio.ensure_future(
+            _read_stream_json_capped(proc.stdout, MAX_STDOUT_BYTES, event_callback=event_callback)
+        )
+    else:
+        # Test doubles and defensive fallback for non-StreamReader-like stdout.
+        stdout_task = asyncio.ensure_future(_read_capped(proc.stdout, MAX_STDOUT_BYTES))
     stderr_task = asyncio.ensure_future(_read_capped(proc.stderr, MAX_STDERR_BYTES))
 
     timed_out = False
@@ -871,6 +1229,7 @@ def run_claude_p_task(
     *,
     write_capable: bool,
     cancel_event: Optional[threading.Event] = None,
+    event_callback: Optional[ClaudePEventCallback] = None,
 ) -> ClaudePRunResult:
     """Run one bounded ``claude -p`` task synchronously (drives its own loop).
 
@@ -900,8 +1259,26 @@ def run_claude_p_task(
     acquired = False
     try:
         if lock is not None:
-            lock.acquire()
-            acquired = True
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    duration = time.monotonic() - start
+                    return ClaudePRunResult(
+                        status="interrupted",
+                        summary=None,
+                        error="claude -p was interrupted before acquiring the workdir lock",
+                        session_id=request.session_id,
+                        claude_session_id=None,
+                        num_turns=None,
+                        cost_usd=None,
+                        model=request.model,
+                        duration_seconds=duration,
+                        exit_reason="interrupted",
+                        tokens={"input": 0, "output": 0},
+                        model_usage={},
+                    )
+                if lock.acquire(timeout=0.1):
+                    acquired = True
+                    break
 
         argv = build_claude_p_argv(request, executable=executable)
         env = build_scrubbed_environment()
@@ -914,6 +1291,8 @@ def run_claude_p_task(
             }
             if cancel_event is not None:
                 run_kwargs["cancel_event"] = cancel_event
+            if event_callback is not None:
+                run_kwargs["event_callback"] = event_callback
             task = asyncio.ensure_future(_run_claude_p_async(argv, **run_kwargs))
             return await task
 
@@ -942,25 +1321,9 @@ def run_claude_p_task(
     duration = time.monotonic() - start
     stdout_text = stdout_bytes.decode("utf-8", errors="replace")
 
-    if output_overflow:
-        return ClaudePRunResult(
-            status="error",
-            summary=None,
-            error="claude -p output exceeded its bounded size limit",
-            session_id=request.session_id,
-            claude_session_id=None,
-            num_turns=None,
-            cost_usd=None,
-            model=request.model,
-            duration_seconds=duration,
-            exit_reason="output_limit",
-            tokens={"input": 0, "output": 0},
-            model_usage={},
-        )
-
     interrupted = bool(cancel_event is not None and cancel_event.is_set() and not timed_out)
     if interrupted:
-        parsed = normalize_claude_p_output(
+        parsed = normalize_claude_p_stream(
             stdout_text,
             session_id=request.session_id,
             duration_seconds=duration,
@@ -979,6 +1342,30 @@ def run_claude_p_task(
             exit_reason="interrupted",
             tokens=(parsed.tokens if parsed is not None else {"input": 0, "output": 0}),
             model_usage=(parsed.model_usage if parsed is not None else {}),
+        )
+
+    if output_overflow:
+        parsed_overflow = normalize_claude_p_stream(
+            stdout_text,
+            session_id=request.session_id,
+            duration_seconds=duration,
+            fallback_model=request.model,
+        )
+        if parsed_overflow.exit_reason != "malformed_output":
+            return parsed_overflow
+        return ClaudePRunResult(
+            status="error",
+            summary=None,
+            error="claude -p output exceeded its bounded size limit",
+            session_id=request.session_id,
+            claude_session_id=None,
+            num_turns=None,
+            cost_usd=None,
+            model=request.model,
+            duration_seconds=duration,
+            exit_reason="output_limit",
+            tokens={"input": 0, "output": 0},
+            model_usage={},
         )
 
     if timed_out:
@@ -1000,7 +1387,7 @@ def run_claude_p_task(
     if returncode != 0:
         parsed = _find_final_json_object(stdout_text)
         if parsed is not None:
-            result = normalize_claude_p_output(
+            result = normalize_claude_p_stream(
                 stdout_text, session_id=request.session_id, duration_seconds=duration, fallback_model=request.model
             )
             return ClaudePRunResult(**{**result.__dict__, "status": "error"})
@@ -1019,7 +1406,7 @@ def run_claude_p_task(
             model_usage={},
         )
 
-    return normalize_claude_p_output(
+    return normalize_claude_p_stream(
         stdout_text,
         session_id=request.session_id,
         duration_seconds=duration,

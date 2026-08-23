@@ -185,6 +185,41 @@ class TestClaudePDispatch:
         assert spec.params["model"] == "claude-opus-5"
         assert spec.write_capable is False
 
+    def test_subagent_auto_approve_is_captured_into_claude_p_run_params(self, harness, monkeypatch):
+        cfg = {
+            **MIXED_CFG,
+            "subagent_auto_approve": True,
+            "routes": [
+                {
+                    **CLAUDE_ROUTE,
+                    "tool_profile": "default",
+                    "capabilities": ["coding", "reasoning", "review"],
+                }
+            ],
+        }
+        monkeypatch.setattr(dt, "_load_config", lambda: cfg)
+        captured = []
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            captured.append((request, write_capable))
+            return cb.ClaudePRunResult(
+                status="completed", summary="done", error=None,
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=1, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="completed",
+                tokens={"input": 1, "output": 1}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        _run(goal="Edit the code", difficulty="complex", required_capabilities=["coding"])
+
+        assert captured
+        request, write_capable = captured[0]
+        assert request.tool_profile == "default"
+        assert request.auto_approve is True
+        assert request.max_budget_usd is None
+        assert write_capable is True
+
     def test_result_is_normalized_into_the_delegate_entry_shape(self, harness, monkeypatch):
         _stub_claude_success(monkeypatch, summary="reviewed the scheduler")
         out = _run(goal="Redesign the scheduler to remove the global lock", difficulty="complex")
@@ -199,6 +234,7 @@ class TestClaudePDispatch:
         assert entry["tokens"] == {"input": 100, "output": 50}
         assert entry["api_calls"] == 3
         assert entry["exit_reason"] == "completed"
+        assert entry["cost_status"] == "notional"
         assert entry["route"]["backend"] == "claude-p"
         assert entry["route"]["id"] == "claude-sub"
 
@@ -575,6 +611,45 @@ class TestClaudePLiveRegistryLifecycle:
             thread.join(timeout=2)
             dt._unregister_subagent(spec._subagent_id)
 
+
+    def test_parent_interrupt_propagates_to_claude_p_child_and_unregisters(self, monkeypatch):
+        parent = _LiveParent()
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        spec = self._spec(parent)
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            started.set()
+            assert cancel_event is not None
+            assert cancel_event.wait(timeout=2), "parent interrupt did not signal claude-p cancel"
+            cancelled.set()
+            return cb.ClaudePRunResult(
+                status="interrupted", summary="partial", error="interrupted",
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=1, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="interrupted",
+                tokens={"input": 1, "output": 1}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        thread = threading.Thread(target=lambda: dt._run_single_child(0, "Audit the scheduler", spec, parent))
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            assert spec in parent._active_children
+            spec.interrupt("ctrl-c")
+            assert cancelled.wait(timeout=2)
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert spec not in parent._active_children
+            assert json.loads(dt._handle_control_action("list", None, None, parent))["count"] == 0
+        finally:
+            spec.interrupt("cleanup")
+            thread.join(timeout=2)
+            dt._unregister_subagent(spec._subagent_id)
+
     def test_claude_p_spec_has_activity_summary_for_async_progress(self):
         parent = _LiveParent()
         spec = self._spec(parent)
@@ -722,6 +797,39 @@ class TestClaudePLiveRegistryLifecycle:
         assert result["summary"] == '{"ok": true}'
         assert result["schema_valid"] is True
         assert len(calls) == 1
+
+
+    def test_schema_retry_interrupt_preserves_first_summary(self, monkeypatch):
+        parent = _LiveParent()
+        spec = self._spec(parent)
+        spec._delegate_output_schema = {"type": "object", "required": ["ok"]}
+        calls = []
+
+        def _fake_task(request, *, write_capable, cancel_event=None):
+            calls.append(request)
+            if len(calls) == 1:
+                return cb.ClaudePRunResult(
+                    status="completed", summary="not json but useful", error=None,
+                    session_id=request.session_id, claude_session_id="12345678-1234-4234-8234-123456789abc",
+                    num_turns=1, cost_usd=0.1, model=request.model,
+                    duration_seconds=0.1, exit_reason="completed",
+                    tokens={"input": 1, "output": 2}, model_usage={},
+                )
+            return cb.ClaudePRunResult(
+                status="interrupted", summary=None, error="interrupted",
+                session_id=request.session_id, claude_session_id=None,
+                num_turns=0, cost_usd=0.0, model=request.model,
+                duration_seconds=0.1, exit_reason="interrupted",
+                tokens={"input": 0, "output": 0}, model_usage={},
+            )
+
+        monkeypatch.setattr(cb, "run_claude_p_task", _fake_task)
+        result = dt._run_single_child(0, "Audit the scheduler", spec, parent)
+
+        assert len(calls) == 2
+        assert result["summary"] == "not json but useful"
+        assert result["schema_valid"] is False
+        assert result["schema_retries"] == 1
 
     def test_claude_p_steer_rejection_names_unsupported_channel(self, monkeypatch):
         parent = _LiveParent()

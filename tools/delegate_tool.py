@@ -1565,6 +1565,17 @@ def _build_child_progress_callback(
             _relay("subagent.text", preview=preview)
             return
 
+        if event_type == "tool.start":
+            tool_name = str(tool_name or kwargs.get("tool") or "tool")
+            event_type = "tool.started"
+        elif event_type == "tool.complete":
+            tool_name = str(tool_name or kwargs.get("tool") or "tool")
+            event_type = "tool.completed"
+
+        if event_type == "subagent.activity":
+            _relay("subagent.activity", preview=preview, **kwargs)
+            return
+
         # Normalise legacy strings, new-style "delegate.*" strings, and
         # DelegateEvent enum values all to a single DelegateEvent.  The
         # original implementation only accepted the five legacy strings;
@@ -1640,7 +1651,7 @@ def _build_child_progress_callback(
                 logger.debug("Spinner print_above failed: %s", e)
 
         if parent_cb:
-            _relay("subagent.tool", tool_name, preview, args)
+            _relay("subagent.tool", tool_name, preview, args, **kwargs)
             _batch.append(tool_name or "")
             if len(_batch) >= _BATCH_SIZE:
                 summary = ", ".join(_batch)
@@ -2583,6 +2594,18 @@ def _run_single_child(
                     pass
 
         _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        _parent_active_registered = False
+        if hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.append(child)
+                else:
+                    parent_agent._active_children.append(child)
+                _parent_active_registered = True
+            except Exception as exc:
+                logger.debug("Could not register claude-p child for parent interrupts: %s", exc)
         with _registered_live_subagent(
             child=child,
             goal=goal,
@@ -2604,6 +2627,16 @@ def _run_single_child(
                 _heartbeat_stop.set()
                 if _heartbeat_thread.ident is not None:
                     _heartbeat_thread.join(timeout=5)
+                if _parent_active_registered and hasattr(parent_agent, "_active_children"):
+                    try:
+                        lock = getattr(parent_agent, "_active_children_lock", None)
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except (ValueError, AttributeError) as exc:
+                        logger.debug("Could not remove claude-p child from active_children: %s", exc)
 
     child_start = time.monotonic()
 
@@ -3732,29 +3765,45 @@ def _run_claude_p_child(
     )
 
     params = spec.params
+    max_turns_param = params.get("max_turns")
+    max_budget_param = params.get("max_budget_usd")
     request = ClaudePRunRequest(
         prompt=_build_claude_p_prompt(goal, spec.context),
         model=str(params.get("model") or ""),
         difficulty=str(params.get("difficulty") or "standard"),
         workdir=spec.workdir,
         tool_profile=str(params.get("tool_profile") or "read_only"),
-        max_turns=int(params.get("max_turns") or 40),
-        max_budget_usd=float(params.get("max_budget_usd") or 5.0),
+        max_turns=(int(max_turns_param) if max_turns_param is not None else None),
+        max_budget_usd=(float(max_budget_param) if max_budget_param is not None else None),
         timeout_seconds=float(params.get("timeout_seconds") or 900),
         session_id=spec.session_id,
+        auto_approve=is_truthy_value(params.get("auto_approve"), default=False),
     )
+
+    def _run_task(req: ClaudePRunRequest):
+        kwargs: Dict[str, Any] = {
+            "write_capable": spec.write_capable,
+            "cancel_event": spec._cancel_event,
+        }
+        child_progress_cb = getattr(spec, "tool_progress_callback", None)
+        if child_progress_cb is not None:
+            try:
+                import inspect
+
+                if "event_callback" in inspect.signature(run_claude_p_task).parameters:
+                    kwargs["event_callback"] = child_progress_cb
+            except (TypeError, ValueError):
+                kwargs["event_callback"] = child_progress_cb
+        return run_claude_p_task(req, **kwargs)
 
     spec.tools_started = True
     spec._last_activity_ts = time.time()
     spec._last_activity_desc = "claude-p running"
+    child_start = time.monotonic()
     try:
-        result = run_claude_p_task(
-            request,
-            write_capable=spec.write_capable,
-            cancel_event=spec._cancel_event,
-        )
+        result = _run_task(request)
     except Exception as exc:
-        duration = 0.0
+        duration = round(time.monotonic() - child_start, 2)
         spec._last_activity_ts = time.time()
         spec._last_activity_desc = "claude-p failed"
         entry = {
@@ -3806,11 +3855,15 @@ def _run_claude_p_child(
         from tools.delegation_output_schema import build_retry_message, validate_output
 
         schema_valid, schema_errors = validate_output(result.summary or "", output_schema)
-        remaining_turns = max(0, request.max_turns - (result.num_turns or 0))
+        remaining_turns = (
+            max(0, request.max_turns - (result.num_turns or 0))
+            if request.max_turns is not None
+            else 0
+        )
         remaining_budget = (
             max(0.0, request.max_budget_usd - result.cost_usd)
-            if result.cost_usd is not None
-            else 0.0
+            if request.max_budget_usd is not None and result.cost_usd is not None
+            else request.max_budget_usd
         )
         remaining_timeout = max(0.0, request.timeout_seconds - result.duration_seconds)
         if (
@@ -3819,7 +3872,7 @@ def _run_claude_p_child(
             and not spec._cancel_event.is_set()
             and result.claude_session_id
             and remaining_turns >= 1
-            and remaining_budget >= 0.01
+            and (remaining_budget is None or remaining_budget >= 0.01)
             and remaining_timeout >= 1.0
         ):
             schema_retries = 1
@@ -3831,31 +3884,45 @@ def _run_claude_p_child(
                 timeout_seconds=remaining_timeout,
                 resume_session_id=result.claude_session_id,
             )
-            retry = run_claude_p_task(
-                retry_request,
-                write_capable=spec.write_capable,
-                cancel_event=spec._cancel_event,
-            )
-            total_cost = (
-                (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
-                if result.cost_usd is not None or retry.cost_usd is not None
-                else None
-            )
-            result = replace(
-                retry,
-                duration_seconds=result.duration_seconds + retry.duration_seconds,
-                num_turns=(result.num_turns or 0) + (retry.num_turns or 0),
-                cost_usd=total_cost,
-                tokens={
-                    "input": result.tokens.get("input", 0)
-                    + retry.tokens.get("input", 0),
-                    "output": result.tokens.get("output", 0)
-                    + retry.tokens.get("output", 0),
-                },
-            )
-            schema_valid, schema_errors = validate_output(
-                result.summary or "", output_schema
-            )
+            retry = _run_task(retry_request)
+            if retry.status == "completed":
+                total_cost = (
+                    (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
+                    if result.cost_usd is not None or retry.cost_usd is not None
+                    else None
+                )
+                result = replace(
+                    retry,
+                    duration_seconds=result.duration_seconds + retry.duration_seconds,
+                    num_turns=(result.num_turns or 0) + (retry.num_turns or 0),
+                    cost_usd=total_cost,
+                    tokens={
+                        "input": result.tokens.get("input", 0)
+                        + retry.tokens.get("input", 0),
+                        "output": result.tokens.get("output", 0)
+                        + retry.tokens.get("output", 0),
+                    },
+                )
+                schema_valid, schema_errors = validate_output(
+                    result.summary or "", output_schema
+                )
+            else:
+                # Preserve the first useful summary if the schema-retry turn is
+                # interrupted or errors; do not replace it with an empty retry.
+                result = replace(
+                    result,
+                    duration_seconds=result.duration_seconds + retry.duration_seconds,
+                    num_turns=(result.num_turns or 0) + (retry.num_turns or 0),
+                    cost_usd=(
+                        (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
+                        if result.cost_usd is not None or retry.cost_usd is not None
+                        else None
+                    ),
+                    tokens={
+                        "input": result.tokens.get("input", 0) + retry.tokens.get("input", 0),
+                        "output": result.tokens.get("output", 0) + retry.tokens.get("output", 0),
+                    },
+                )
             spec._api_call_count = int(result.num_turns or 0)
             spec._last_activity_ts = time.time()
             spec._last_activity_desc = f"claude-p {result.status}"
@@ -3879,13 +3946,20 @@ def _run_claude_p_child(
         "duration_seconds": round(result.duration_seconds, 2),
         "model": result.model,
         "exit_reason": result.exit_reason,
-        "truncated": result.exit_reason in {"error_max_turns", "error_budget"},
+        "truncated": result.exit_reason in {
+            "error_max_turns",
+            "error_budget",
+            "error_max_budget_usd",
+        },
         "tokens": dict(result.tokens),
         "tool_trace": [],
         "_child_role": spec._delegate_role,
-        "_child_cost_usd": float(result.cost_usd or 0.0),
+        # Claude subscription usage reports an API-price equivalent, not an
+        # amount actually charged. Keep it visible as notional metadata but do
+        # not roll it into the parent's real/estimated session spend.
+        "_child_cost_usd": 0.0,
         "cost_usd": round(float(result.cost_usd or 0.0), 6),
-        "cost_status": "reported" if result.cost_usd is not None else "unknown",
+        "cost_status": "notional" if result.cost_usd is not None else "unknown",
         # Opaque per-task session id for bounded resume. Kept in the result
         # metadata only — never persisted into the usage cache.
         "claude_session_id": result.claude_session_id,
@@ -5227,6 +5301,7 @@ def _resolve_routed_credentials(
                 "cooldown_seconds": selected_route.cooldown_seconds,
                 "write_capable": selected_route.write_capable,
                 "difficulty": decision.difficulty,
+                "auto_approve": is_truthy_value(cfg.get("subagent_auto_approve"), default=False),
             },
             "route_decision": asdict(decision),
         }

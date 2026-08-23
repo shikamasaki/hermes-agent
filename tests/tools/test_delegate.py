@@ -1479,6 +1479,22 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
 
+    def test_progress_callback_maps_stream_tool_name_and_input_summary(self):
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
+        self.assertIsNotNone(cb)
+        summary = {"argument_keys": ["file_path"], "targets": {"file_path": "a.py"}}
+        cb("tool.start", tool="Read", input_summary=summary)
+
+        rendered = " ".join(str(call) for call in parent._delegate_spinner.print_above.call_args_list)
+        self.assertIn("Read", rendered)
+        relay_calls = parent.tool_progress_callback.call_args_list
+        self.assertTrue(any(call.args[:2] == ("subagent.tool", "Read") for call in relay_calls))
+        self.assertTrue(any(call.kwargs.get("input_summary") == summary for call in relay_calls))
+
 
     def test_progress_callback_ignores_unknown_events(self):
         """Unknown event types are silently ignored."""
