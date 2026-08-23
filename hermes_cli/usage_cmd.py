@@ -208,10 +208,10 @@ def render_text(providers: Iterable[str], *, refresh: bool, provider_filter=None
             label = window["label"] or "(window)"
             remaining = window.get("remaining_percent")
             used = window.get("used_percent")
-            
+
             rem_str = f"{remaining:.1f}% remaining" if remaining is not None else "unknown remaining"
             used_str = f"{used:.1f}% used" if used is not None else "unknown used"
-            
+
             reset_at = window.get("reset_at") or "unknown"
             lines.append(f"  {label}: {rem_str} / {used_str}, reset_at={reset_at}")
     return "\n".join(lines)

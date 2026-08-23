@@ -366,7 +366,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, busy_policy="dispatch"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True, busy_policy="dispatch"),
-    CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset; `providers` lists every configured provider's cached usage", "Info",
+    CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked rate-limit reset; `providers` lists every configured provider's cached usage", "Info",
                args_hint="[reset [--force] | providers [refresh]]",
                subcommands=("reset", "providers")),
     CommandDef("subscription", "View your Nous plan and change it in the browser", "Info",

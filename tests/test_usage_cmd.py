@@ -69,12 +69,12 @@ class TestDiscoverConfiguredProviders:
     def test_discovers_auxiliary_provider_assignments(self):
         config = {
             "auxiliary": {
-                "vision": {"provider": "openrouter"},
+                "vision": {"provider": "aux-provider"},
                 "compression": {"provider": "auto"},
             }
         }
         providers = usage_cmd.discover_configured_providers(config)
-        assert "openrouter" in providers
+        assert "aux-provider" in providers
 
     def test_dedupes_across_sources(self):
         config = {
