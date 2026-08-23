@@ -249,25 +249,25 @@ class TestUsageProviders:
 
         monkeypatch.setattr(
             "hermes_cli.usage_cmd._load_active_config",
-            lambda: {"model": {"provider": "openai-codex"}},
+            lambda: {"model": {"provider": "provider-a"}},
         )
         monkeypatch.setattr(
             "hermes_cli.usage_cmd.discover_configured_providers",
-            lambda config: ("openai-codex",),
+            lambda config: ("provider-a",),
         )
 
         def fake_render_text(providers, *, refresh, **kwargs):
             calls["providers"] = tuple(providers)
             calls["refresh"] = refresh
-            return "openai-codex: unknown (unknown, age=unknown)"
+            return "provider-a: unknown (unknown, age=unknown)"
 
         monkeypatch.setattr("hermes_cli.usage_cmd.render_text", fake_render_text)
 
         result = await runner._handle_usage_command(self._event("providers"))
 
-        assert calls["providers"] == ("openai-codex",)
+        assert calls["providers"] == ("provider-a",)
         assert calls["refresh"] is False
-        assert result == "openai-codex: unknown (unknown, age=unknown)"
+        assert result == "provider-a: unknown (unknown, age=unknown)"
 
     @pytest.mark.asyncio
     async def test_providers_refresh_calls_shared_service_with_refresh_true(self, monkeypatch):
@@ -276,11 +276,11 @@ class TestUsageProviders:
 
         monkeypatch.setattr(
             "hermes_cli.usage_cmd._load_active_config",
-            lambda: {"model": {"provider": "openai-codex"}},
+            lambda: {"model": {"provider": "provider-a"}},
         )
         monkeypatch.setattr(
             "hermes_cli.usage_cmd.discover_configured_providers",
-            lambda config: ("openai-codex",),
+            lambda config: ("provider-a",),
         )
 
         def fake_render_text(providers, *, refresh, **kwargs):
@@ -302,11 +302,11 @@ class TestUsageProviders:
 
         monkeypatch.setattr(
             "hermes_cli.usage_cmd._load_active_config",
-            lambda: {"model": {"provider": "openai-codex"}},
+            lambda: {"model": {"provider": "provider-a"}},
         )
         monkeypatch.setattr(
             "hermes_cli.usage_cmd.discover_configured_providers",
-            lambda config: ("openai-codex",),
+            lambda config: ("provider-a",),
         )
 
         def fake_render_text(providers, *, refresh, **kwargs):
@@ -353,7 +353,7 @@ class TestUsageProviders:
         runner = _make_runner(SK)
         monkeypatch.setattr(
             "hermes_cli.usage_cmd._load_active_config",
-            lambda: {"model": {"provider": "openai-codex"}},
+            lambda: {"model": {"provider": "provider-a"}},
         )
 
         result = await runner._handle_usage_command(self._event("providers"))

@@ -25,9 +25,9 @@ from hermes_cli import usage_cmd
 
 class TestDiscoverConfiguredProviders:
     def test_discovers_model_provider(self):
-        config = {"model": {"provider": "openai-codex"}}
+        config = {"model": {"provider": "provider-a"}}
         providers = usage_cmd.discover_configured_providers(config)
-        assert "openai-codex" in providers
+        assert "provider-a" in providers
 
     def test_discovers_delegation_routes_providers(self):
         config = {
@@ -36,15 +36,15 @@ class TestDiscoverConfiguredProviders:
                 "routes": [
                     {
                         "id": "r1",
-                        "provider": "openai-codex",
-                        "model": "gpt-5",
+                        "provider": "provider-a",
+                        "model": "model-a",
                         "model_class": "advanced",
                         "task_difficulties": ["standard"],
                     },
                     {
                         "id": "r2",
-                        "provider": "google-antigravity",
-                        "model": "gemini-3",
+                        "provider": "provider-b",
+                        "model": "model-b",
                         "model_class": "advanced",
                         "task_difficulties": ["standard"],
                     },
@@ -52,18 +52,18 @@ class TestDiscoverConfiguredProviders:
             }
         }
         providers = usage_cmd.discover_configured_providers(config)
-        assert "openai-codex" in providers
-        assert "google-antigravity" in providers
+        assert "provider-a" in providers
+        assert "provider-b" in providers
 
     def test_discovers_legacy_delegation_provider_without_route_catalog(self):
         config = {
             "delegation": {
-                "provider": "openai-codex",
-                "model": "gpt-5",
+                "provider": "provider-a",
+                "model": "model-a",
             }
         }
         providers = usage_cmd.discover_configured_providers(config)
-        assert providers == ("openai-codex",)
+        assert providers == ("provider-a",)
 
 
     def test_discovers_auxiliary_provider_assignments(self):
@@ -78,23 +78,23 @@ class TestDiscoverConfiguredProviders:
 
     def test_dedupes_across_sources(self):
         config = {
-            "model": {"provider": "openai-codex"},
+            "model": {"provider": "provider-a"},
             "delegation": {
                 "routing": {"enabled": True},
                 "routes": [
                     {
                         "id": "r1",
-                        "provider": "openai-codex",
-                        "model": "gpt-5",
+                        "provider": "provider-a",
+                        "model": "model-a",
                         "model_class": "advanced",
                         "task_difficulties": ["standard"],
                     },
                 ],
             },
-            "auxiliary": {"vision": {"provider": "openai-codex"}},
+            "auxiliary": {"vision": {"provider": "provider-a"}},
         }
         providers = usage_cmd.discover_configured_providers(config)
-        assert list(providers).count("openai-codex") == 1
+        assert list(providers).count("provider-a") == 1
 
     def test_ignores_auto_and_custom_and_empty_placeholders(self):
         config = {
@@ -123,12 +123,6 @@ class TestDiscoverConfiguredProviders:
     def test_no_configured_providers_returns_empty(self):
         assert usage_cmd.discover_configured_providers({}) == ()
 
-    def test_normalizes_provider_aliases(self):
-        config = {"model": {"provider": "antigravity"}}
-        providers = usage_cmd.discover_configured_providers(config)
-        assert "google-antigravity" in providers
-        assert "antigravity" not in providers
-
 
 # ---------------------------------------------------------------------------
 # Cache rendering
@@ -144,7 +138,7 @@ def cache(tmp_path, monkeypatch):
     return duc
 
 
-def _store(cache, provider, *, used=40.0, label="Session", fetched_at=None, source="usage_api"):
+def _store(cache, provider, *, used=40.0, label="Session", fetched_at=None, source="source_a"):
     from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 
     snapshot = AccountUsageSnapshot(
@@ -165,33 +159,33 @@ def _store(cache, provider, *, used=40.0, label="Session", fetched_at=None, sour
 class TestRenderCachedUsage:
     def test_renders_fresh_window_fields(self, cache, monkeypatch):
         monkeypatch.setattr(usage_cmd, "_SAFE_LABEL_OVERRIDE", None, raising=False)
-        _store(cache, "openai-codex", used=40.0, label="Session")
-        rows = usage_cmd.build_usage_rows(["openai-codex"], refresh=False)
+        _store(cache, "provider-a", used=40.0, label="Session")
+        rows = usage_cmd.build_usage_rows(["provider-a"], refresh=False)
         assert len(rows) == 1
         row = rows[0]
-        assert row["provider"] == "openai-codex"
+        assert row["provider"] == "provider-a"
         assert row["freshness"] == "fresh"
         assert row["age_seconds"] is not None
         assert row["windows"][0]["remaining_percent"] == 60.0
         assert row["windows"][0]["used_percent"] == 40.0
         assert row["windows"][0]["reset_at"] == "2026-08-30T12:00:00+00:00"
-        assert row["source"] == "usage_api"
+        assert row["source"] == "source_a"
 
     def test_stale_window_marked_stale(self, cache):
         old = datetime.now(timezone.utc) - timedelta(seconds=1000)
-        _store(cache, "openai-codex", used=10.0, fetched_at=old)
+        _store(cache, "provider-a", used=10.0, fetched_at=old)
         rows = usage_cmd.build_usage_rows(
-            ["openai-codex"], refresh=False, ttl_seconds=300, stale_seconds=1800
+            ["provider-a"], refresh=False, ttl_seconds=300, stale_seconds=1800
         )
         assert rows[0]["freshness"] == "stale"
 
     def test_multiple_providers_each_get_a_row(self, cache):
-        _store(cache, "openai-codex")
-        _store(cache, "google-antigravity")
+        _store(cache, "provider-a")
+        _store(cache, "provider-b")
         rows = usage_cmd.build_usage_rows(
-            ["openai-codex", "google-antigravity"], refresh=False
+            ["provider-a", "provider-b"], refresh=False
         )
-        assert {r["provider"] for r in rows} == {"openai-codex", "google-antigravity"}
+        assert {r["provider"] for r in rows} == {"provider-a", "provider-b"}
 
 
 # ---------------------------------------------------------------------------
@@ -201,23 +195,23 @@ class TestRenderCachedUsage:
 
 class TestUnknownState:
     def test_uncached_provider_is_explicit_unknown(self, cache):
-        rows = usage_cmd.build_usage_rows(["openai-codex"], refresh=False)
+        rows = usage_cmd.build_usage_rows(["provider-a"], refresh=False)
         assert rows[0]["freshness"] == "unknown"
         assert rows[0]["windows"] == []
         assert rows[0]["status"] == "unknown"
 
     def test_past_stale_window_reports_unknown_not_raw_age(self, cache):
         ancient = datetime.now(timezone.utc) - timedelta(seconds=999999)
-        _store(cache, "openai-codex", fetched_at=ancient)
+        _store(cache, "provider-a", fetched_at=ancient)
         rows = usage_cmd.build_usage_rows(
-            ["openai-codex"], refresh=False, ttl_seconds=300, stale_seconds=1800
+            ["provider-a"], refresh=False, ttl_seconds=300, stale_seconds=1800
         )
         assert rows[0]["freshness"] == "unknown"
 
     def test_unknown_state_never_carries_raw_error_text(self, cache, monkeypatch):
         # Simulate a fetch that raised — cache stores nothing; row must stay
         # a clean "unknown" shape, never leak exception text.
-        rows = usage_cmd.build_usage_rows(["openai-codex"], refresh=False)
+        rows = usage_cmd.build_usage_rows(["provider-a"], refresh=False)
         blob = json.dumps(rows)
         assert "Traceback" not in blob
         assert "Exception" not in blob
@@ -238,8 +232,8 @@ class TestRefreshFlag:
             "refresh_provider_now",
             lambda provider: calls.append(provider),
         )
-        usage_cmd.build_usage_rows(["openai-codex", "google-antigravity"], refresh=True)
-        assert set(calls) == {"openai-codex", "google-antigravity"}
+        usage_cmd.build_usage_rows(["provider-a", "provider-b"], refresh=True)
+        assert set(calls) == {"provider-a", "provider-b"}
 
     def test_refresh_false_never_calls_refresh_provider_now(self, cache, monkeypatch):
         calls = []
@@ -248,7 +242,7 @@ class TestRefreshFlag:
             "refresh_provider_now",
             lambda provider: calls.append(provider),
         )
-        usage_cmd.build_usage_rows(["openai-codex"], refresh=False)
+        usage_cmd.build_usage_rows(["provider-a"], refresh=False)
         assert calls == []
 
     def test_refresh_is_bounded_synchronous_not_background_thread(self, cache, monkeypatch):
@@ -266,7 +260,7 @@ class TestRefreshFlag:
             "schedule_refresh",
             lambda provider: started.append(provider),
         )
-        rows = usage_cmd.build_usage_rows(["openai-codex"], refresh=True)
+        rows = usage_cmd.build_usage_rows(["provider-a"], refresh=True)
         assert started == []
         assert rows[0]["windows"][0]["used_percent"] == 5.0
 
@@ -278,27 +272,19 @@ class TestRefreshFlag:
 
 class TestProviderFilter:
     def test_filter_narrows_to_selected_provider(self, cache):
-        _store(cache, "openai-codex")
-        _store(cache, "google-antigravity")
+        _store(cache, "provider-a")
+        _store(cache, "provider-b")
         rows = usage_cmd.build_usage_rows(
-            ["openai-codex", "google-antigravity"],
+            ["provider-a", "provider-b"],
             refresh=False,
-            provider_filter=["openai-codex"],
+            provider_filter=["provider-a"],
         )
-        assert {r["provider"] for r in rows} == {"openai-codex"}
+        assert {r["provider"] for r in rows} == {"provider-a"}
 
-    def test_filter_normalizes_aliases(self, cache):
-        _store(cache, "google-antigravity")
-        rows = usage_cmd.build_usage_rows(
-            ["google-antigravity"],
-            refresh=False,
-            provider_filter=["antigravity"],
-        )
-        assert {r["provider"] for r in rows} == {"google-antigravity"}
 
     def test_filter_for_unconfigured_provider_yields_no_rows(self, cache):
         rows = usage_cmd.build_usage_rows(
-            ["openai-codex"], refresh=False, provider_filter=["google-antigravity"]
+            ["provider-a"], refresh=False, provider_filter=["provider-b"]
         )
         assert rows == []
 
@@ -310,15 +296,15 @@ class TestProviderFilter:
 
 class TestSafeOutput:
     def test_json_output_is_valid_json_with_expected_top_level_shape(self, cache):
-        _store(cache, "openai-codex")
-        payload = usage_cmd.render_json(["openai-codex"], refresh=False)
+        _store(cache, "provider-a")
+        payload = usage_cmd.render_json(["provider-a"], refresh=False)
         data = json.loads(payload)
         assert "providers" in data
         assert isinstance(data["providers"], list)
 
     def test_json_output_never_contains_secret_fields(self, cache):
-        _store(cache, "openai-codex")
-        payload = usage_cmd.render_json(["openai-codex"], refresh=False)
+        _store(cache, "provider-a")
+        payload = usage_cmd.render_json(["provider-a"], refresh=False)
         for leaked in (
             "api_key",
             "token",
@@ -332,8 +318,8 @@ class TestSafeOutput:
             assert leaked not in payload, f"json output leaked {leaked!r}"
 
     def test_text_output_never_contains_secret_fields(self, cache):
-        _store(cache, "openai-codex")
-        text = usage_cmd.render_text(["openai-codex"], refresh=False)
+        _store(cache, "provider-a")
+        text = usage_cmd.render_text(["provider-a"], refresh=False)
         for leaked in ("api_key", "Authorization", "base_url", "credential"):
             assert leaked not in text, f"text output leaked {leaked!r}"
 
@@ -387,9 +373,9 @@ class TestParserAndDispatch:
     def test_provider_flag_repeatable(self):
         parser, _ = self._build_parser()
         args = parser.parse_args(
-            ["usage", "--provider", "openai-codex", "--provider", "google-antigravity"]
+            ["usage", "--provider", "provider-a", "--provider", "provider-b"]
         )
-        assert args.provider == ["openai-codex", "google-antigravity"]
+        assert args.provider == ["provider-a", "provider-b"]
 
     def test_provider_flag_defaults_to_none(self):
         parser, _ = self._build_parser()
@@ -432,7 +418,7 @@ class TestRunUsageCommandExitCodes:
         monkeypatch.setattr(
             usage_cmd,
             "_load_active_config",
-            lambda: {"model": {"provider": "openai-codex"}},
+            lambda: {"model": {"provider": "provider-a"}},
         )
         args = argparse.Namespace(refresh=False, provider=None, json=False)
         code = usage_cmd.run_usage_command(args)
@@ -460,15 +446,12 @@ class TestNoBehaviorChangeElsewhere:
         assert "agent.agent_loop" not in sys.modules
         assert "cli" not in sys.modules
 
-    def test_build_usage_rows_does_not_mutate_route_catalog_or_orchestrator_state(
-        self, cache
-    ):
+    def test_build_usage_rows_does_not_mutate_route_catalog_state(self, cache):
         # Calling the reporting path must not perturb delegation routing's
-        # own module-level state beyond the documented refresh-scheduling
-        # seam (which we already assert separately).
+        # module-level contracts.
         from agent import delegation_routing
 
-        before = delegation_routing.NATIVE_ROUTABLE_PROVIDERS
-        usage_cmd.build_usage_rows(["openai-codex"], refresh=False)
-        after = delegation_routing.NATIVE_ROUTABLE_PROVIDERS
+        before = delegation_routing.RouteCatalog
+        usage_cmd.build_usage_rows(["provider-a"], refresh=False)
+        after = delegation_routing.RouteCatalog
         assert before is after

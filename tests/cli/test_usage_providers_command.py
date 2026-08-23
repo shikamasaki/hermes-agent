@@ -96,24 +96,24 @@ class TestUsageProvidersRendering:
         from hermes_cli import usage_cmd
 
         monkeypatch.setattr(
-            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "openai-codex"}}
+            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "provider-a"}}
         )
         monkeypatch.setattr(
-            usage_cmd, "discover_configured_providers", lambda config: ("openai-codex",)
+            usage_cmd, "discover_configured_providers", lambda config: ("provider-a",)
         )
 
         def fake_render_text(providers, *, refresh, **kwargs):
             calls["providers"] = tuple(providers)
             calls["refresh"] = refresh
-            return "openai-codex: unknown"
+            return "provider-a: unknown"
 
         monkeypatch.setattr(usage_cmd, "render_text", fake_render_text)
 
         instance._usage_providers(refresh=False)
 
-        assert calls["providers"] == ("openai-codex",)
+        assert calls["providers"] == ("provider-a",)
         assert calls["refresh"] is False
-        assert "openai-codex: unknown" in capsys.readouterr().out
+        assert "provider-a: unknown" in capsys.readouterr().out
 
     def test_calls_shared_service_with_refresh_true(self, monkeypatch, capsys):
         instance = _bare_cli()
@@ -122,10 +122,10 @@ class TestUsageProvidersRendering:
         from hermes_cli import usage_cmd
 
         monkeypatch.setattr(
-            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "openai-codex"}}
+            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "provider-a"}}
         )
         monkeypatch.setattr(
-            usage_cmd, "discover_configured_providers", lambda config: ("openai-codex",)
+            usage_cmd, "discover_configured_providers", lambda config: ("provider-a",)
         )
 
         def fake_render_text(providers, *, refresh, **kwargs):
@@ -158,7 +158,7 @@ class TestUsageProvidersRendering:
         from hermes_cli import usage_cmd
 
         monkeypatch.setattr(
-            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "openai-codex"}}
+            usage_cmd, "_load_active_config", lambda: {"model": {"provider": "provider-a"}}
         )
 
         instance._usage_providers(refresh=False)
