@@ -311,6 +311,25 @@ from plugins.platforms.telegram.telegram_network import (
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+# Max seconds a send/edit coroutine may sleep inline on a Telegram
+# flood-control RetryAfter. Longer server penalties fail closed with a
+# ``flood_control:{wait}`` SendResult so the caller's retry machinery
+# (delivery ledger, streaming fallback) owns the wait instead of the
+# coroutine pinning its worker — a 97-minute penalty on the boot path
+# froze inbound on every platform (#91969).
+_FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+
+
+def _flood_cap_result(wait: float) -> "SendResult":
+    """The shared fail-closed SendResult for an over-cap flood wait."""
+    return SendResult(
+        success=False,
+        error=f"flood_control:{wait}",
+        retry_after=float(wait),
+    )
+
+
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -619,6 +638,15 @@ _POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
+# Telegram holds a long-poll open for at most ~50s before answering (empty or
+# not), so a healthy idle poller completes a getUpdates round-trip well inside
+# this window. If no round-trip has completed for longer than this — while
+# get_me() on the general request path stays healthy and no updates are queued
+# server-side — the long-poll consumer is wedged on a socket that never
+# raises (CLOSE-WAIT behind a TUN/proxy route flip, #92991) and no other probe
+# can see it. ~3x the worst-case poll window leaves ample margin against false
+# positives while still recovering within a few heartbeat intervals.
+_POLLING_STALL_TIMEOUT = 150.0
 # Telegram transcodes an uploaded video before it answers sendVideo, so the
 # wait for the response is unrelated to how fast the bytes went out and can
 # outlast the 20s read timeout the rest of the Bot API is tuned for. Only
@@ -813,6 +841,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
+        # Monotonic timestamps for the polling stall watchdog (#92991): when
+        # the current polling generation began, and when the last successful
+        # getUpdates round-trip completed. None = unknown / not yet observed.
+        self._polling_generation_started_monotonic: Optional[float] = None
+        self._polling_last_progress_monotonic: Optional[float] = None
         # Live @username, refreshed whenever Telegram tells us what it is.
         # PTB caches getMe() in Bot._bot_user at initialize() and only rewrites
         # it inside get_me(), so a BotFather rename leaves self._bot.username
@@ -2534,6 +2567,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
+        # Reset the stall-watchdog timestamps (#92991): this generation has not
+        # proven getUpdates progress yet, and its age is measured from here.
+        self._polling_generation_started_monotonic = time.monotonic()
+        self._polling_last_progress_monotonic = None
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> None:
@@ -2558,6 +2595,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 generation,
             )
         self._polling_progress_event.set()
+        self._polling_last_progress_monotonic = time.monotonic()
         self._polling_network_error_count = 0
         if generation == self._polling_conflict_recovery_generation:
             self._polling_conflict_recovery_generation = None
@@ -3185,6 +3223,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # a single in-flight update (consumed before the next probe)
                 # never trips recovery.
                 await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                # Even an empty queue cannot hide a wedged long-poll forever:
+                # Telegram answers within ~50s, so a consumer with no
+                # successful round-trip past the stall threshold is dead
+                # (#92991). Pure local-state check — no Bot API call needed.
+                await self._check_polling_stall()
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
@@ -3304,6 +3347,67 @@ class TelegramAdapter(BasePlatformAdapter):
                     RuntimeError("getUpdates consumer wedged: pending updates not draining")
                 )
             )
+
+    async def _check_polling_stall(self) -> None:
+        """Watchdog the last successful getUpdates round-trip (#92991).
+
+        PTB's long-poll can wedge without ever raising: the TCP connection
+        dies mid-read (e.g. a TUN/proxy route flip leaves the socket in
+        CLOSE-WAIT) and the pending read simply never returns and never
+        errors. In that state ``updater.running`` stays True, ``get_me()`` on
+        the general request path stays healthy, and — while no messages are
+        queued server-side — ``pending_update_count`` stays 0, so every other
+        probe is blind and the gateway goes silently, permanently deaf.
+
+        Telegram answers a long-poll within ~50s at most, so a poller that has
+        completed no getUpdates round-trip for ``_POLLING_STALL_TIMEOUT``
+        seconds is unambiguously wedged. Escalate loudly through the same
+        bounded reconnect ladder every other polling failure uses, so the
+        wedged updater is cancelled and rebuilt instead of hanging forever.
+
+        Called from ``_polling_heartbeat_loop`` and independently testable.
+        """
+        if self._webhook_mode:
+            return
+        if getattr(self, "_polling_teardown_started", False):
+            return
+        if self.has_fatal_error:
+            return
+        if self._polling_error_task and not self._polling_error_task.done():
+            return
+        now = time.monotonic()
+        last_progress = getattr(self, "_polling_last_progress_monotonic", None)
+        generation_started = getattr(
+            self, "_polling_generation_started_monotonic", None
+        )
+        if last_progress is not None:
+            stalled_for = now - last_progress
+        elif generation_started is not None:
+            # No round-trip ever completed in this generation. The one-shot
+            # progress verifier owns the immediate post-start window; this
+            # branch is the belt-and-braces fallback when it could not run.
+            stalled_for = now - generation_started
+        else:
+            return
+        if stalled_for <= _POLLING_STALL_TIMEOUT:
+            return
+        logger.error(
+            "[%s] Telegram polling stalled: no getUpdates progress for %.0fs "
+            "(generation %d). Rebuilding the long-poll consumer through the "
+            "reconnect ladder instead of staying silently deaf.",
+            self.name, stalled_for, getattr(self, "_polling_generation", 0),
+        )
+        loop = asyncio.get_running_loop()
+        self._polling_error_task = loop.create_task(
+            self._handle_polling_network_error(
+                RuntimeError(
+                    "getUpdates made no progress for %.0fs (polling stall "
+                    "watchdog)" % stalled_for
+                )
+            )
+        )
+        self._background_tasks.add(self._polling_error_task)
+        self._polling_error_task.add_done_callback(self._background_tasks.discard)
 
     async def _verify_polling_after_reconnect(
         self,
@@ -5441,9 +5545,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            wait = float(retry_after) if retry_after is not None else 1.0
+                            safe_send_error = _redact_telegram_error_text(send_err)
+                            # Mirror the edit path: a RetryAfter past a few
+                            # seconds is not something to hold this coroutine
+                            # open for. Sleeping the server value verbatim
+                            # pinned send() for 97 minutes in production and
+                            # froze inbound on every platform when it ran on
+                            # the gateway boot path (#91969).
+                            if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
+                                logger.warning(
+                                    "[%s] Telegram flood control on send "
+                                    "(retry_after=%.1fs > %.0fs); failing closed "
+                                    "instead of sleeping: %s",
+                                    self.name,
+                                    wait,
+                                    _FLOOD_INLINE_WAIT_CAP_SECS,
+                                    safe_send_error,
+                                )
+                                return _flood_cap_result(wait)
                             if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
-                                safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
                                     self.name,
@@ -5694,12 +5815,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Telegram flood control, waiting %.1fs",
                     self.name, wait,
                 )
-                if wait > 5.0:
-                    return SendResult(
-                        success=False,
-                        error=f"flood_control:{wait}",
-                        retry_after=float(wait),
-                    )
+                if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
+                    return _flood_cap_result(wait)
                 await asyncio.sleep(wait)
                 try:
                     await self._bot.edit_message_text(

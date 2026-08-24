@@ -1132,6 +1132,7 @@ def direct_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     _check_stale_giveup(agent)
+    agent._direct_api_terminal_phase = None
     agent._touch_activity("waiting for non-streaming API response")
     # Request-lifecycle state, every transition under ``request_client_lock``
     # (ported from the #75301 design): ``done`` stops a late timer from
@@ -1167,6 +1168,8 @@ def direct_api_call(agent, api_kwargs: dict):
                 # cancelled call as provider staleness and advance the
                 # cross-turn circuit breaker.
                 request_state["cancelled"] = True
+                agent._direct_api_terminal_phase = "interrupt"
+                activity_hb_stop.set()
             newly_stale = reason == "stale_call_kill" and not request_state["stale"]
             if newly_stale:
                 request_state["stale"] = True
@@ -1261,6 +1264,12 @@ def direct_api_call(agent, api_kwargs: dict):
         # interrupt owns the outcome.
         if not _abort_active_request("stale_call_kill"):
             return
+        # The socket abort is best-effort. Expose an authoritative lifecycle
+        # signal even when the transport has no closable socket and the inline
+        # request thread remains blocked. Stop the synthetic heartbeat so it
+        # cannot mask this terminal provider-stale state from delegation.
+        agent._direct_api_terminal_phase = "provider_stale"
+        activity_hb_stop.set()
         elapsed = time.time() - call_start
         _report_stale_nonstream_kill(
             agent, api_kwargs, elapsed, stale_timeout, inline=True
@@ -1320,6 +1329,7 @@ def direct_api_call(agent, api_kwargs: dict):
             request_state["done"] = True
         activity_hb_stop.set()
         activity_hb.join(timeout=2.0)
+        agent._direct_api_terminal_phase = None
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
@@ -2848,8 +2858,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    agent._safe_print(
-        f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    if getattr(agent, "suppress_status_output", False):
+        # Strict machine-readable mode (hermes chat -Q, oneshot, background
+        # review): keep diagnostics out of stdout so wrappers receive only
+        # the final assistant content (#93220 class). Note: plain quiet_mode
+        # is NOT the right gate — the interactive CLI runs quiet_mode=True by
+        # default and should still see this warning.
+        logger.warning(warning)
+    else:
+        agent._safe_print(warning)
+
+    summary_request = (
+        "You've reached the maximum number of tool-calling iterations allowed. "
+        "Please provide a final response summarizing what you've found and accomplished so far, "
+        "without calling any more tools."
     )
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"

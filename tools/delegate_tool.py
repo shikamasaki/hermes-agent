@@ -28,6 +28,7 @@ import os
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
@@ -353,6 +354,91 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
+def _build_live_subagent_record(
+    *,
+    child: Any,
+    goal: str,
+    parent_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    accepting_steer: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Build the shared active-subagent registry record for any backend."""
+    _raw_sid = getattr(child, "_subagent_id", None)
+    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    if not _subagent_id:
+        return None
+    if owner_session_id is None:
+        try:
+            from gateway.session_context import get_session_env
+
+            owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+        except Exception:
+            owner_session_id = None
+    if owner_session_id and (owner_transport is None or owner_session_record is None):
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+    _raw_depth = getattr(child, "_delegate_depth", 1)
+    _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
+    _parent_sid = getattr(child, "_parent_subagent_id", None)
+    _owner_agent_session_id = (
+        str(getattr(child, "_parent_session_id", "") or "")
+        or str(getattr(parent_agent, "session_id", "") or "")
+    )
+    _delegation_id = getattr(child, "_delegation_id", None)
+    _model = getattr(child, "model", None)
+    return {
+        "subagent_id": _subagent_id,
+        "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+        "depth": _tui_depth,
+        "goal": goal,
+        "delegation_id": _delegation_id if isinstance(_delegation_id, str) else None,
+        "model": _model if isinstance(_model, str) else None,
+        "started_at": time.time(),
+        "status": "running",
+        "tool_count": 0,
+        "agent": child,
+        "owner_agent_session_id": _owner_agent_session_id or None,
+        "owner_session_id": owner_session_id,
+        "owner_transport": owner_transport,
+        "owner_session_record": owner_session_record,
+        "accepting_steer": bool(accepting_steer),
+    }
+
+
+@contextmanager
+def _registered_live_subagent(
+    *,
+    child: Any,
+    goal: str,
+    parent_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    accepting_steer: bool = True,
+):
+    """Register a child for the duration of its run and always unregister it."""
+    record = _build_live_subagent_record(
+        child=child,
+        goal=goal,
+        parent_agent=parent_agent,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+        accepting_steer=accepting_steer,
+    )
+    sid = record.get("subagent_id") if record else None
+    if record:
+        _register_subagent(record)
+    try:
+        yield sid if isinstance(sid, str) else None
+    finally:
+        if isinstance(sid, str):
+            _unregister_subagent(sid, agent=child)
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -556,6 +642,13 @@ def _handle_control_action(
             return tool_error(
                 "action='steer' requires a non-empty 'message' describing the "
                 "course correction."
+            )
+        agent = record.get("agent")
+        if isinstance(agent, ClaudePChildSpec):
+            return tool_error(
+                f"Subagent '{sid}' runs through claude-p, which does not support "
+                "live steering. Use action='stop' to interrupt it and delegate a "
+                "follow-up task with the new instructions."
             )
         if steer_subagent(sid, text):
             return json.dumps(
@@ -1200,6 +1293,34 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+        # Project context files (AGENTS.md / CLAUDE.md / .cursorrules ...)
+        # from the workspace, via the SAME discovery/priority/cap logic the
+        # main agent's system prompt uses. Children are constructed with
+        # skip_context_files=True (their prompt is this focused one), so
+        # without this a subagent works in a repo without the repo's own
+        # conventions unless it thinks to go read them. SOUL.md is skipped —
+        # identity belongs to the parent. workspace_path comes only from
+        # explicit sources (_resolve_workspace_hint: TERMINAL_CWD / agent cwd
+        # hints, never bare getcwd), so the #64590 install-tree-fallback leak
+        # doesn't apply here. Best-effort: on any failure the child prompt is
+        # simply built without the block.
+        try:
+            from agent.prompt_builder import build_context_files_prompt
+
+            _ctx_files = build_context_files_prompt(
+                cwd=str(workspace_path), skip_soul=True
+            )
+        except Exception:
+            logger.debug(
+                "subagent: workspace context-files load failed", exc_info=True
+            )
+            _ctx_files = ""
+        if _ctx_files.strip():
+            parts.append(
+                "\nThe workspace's project context files are reproduced "
+                "below. Their conventions and invariants are binding for "
+                "your work in this workspace.\n\n" + _ctx_files.strip()
+            )
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -1444,6 +1565,17 @@ def _build_child_progress_callback(
             _relay("subagent.text", preview=preview)
             return
 
+        if event_type == "tool.start":
+            tool_name = str(tool_name or kwargs.get("tool") or "tool")
+            event_type = "tool.started"
+        elif event_type == "tool.complete":
+            tool_name = str(tool_name or kwargs.get("tool") or "tool")
+            event_type = "tool.completed"
+
+        if event_type == "subagent.activity":
+            _relay("subagent.activity", preview=preview, **kwargs)
+            return
+
         # Normalise legacy strings, new-style "delegate.*" strings, and
         # DelegateEvent enum values all to a single DelegateEvent.  The
         # original implementation only accepted the five legacy strings;
@@ -1519,7 +1651,7 @@ def _build_child_progress_callback(
                 logger.debug("Spinner print_above failed: %s", e)
 
         if parent_cb:
-            _relay("subagent.tool", tool_name, preview, args)
+            _relay("subagent.tool", tool_name, preview, args, **kwargs)
             _batch.append(tool_name or "")
             if len(_batch) >= _BATCH_SIZE:
                 summary = ", ".join(_batch)
@@ -1591,6 +1723,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_provider_project_id: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1758,6 +1891,14 @@ def _build_child_agent(
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
     effective_api_key = override_api_key or parent_api_key
+    parent_project_id = getattr(parent_agent, "provider_project_id", None)
+    if not isinstance(parent_project_id, str) or not parent_project_id.strip():
+        parent_project_id = None
+    effective_provider_project_id = (
+        override_provider_project_id
+        if override_provider_project_id is not None
+        else parent_project_id
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1940,6 +2081,7 @@ def _build_child_agent(
                 model=effective_model,
                 provider=effective_provider,
                 api_mode=effective_api_mode,
+                provider_project_id=effective_provider_project_id,
                 acp_command=effective_acp_command,
                 acp_args=effective_acp_args,
                 max_iterations=max_iterations,
@@ -2438,6 +2580,72 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    # claude-p tasks are not in-process agents: they run as a bounded,
+    # scrubbed `claude -p` subprocess. Branch before any AIAgent bookkeeping
+    # so the native path below stays byte-for-byte unchanged.
+    if isinstance(child, ClaudePChildSpec):
+        child_progress_cb = getattr(child, "tool_progress_callback", None)
+        _heartbeat_stop = threading.Event()
+
+        def _heartbeat_loop():
+            while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                if parent_agent is None:
+                    continue
+                touch = getattr(parent_agent, "_touch_activity", None)
+                if not touch:
+                    continue
+                try:
+                    summary = child.get_activity_summary()
+                    desc = summary.get("last_activity_desc") or "claude-p running"
+                    touch(f"delegate_task: subagent {desc}")
+                except Exception:
+                    pass
+
+        _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        _parent_active_registered = False
+        if hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.append(child)
+                else:
+                    parent_agent._active_children.append(child)
+                _parent_active_registered = True
+            except Exception as exc:
+                logger.debug("Could not register claude-p child for parent interrupts: %s", exc)
+        with _registered_live_subagent(
+            child=child,
+            goal=goal,
+            parent_agent=parent_agent,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+            accepting_steer=False,
+        ):
+            try:
+                _heartbeat_thread.start()
+                if child_progress_cb:
+                    try:
+                        child_progress_cb("subagent.start", preview=goal)
+                    except Exception as exc:
+                        logger.debug("Claude-p progress start failed: %s", exc)
+                return _run_claude_p_child(task_index, goal, child, parent_agent)
+            finally:
+                _heartbeat_stop.set()
+                if _heartbeat_thread.ident is not None:
+                    _heartbeat_thread.join(timeout=5)
+                if _parent_active_registered and hasattr(parent_agent, "_active_children"):
+                    try:
+                        lock = getattr(parent_agent, "_active_children_lock", None)
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except (ValueError, AttributeError) as exc:
+                        logger.debug("Could not remove claude-p child from active_children: %s", exc)
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -2563,64 +2771,19 @@ def _run_single_child(
     # target it by subagent_id (kill, pause, status queries).  Unregistered
     # in the finally block, even when the child raises.  Test doubles that
     # hand us a MagicMock don't carry stable ids; skip registration then.
-    _raw_sid = getattr(child, "_subagent_id", None)
-    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
-    if _subagent_id:
-        if owner_session_id is None:
-            try:
-                from gateway.session_context import get_session_env
-
-                owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
-            except Exception:
-                owner_session_id = None
-        if owner_session_id and (
-            owner_transport is None or owner_session_record is None
-        ):
-            owner_transport, owner_session_record = (
-                _capture_gateway_steer_authority(owner_session_id)
-            )
-        _raw_depth = getattr(child, "_delegate_depth", 1)
-        _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
-        _parent_sid = getattr(child, "_parent_subagent_id", None)
-        # Durable ownership spine: the OWNING CONVERSATION's session id (the
-        # same lineage the delivery path routes completions by). Sourced from
-        # the child's _parent_session_id stamp so it stays correct even when
-        # parent_agent has been rebuilt between dispatch and this run.
-        _owner_agent_session_id = (
-            str(getattr(child, "_parent_session_id", "") or "")
-            or str(getattr(parent_agent, "session_id", "") or "")
-        )
-        _delegation_id = getattr(child, "_delegation_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "delegation_id": (
-                    _delegation_id if isinstance(_delegation_id, str) else None
-                ),
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-                # Durable conversation lineage for the model-facing control
-                # plane (list/steer/stop). The weakref identity chain breaks
-                # when the CLI rebuilds its AIAgent mid-session; this id is
-                # the same spine completion delivery routes by.
-                "owner_agent_session_id": _owner_agent_session_id or None,
-                # Immutable live gateway/TUI session that commissioned this
-                # child. Empty outside those hosts; RPC authority fails closed.
-                "owner_session_id": owner_session_id,
-                "owner_transport": owner_transport,
-                "owner_session_record": owner_session_record,
-            }
-        )
+    _live_record = _build_live_subagent_record(
+        child=child,
+        goal=goal,
+        parent_agent=parent_agent,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    _subagent_id = (
+        _live_record.get("subagent_id") if isinstance(_live_record, dict) else None
+    )
+    if _live_record:
+        _register_subagent(_live_record)
 
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
@@ -3488,6 +3651,408 @@ def _finalize_child_results(
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
 
+class ClaudePChildSpec:
+    """Stand-in for a native child when a task routes to the claude-p backend.
+
+    Deliberately NOT an ``AIAgent``: a claude-p task runs as a bounded,
+    scrubbed ``claude -p`` subprocess, not an in-process agent loop. This
+    object carries only what the dispatch/result path needs, and exposes the
+    same handful of attributes ``_run_single_child``'s bookkeeping reads so
+    the native path stays untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_index: int,
+        goal: str,
+        context: Optional[str],
+        params: Dict[str, Any],
+        route_decision: Optional[Dict[str, Any]],
+        output_schema: Optional[Dict[str, Any]],
+        workdir: str,
+        role: str = "leaf",
+    ):
+        import uuid as _uuid
+
+        self.task_index = task_index
+        self.goal = goal
+        self.context = context
+        self.params = dict(params or {})
+        self.workdir = workdir
+        self.model = self.params.get("model")
+        self.session_id = str(_uuid.uuid4())
+        self._subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+        self._delegate_role = role
+        self._delegate_route_decision = dict(route_decision or {})
+        self._delegate_output_schema = output_schema
+        self._live_transcript_path: Optional[str] = None
+        self._delegation_id: Optional[str] = None
+        self._delegate_depth = 1
+        self._parent_subagent_id: Optional[str] = None
+        self._parent_session_id: Optional[str] = None
+        self._delegate_parent_ref: Any = None
+        self._cancel_event = threading.Event()
+        self.tool_progress_callback: Any = None
+        self._api_call_count = 0
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = "claude-p starting"
+        #: Set once the child process has actually been spawned. A task that
+        #: has started running tools must never be rerouted — see
+        #: ``_run_claude_p_child``.
+        self.tools_started = False
+
+    @property
+    def write_capable(self) -> bool:
+        return bool(self.params.get("write_capable"))
+
+    def hard_interrupt(self, message: Optional[str] = None) -> None:
+        """Ask the underlying claude-p runner to cancel its subprocess."""
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = "claude-p interrupt requested"
+        self._cancel_event.set()
+
+    interrupt = hard_interrupt
+
+    def steer(self, text: str) -> bool:
+        """claude -p has no live steering channel; expose that explicitly."""
+        return False
+
+    def get_activity_summary(self) -> Dict[str, Any]:
+        """Activity token compatible with native AIAgent progress monitors."""
+        return {
+            "api_call_count": int(self._api_call_count),
+            "current_tool": "claude-p",
+            "max_iterations": int(self.params.get("max_turns") or 0),
+            "last_activity_ts": float(self._last_activity_ts),
+            "last_activity_desc": self._last_activity_desc,
+        }
+
+    def close(self) -> None:  # parity with AIAgent.close()
+        return None
+
+
+def _build_claude_p_prompt(goal: str, context: Optional[str]) -> str:
+    """Build the self-contained prompt handed to ``claude -p`` as one argv."""
+    parts = [
+        "You are a focused subagent working on a specific delegated task.",
+        "Do not commit, push, open or modify pull requests, publish, deploy, "
+        "send messages, make payments, access credentials, or broaden permissions. "
+        "If any of those actions are required, stop and report the blocker to "
+        "the parent instead.",
+        "",
+        f"YOUR TASK:\n{goal}",
+    ]
+    if context and str(context).strip():
+        parts.append(f"\nCONTEXT:\n{context}")
+    parts.append(
+        "\nComplete this task, then reply with a tight summary of what you "
+        "did, what you found, any files you changed, and any issues hit. "
+        "Lead with outcomes; do not replay your whole process."
+    )
+    return "\n".join(parts)
+
+
+def _run_claude_p_child(
+    task_index: int,
+    goal: str,
+    spec: "ClaudePChildSpec",
+    parent_agent=None,
+) -> Dict[str, Any]:
+    """Execute one claude-p task and normalize it into a delegate result entry.
+
+    The child's self-report is untrusted: the parent remains responsible for
+    inspecting diffs, running tests, and verifying external side effects.
+    Nothing here logs or returns raw stderr, the command line (which contains
+    the task body), the child environment, or raw malformed output.
+    """
+    from agent.claude_p_backend import (
+        ClaudePRunRequest,
+        note_route_failure,
+        run_claude_p_task,
+    )
+
+    params = spec.params
+    max_turns_param = params.get("max_turns")
+    max_budget_param = params.get("max_budget_usd")
+    request = ClaudePRunRequest(
+        prompt=_build_claude_p_prompt(goal, spec.context),
+        model=str(params.get("model") or ""),
+        difficulty=str(params.get("difficulty") or "standard"),
+        workdir=spec.workdir,
+        tool_profile=str(params.get("tool_profile") or "read_only"),
+        max_turns=(int(max_turns_param) if max_turns_param is not None else None),
+        max_budget_usd=(float(max_budget_param) if max_budget_param is not None else None),
+        timeout_seconds=float(params.get("timeout_seconds") or 900),
+        session_id=spec.session_id,
+        auto_approve=is_truthy_value(params.get("auto_approve"), default=False),
+    )
+
+    def _run_task(req: ClaudePRunRequest):
+        kwargs: Dict[str, Any] = {
+            "write_capable": spec.write_capable,
+            "cancel_event": spec._cancel_event,
+        }
+        child_progress_cb = getattr(spec, "tool_progress_callback", None)
+        if child_progress_cb is not None:
+            try:
+                import inspect
+
+                if "event_callback" in inspect.signature(run_claude_p_task).parameters:
+                    kwargs["event_callback"] = child_progress_cb
+            except (TypeError, ValueError):
+                kwargs["event_callback"] = child_progress_cb
+        return run_claude_p_task(req, **kwargs)
+
+    spec.tools_started = True
+    spec._last_activity_ts = time.time()
+    spec._last_activity_desc = "claude-p running"
+    child_start = time.monotonic()
+    try:
+        result = _run_task(request)
+    except Exception as exc:
+        duration = round(time.monotonic() - child_start, 2)
+        spec._last_activity_ts = time.time()
+        spec._last_activity_desc = "claude-p failed"
+        entry = {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": str(exc),
+            "api_calls": int(spec._api_call_count),
+            "duration_seconds": duration,
+            "model": request.model,
+            "exit_reason": "error",
+            "truncated": False,
+            "tokens": {"input": 0, "output": 0},
+            "tool_trace": [],
+            "_child_role": spec._delegate_role,
+            "_child_cost_usd": 0.0,
+            "cost_usd": 0.0,
+            "cost_status": "unknown",
+            "claude_session_id": None,
+        }
+        child_progress_cb = getattr(spec, "tool_progress_callback", None)
+        if child_progress_cb:
+            try:
+                child_progress_cb(
+                    "subagent.complete",
+                    preview=str(exc)[:160],
+                    status="error",
+                    duration_seconds=duration,
+                    summary=str(exc),
+                    input_tokens=0,
+                    output_tokens=0,
+                    api_calls=0,
+                    cost_usd=0.0,
+                    output_tail=[],
+                )
+            except Exception as cb_exc:
+                logger.debug("Claude-p progress failure failed: %s", cb_exc)
+        return entry
+    spec._api_call_count = int(result.num_turns or 0)
+    spec._last_activity_ts = time.time()
+    spec._last_activity_desc = f"claude-p {result.status}"
+
+    schema_valid: Optional[bool] = None
+    schema_errors: List[str] = []
+    schema_retries = 0
+    output_schema = spec._delegate_output_schema
+    if isinstance(output_schema, dict) and result.status == "completed":
+        from dataclasses import replace
+        from tools.delegation_output_schema import build_retry_message, validate_output
+
+        schema_valid, schema_errors = validate_output(result.summary or "", output_schema)
+        remaining_turns = (
+            max(0, request.max_turns - (result.num_turns or 0))
+            if request.max_turns is not None
+            else 0
+        )
+        remaining_budget = (
+            max(0.0, request.max_budget_usd - result.cost_usd)
+            if request.max_budget_usd is not None and result.cost_usd is not None
+            else request.max_budget_usd
+        )
+        remaining_timeout = max(0.0, request.timeout_seconds - result.duration_seconds)
+        if (
+            not schema_valid
+            and (result.summary or "").strip()
+            and not spec._cancel_event.is_set()
+            and result.claude_session_id
+            and remaining_turns >= 1
+            and (remaining_budget is None or remaining_budget >= 0.01)
+            and remaining_timeout >= 1.0
+        ):
+            schema_retries = 1
+            retry_request = replace(
+                request,
+                prompt=build_retry_message(schema_errors),
+                max_turns=remaining_turns,
+                max_budget_usd=remaining_budget,
+                timeout_seconds=remaining_timeout,
+                resume_session_id=result.claude_session_id,
+            )
+            retry = _run_task(retry_request)
+            if retry.status == "completed":
+                total_cost = (
+                    (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
+                    if result.cost_usd is not None or retry.cost_usd is not None
+                    else None
+                )
+                result = replace(
+                    retry,
+                    duration_seconds=result.duration_seconds + retry.duration_seconds,
+                    num_turns=(result.num_turns or 0) + (retry.num_turns or 0),
+                    cost_usd=total_cost,
+                    tokens={
+                        "input": result.tokens.get("input", 0)
+                        + retry.tokens.get("input", 0),
+                        "output": result.tokens.get("output", 0)
+                        + retry.tokens.get("output", 0),
+                    },
+                )
+                schema_valid, schema_errors = validate_output(
+                    result.summary or "", output_schema
+                )
+            else:
+                # Preserve the first useful summary if the schema-retry turn is
+                # interrupted or errors; do not replace it with an empty retry.
+                result = replace(
+                    result,
+                    duration_seconds=result.duration_seconds + retry.duration_seconds,
+                    num_turns=(result.num_turns or 0) + (retry.num_turns or 0),
+                    cost_usd=(
+                        (result.cost_usd or 0.0) + (retry.cost_usd or 0.0)
+                        if result.cost_usd is not None or retry.cost_usd is not None
+                        else None
+                    ),
+                    tokens={
+                        "input": result.tokens.get("input", 0) + retry.tokens.get("input", 0),
+                        "output": result.tokens.get("output", 0) + retry.tokens.get("output", 0),
+                    },
+                )
+            spec._api_call_count = int(result.num_turns or 0)
+            spec._last_activity_ts = time.time()
+            spec._last_activity_desc = f"claude-p {result.status}"
+
+    # A pre-start failure (rate limit / overload / billing / unavailable)
+    # cools the route down so the NEXT selection picks another route. This is
+    # never a mid-flight reroute: the task itself is already finished here.
+    if result.exit_reason in {"unavailable", "spawn_error"}:
+        route_id = params.get("route_id")
+        if route_id:
+            note_route_failure(
+                str(route_id),
+                retry_after_seconds=float(params.get("cooldown_seconds") or 60),
+            )
+
+    entry: Dict[str, Any] = {
+        "task_index": task_index,
+        "status": "completed" if result.status == "completed" else result.status,
+        "summary": result.summary,
+        "api_calls": result.num_turns or 0,
+        "duration_seconds": round(result.duration_seconds, 2),
+        "model": result.model,
+        "exit_reason": result.exit_reason,
+        "truncated": result.exit_reason in {
+            "error_max_turns",
+            "error_budget",
+            "error_max_budget_usd",
+        },
+        "tokens": dict(result.tokens),
+        "tool_trace": [],
+        "_child_role": spec._delegate_role,
+        # Claude subscription usage reports an API-price equivalent, not an
+        # amount actually charged. Keep it visible as notional metadata but do
+        # not roll it into the parent's real/estimated session spend.
+        "_child_cost_usd": 0.0,
+        "cost_usd": round(float(result.cost_usd or 0.0), 6),
+        "cost_status": "notional" if result.cost_usd is not None else "unknown",
+        # Opaque per-task session id for bounded resume. Kept in the result
+        # metadata only — never persisted into the usage cache.
+        "claude_session_id": result.claude_session_id,
+    }
+    if result.error:
+        entry["error"] = result.error
+    if result.model_usage:
+        # Post-run aggregates only. NEVER a remaining-quota claim: the Claude
+        # CLI exposes no machine-readable subscription allowance.
+        entry["model_usage"] = result.model_usage
+    if isinstance(output_schema, dict):
+        entry["schema_valid"] = bool(schema_valid)
+        if schema_retries:
+            entry["schema_retries"] = schema_retries
+        if not schema_valid and schema_errors:
+            entry["schema_errors"] = schema_errors
+
+    child_progress_cb = getattr(spec, "tool_progress_callback", None)
+    if child_progress_cb:
+        try:
+            child_progress_cb(
+                "subagent.complete",
+                preview=(result.summary or result.error or "")[:160],
+                status=entry["status"],
+                duration_seconds=entry["duration_seconds"],
+                summary=result.summary or result.error or "",
+                input_tokens=int(entry["tokens"].get("input", 0) or 0),
+                output_tokens=int(entry["tokens"].get("output", 0) or 0),
+                api_calls=int(entry["api_calls"] or 0),
+                cost_usd=entry["cost_usd"],
+                output_tail=[],
+            )
+            if hasattr(child_progress_cb, "_flush"):
+                child_progress_cb._flush()
+        except Exception as exc:
+            logger.debug("Claude-p progress completion failed: %s", exc)
+    return entry
+
+
+def _public_route_metadata(child) -> Optional[Dict[str, Any]]:
+    """Return prompt-safe route observability without raw quota values."""
+    decision = getattr(child, "_delegate_route_decision", None)
+    if not isinstance(decision, dict):
+        return None
+
+    def _code(reason: Any) -> str:
+        text = str(reason or "").lower()
+        if "reserve" in text or "remaining" in text:
+            return "usage_reserve"
+        if "unknown usage" in text:
+            return "usage_unknown"
+        if "not available" in text:
+            return "provider_unavailable"
+        if "disabled" in text:
+            return "route_disabled"
+        if "difficulty" in text:
+            return "difficulty_mismatch"
+        if "model_class" in text or "model class" in text:
+            return "model_class_mismatch"
+        if "capabilit" in text:
+            return "capability_mismatch"
+        return "not_eligible"
+
+    exclusion_codes = sorted({_code(item) for item in decision.get("exclusions") or ()})
+    backend = "claude-p" if decision.get("provider") == "claude-p" else "native"
+    return {
+        "id": decision.get("route_id"),
+        "provider": decision.get("provider"),
+        "backend": backend,
+        "model": decision.get("model"),
+        "model_class": decision.get("model_class"),
+        "difficulty": decision.get("difficulty"),
+        "usage_freshness": decision.get("usage_freshness", "unknown"),
+        "explicit_override": bool(decision.get("explicit_override")),
+        "reserve_bypassed": bool(decision.get("reserve_bypassed")),
+        "exclusion_codes": exclusion_codes,
+    }
+
+
+def _attach_route_result_metadata(entry: Dict[str, Any], child) -> None:
+    metadata = _public_route_metadata(child)
+    if metadata is not None:
+        entry["route"] = metadata
+
+
 def _run_child_lifecycle(
     task_index: int,
     goal: str,
@@ -3497,6 +4062,7 @@ def _run_child_lifecycle(
     """Run one child and apply the same host lifecycle used by delegate_task."""
     result = _run_single_child(task_index, goal, child, parent_agent)
     result.setdefault("task_index", task_index)
+    _attach_route_result_metadata(result, child)
     task = {"goal": goal}
     _finalize_child_results(
         [result],
@@ -3605,7 +4171,13 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    route: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    difficulty_reason: Optional[str] = None,
+    required_capabilities: Optional[List[str]] = None,
+    minimum_model_class: Optional[str] = None,
     parent_agent=None,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3699,10 +4271,44 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # ``credentials_cfg`` (internal callers only — never model-facing) is a
+    # per-call override used by the /review engine without changing the
+    # global delegation pin. Adaptive routing remains authoritative when it
+    # is enabled; otherwise resolve against that override when present.
+    # Top-level routing hints; per-task fields override these (see
+    # _route_request_from_args). Collected before task normalization so the
+    # single-`goal` form and the batch form share one code path.
+    _top_routing = {
+        "route": route,
+        "difficulty": difficulty,
+        "difficulty_reason": difficulty_reason,
+        "required_capabilities": required_capabilities,
+        "minimum_model_class": minimum_model_class,
+    }
+
+    routing_active = _routing_active(cfg) and not credentials_cfg
+    if credentials_cfg:
+        try:
+            # Preserve the upstream internal-review override contract: this
+            # path intentionally bypasses adaptive routing and keeps the
+            # legacy two-argument resolver call used by review integrations.
+            creds = _resolve_delegation_credentials(credentials_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+    elif _routing_active(cfg):
+        # Adaptive batches have no single provider:model before their tasks are
+        # classified. Do not perform a throwaway default-route resolution;
+        # each task is resolved below against one shared invocation context.
+        creds = {"model": "adaptive", "provider": "adaptive"}
+    else:
+        try:
+            creds = _resolve_delegation_credentials(
+                cfg,
+                parent_agent,
+                request=_route_request_from_args({}, _top_routing),
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3824,8 +4430,31 @@ def delegate_task(
     # resolved tool names around each construction under a lock, so child
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
+    # With an adaptive route catalog every task picks its own provider:model
+    # from its own difficulty/capabilities, so credentials are resolved per
+    # task rather than once for the batch. Without a catalog this is the
+    # single `creds` bundle reused for every child, exactly as before.
+    per_task_creds: List[Dict[str, Any]] = []
+    route_context: Dict[str, Any] = {}
+    for t in task_list:
+        if not routing_active:
+            per_task_creds.append(creds)
+            continue
+        try:
+            per_task_creds.append(
+                _resolve_delegation_credentials(
+                    cfg,
+                    parent_agent,
+                    request=_route_request_from_args(t, _top_routing),
+                    route_context=route_context,
+                )
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+
     children = []
     for i, t in enumerate(task_list):
+        task_creds = per_task_creds[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3837,6 +4466,49 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        if task_creds.get("backend") == "claude-p":
+            child = ClaudePChildSpec(
+                task_index=i,
+                goal=t["goal"],
+                context=_child_context,
+                params=task_creds.get("claude_p") or {},
+                route_decision=task_creds.get("route_decision"),
+                output_schema=_task_schema,
+                workdir=_resolve_workspace_hint(parent_agent) or os.getcwd(),
+                role=effective_role,
+            )
+            if live_deleg_id:
+                child._delegation_id = live_deleg_id
+            parent_depth = getattr(parent_agent, "_delegate_depth", 0)
+            child._delegate_depth = (
+                max(0, parent_depth) + 1 if isinstance(parent_depth, int) else 1
+            )
+            child._parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+            child._parent_session_id = getattr(parent_agent, "session_id", None)
+            try:
+                child._delegate_parent_ref = weakref.ref(parent_agent)
+            except TypeError:
+                child._delegate_parent_ref = None
+            child.tool_progress_callback = _build_child_progress_callback(
+                i,
+                t["goal"],
+                parent_agent,
+                n_tasks,
+                subagent_id=child._subagent_id,
+                parent_id=getattr(parent_agent, "_subagent_id", None),
+                depth=max(0, getattr(parent_agent, "_delegate_depth", 0)),
+                model=child.model if isinstance(child.model, str) else None,
+                toolsets=None,
+                session_ref={"session_id": child.session_id},
+            )
+            _writer = live_writers[i] if i < len(live_writers) else None
+            if _writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(
+                    getattr(child, "tool_progress_callback", None), _writer
+                )
+                child._live_transcript_path = str(_writer.path)
+            children.append((i, t, child))
+            continue
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3845,18 +4517,19 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_provider_project_id=task_creds.get("provider_project_id"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
         except ValueError as exc:
@@ -3870,6 +4543,12 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        _route_decision = task_creds.get("route_decision")
+        if isinstance(_route_decision, dict):
+            try:
+                setattr(child, "_delegate_route_decision", dict(_route_decision))
+            except Exception:
+                logger.debug("Could not attach route decision to child %d", i)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3909,6 +4588,7 @@ def delegate_task(
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
             )
+            _attach_route_result_metadata(result, child)
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -3983,6 +4663,9 @@ def delegate_task(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
                                 }
+                            _attach_route_result_metadata(
+                                entry, _child_by_index.get(idx)
+                            )
                             results.append(entry)
                             completed_count += 1
                         break
@@ -4008,6 +4691,10 @@ def delegate_task(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
                             }
+                        _entry_idx = entry.get("task_index")
+                        _attach_route_result_metadata(
+                            entry, _child_by_index.get(_entry_idx)
+                        )
                         results.append(entry)
                         completed_count += 1
 
@@ -4224,6 +4911,7 @@ def delegate_task(
             # sync-path heartbeat monitor.
             parts = []
             in_tool = False
+            direct_api_terminal_phase = None
             for _c in _child_agents:
                 try:
                     _summary = _c.get_activity_summary()
@@ -4236,9 +4924,13 @@ def delegate_task(
                         )
                     )
                     in_tool = in_tool or bool(_tool)
+                    direct_api_terminal_phase = (
+                        direct_api_terminal_phase
+                        or _summary.get("direct_api_terminal_phase")
+                    )
                 except Exception:
                     parts.append(None)
-            return tuple(parts), in_tool
+            return tuple(parts), in_tool, direct_api_terminal_phase
 
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
@@ -4306,9 +4998,18 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # Pool at capacity / schedule failure: the async registry never took
+        # ownership. Reattach children before the synchronous fallback so a
+        # parent interrupt propagates through its normal active-child list.
+        if hasattr(parent_agent, "_active_children"):
+            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+            for _c in _child_agents:
+                if _ac_lock:
+                    with _ac_lock:
+                        if _c not in parent_agent._active_children:
+                            parent_agent._active_children.append(_c)
+                elif _c not in parent_agent._active_children:
+                    parent_agent._active_children.append(_c)
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
@@ -4414,8 +5115,270 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _routing_active(cfg: dict) -> bool:
+    """True when an enabled, non-empty route catalog governs this delegation."""
+    from agent.delegation_routing import RouteConfigError, load_route_catalog
+
+    try:
+        return load_route_catalog(cfg).active
+    except RouteConfigError:
+        # A malformed catalog surfaces through the resolver's error path with
+        # the full message; here we only decide which path to take.
+        return True
+
+
+def _available_route_providers(routes) -> frozenset:
+    """Providers among *routes* that are actually usable right now.
+
+    Availability is probed through the same runtime-provider resolver the
+    child spawn uses, so a route only competes when its credentials really
+    resolve — no auth-store poking and no credential values are read here,
+    just the boolean outcome. Resolution is per-provider (not per-model) and
+    cached for the call so a 12-route catalog costs at most two probes.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from agent.delegation_routing import CLAUDE_P_PROVIDER
+
+    available = set()
+    for provider in {r.provider for r in routes}:
+        if provider == CLAUDE_P_PROVIDER:
+            # The claude-p backend authenticates through the local CLI's own
+            # subscription session, not an API key, so it is probed with a
+            # bounded `claude auth status --json` call whose result is
+            # projected down to booleans before it ever reaches this set.
+            if _claude_p_available():
+                available.add(provider)
+            continue
+        try:
+            runtime = resolve_runtime_provider(requested=provider, target_model=None)
+        except Exception as exc:
+            logger.debug(
+                "delegation route provider %r unavailable: %s", provider, type(exc).__name__
+            )
+            continue
+        if runtime and runtime.get("api_key"):
+            available.add(provider)
+    return frozenset(available)
+
+
+def _claude_p_available() -> bool:
+    """Bounded availability probe for the claude-p backend (booleans only)."""
+    try:
+        from agent.claude_p_backend import check_claude_availability
+
+        return check_claude_availability().available
+    except Exception as exc:
+        logger.debug("claude-p availability probe failed: %s", type(exc).__name__)
+        return False
+
+
+def _claude_p_cooling_down(routes) -> frozenset:
+    """Route ids currently in a bounded post-failure cooldown."""
+    try:
+        from agent.claude_p_backend import is_route_in_cooldown
+    except Exception:
+        return frozenset()
+    return frozenset(
+        r.id for r in routes if getattr(r, "is_claude_p", False) and is_route_in_cooldown(r.id)
+    )
+
+
+def _route_request_from_args(task: dict, top_level: Optional[dict] = None) -> "Any":
+    """Build a RouteRequest from model-supplied fields.
+
+    Per-task fields beat the top-level ones so a batch can mix difficulties.
+    Malformed values degrade to the default rather than failing the spawn: a
+    model that invents a difficulty should still get work done on a sane
+    route, and the decision reason records what was actually used.
+    """
+    from agent import delegation_routing as _dr
+
+    task = task if isinstance(task, dict) else {}
+    top_level = top_level if isinstance(top_level, dict) else {}
+
+    def _pick(key):
+        value = task.get(key)
+        if value in (None, "", [], ()):
+            value = top_level.get(key)
+        return value
+
+    difficulty = _dr.TaskDifficulty.STANDARD
+    raw_difficulty = _pick("difficulty")
+    if raw_difficulty:
+        try:
+            difficulty = _dr.parse_difficulty(raw_difficulty)
+        except _dr.RouteConfigError:
+            logger.debug(
+                "delegate_task: unknown difficulty %r; using 'standard'", raw_difficulty
+            )
+
+    minimum_model_class = None
+    raw_class = _pick("minimum_model_class")
+    if raw_class:
+        try:
+            minimum_model_class = _dr.parse_model_class(raw_class)
+        except _dr.RouteConfigError:
+            logger.debug(
+                "delegate_task: unknown minimum_model_class %r; ignoring", raw_class
+            )
+
+    raw_caps = _pick("required_capabilities") or ()
+    if isinstance(raw_caps, str):
+        raw_caps = [raw_caps]
+    capabilities = frozenset(
+        str(c).strip().lower() for c in raw_caps if str(c or "").strip()
+    )
+
+    reason = _pick("difficulty_reason")
+    route_id = _pick("route")
+
+    return _dr.RouteRequest(
+        difficulty=difficulty,
+        difficulty_reason=str(reason).strip() if reason else None,
+        required_capabilities=capabilities,
+        minimum_model_class=minimum_model_class,
+        route_id=str(route_id).strip() if route_id else None,
+    )
+
+
+def _resolve_routed_credentials(
+    cfg: dict,
+    catalog,
+    request,
+    *,
+    route_context: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Select a route from the catalog and resolve that pair's credentials.
+
+    The selector itself is pure and reads only cached usage; the network is
+    touched (if at all) by a background refresh scheduled inside
+    ``build_usage_view``, never on this path.
+    """
+    from agent import delegation_usage_cache as _duc
+    from agent.delegation_routing import CLAUDE_P_BACKEND, select_route
+    from dataclasses import asdict
+
+    context = route_context if route_context is not None else {}
+    if "available_providers" not in context:
+        context["available_providers"] = _available_route_providers(catalog.routes)
+    available = context["available_providers"]
+
+    if "usage_view" not in context:
+        context["usage_view"] = _duc.build_route_usage_view(
+            catalog.routes,
+            ttl_seconds=catalog.usage_ttl_seconds,
+            stale_seconds=catalog.usage_stale_seconds,
+            refresh=True,
+        )
+    usage = context["usage_view"]
+
+    decision = select_route(
+        catalog,
+        request,
+        usage=usage,
+        available_providers=available,
+        cooling_down_route_ids=_claude_p_cooling_down(catalog.routes),
+    )
+    if not decision.selected:
+        raise ValueError(
+            f"No delegation route available for a "
+            f"{request.difficulty.value} task: {decision.reason}. "
+            f"Adjust delegation.routes, sign in to the provider, or pass an "
+            f"explicit route id."
+        )
+
+    selected_route = next(
+        (r for r in catalog.routes if r.id == decision.route_id), None
+    )
+    if selected_route is not None and selected_route.is_claude_p:
+        # The claude-p backend never resolves an API key or a runtime
+        # provider: doing so would be exactly the API-billing substitution
+        # this backend exists to avoid. Execution parameters travel instead.
+        return {
+            "model": decision.model,
+            "provider": decision.provider,
+            "backend": CLAUDE_P_BACKEND,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "provider_project_id": None,
+            "command": None,
+            "args": [],
+            "claude_p": {
+                "route_id": selected_route.id,
+                "model": selected_route.model,
+                "tool_profile": selected_route.tool_profile,
+                "max_turns": selected_route.max_turns,
+                "max_budget_usd": selected_route.max_budget_usd,
+                "timeout_seconds": selected_route.timeout_seconds,
+                "cooldown_seconds": selected_route.cooldown_seconds,
+                "write_capable": selected_route.write_capable,
+                "difficulty": decision.difficulty,
+                "auto_approve": is_truthy_value(cfg.get("subagent_auto_approve"), default=False),
+            },
+            "route_decision": asdict(decision),
+        }
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime_key = (decision.provider, decision.model)
+    runtime_cache = context.setdefault("runtime_credentials", {})
+    runtime = runtime_cache.get(runtime_key)
+    if runtime is None:
+        try:
+            runtime = resolve_runtime_provider(
+                requested=decision.provider, target_model=decision.model
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Delegation route {decision.route_id!r} selected "
+                f"{decision.provider}:{decision.model}, but credentials could not be "
+                f"resolved ({type(exc).__name__})."
+            ) from exc
+        runtime_cache[runtime_key] = runtime
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Delegation route {decision.route_id!r} resolved provider "
+            f"'{decision.provider}' with no API key. Run 'hermes auth' for that "
+            f"provider or disable the route."
+        )
+
+    return {
+        "model": decision.model or runtime.get("model") or None,
+        "provider": decision.provider,
+        "backend": "native",
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
+        "max_output_tokens": runtime.get("max_output_tokens"),
+        "provider_project_id": runtime.get("project_id"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        # Progress/result metadata only — deliberately NOT fed into the tool
+        # schema or system prompt, which must stay byte-stable so the prompt
+        # cache is not fragmented by a shifting quota number.
+        "route_decision": asdict(decision),
+    }
+
+
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    request=None,
+    *,
+    route_context: Optional[Dict[str, Any]] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
+
+    When ``delegation.routes`` is configured and ``delegation.routing.enabled``
+    is true, *request* (a ``RouteRequest`` describing the task's difficulty and
+    required capabilities) picks the provider:model pair from the catalog.
+    Absent or disabled routes preserve the legacy behavior below exactly.
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -4435,6 +5398,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    from agent.delegation_routing import RouteRequest, load_route_catalog
+
+    catalog = load_route_catalog(cfg)
+    if catalog.active:
+        return _resolve_routed_credentials(
+            cfg,
+            catalog,
+            request or RouteRequest(),
+            route_context=route_context,
+        )
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
@@ -4551,6 +5525,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
+        "provider_project_id": runtime.get("project_id"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
@@ -4727,6 +5702,91 @@ def _build_dynamic_schema_overrides() -> dict:
     }
 
 
+# --- Adaptive routing schema fragments -------------------------------------
+# STATIC by construction. These strings are embedded in the tool schema, which
+# every request re-sends, so they must never interpolate a quota number, a
+# route's live availability, or anything else that changes between calls —
+# that would invalidate the provider prompt cache on every delegation. The
+# route catalog's *shape* is config, not runtime state, so listing difficulty
+# and capability taxonomies here is safe; the selected route and its usage
+# freshness are reported in the result/progress metadata instead.
+
+_DIFFICULTY_DESCRIPTION = (
+    "How hard this task is, which selects the model class it runs on. "
+    "'routine' = mechanical, well-specified work with an obvious method "
+    "(renames, formatting, applying a stated pattern). "
+    "'standard' = ordinary engineering: a contained feature, a localized bug "
+    "fix, a focused review. "
+    "'complex' = multi-file reasoning, non-obvious debugging, design work "
+    "with real trade-offs. "
+    "'frontier' = the hardest work you can delegate: novel algorithms, "
+    "subtle concurrency or correctness proofs, wide-blast-radius refactors. "
+    "Judge the task, not its length. Defaults to 'standard'."
+)
+
+_DIFFICULTY_REASON_DESCRIPTION = (
+    "One short sentence saying WHY you chose that difficulty (e.g. 'touches "
+    "four modules with shared locking' or 'single-file string change'). "
+    "State it explicitly — it is recorded with the routing decision so a "
+    "mis-routed task is diagnosable."
+)
+
+_REQUIRED_CAPABILITIES_DESCRIPTION = (
+    "Capabilities or arbitrary config-defined purpose tags the assigned route "
+    "must have; matched as a subset, so ask only for what the task genuinely "
+    "needs. Built-in capability values: 'coding' (writing/editing code), "
+    "'reasoning' (multi-step analysis), 'tool_use' (reliable multi-tool "
+    "sequences), 'long_context' (large files or many files at once), 'vision' "
+    "(images, screenshots, diagrams), and 'review' (critique and correctness "
+    "checking). Arbitrary tags such as 'purpose:research', 'source:web', or "
+    "'domain:finance' are also accepted when matching routes declare them in "
+    "config; adding a new purpose tag requires config only, not a code change. "
+    "Over-requesting narrows the eligible routes and can leave none."
+)
+
+_MINIMUM_MODEL_CLASS_DESCRIPTION = (
+    "Optional floor on model strength, ordered 'fast' < 'balanced' < "
+    "'advanced' < 'frontier'. Routes below the floor are excluded even when "
+    "they serve the requested difficulty. Omit unless the difficulty alone "
+    "understates what the task needs."
+)
+
+_ROUTE_DESCRIPTION = (
+    "Optional explicit route id from delegation.routes — an override that "
+    "pins this task to one configured provider:model pair and skips "
+    "difficulty-based selection. The route is still validated (enabled, "
+    "supported backend, provider available, capabilities satisfied), but it may "
+    "run a route below its usage reserve. Prefer describing 'difficulty' and "
+    "'required_capabilities' and letting Hermes route."
+)
+
+
+def _routing_schema_properties() -> dict:
+    """Routing fields shared by the top level and each batch task."""
+    return {
+        "route": {"type": "string", "description": _ROUTE_DESCRIPTION},
+        "difficulty": {
+            "type": "string",
+            "enum": ["routine", "standard", "complex", "frontier"],
+            "description": _DIFFICULTY_DESCRIPTION,
+        },
+        "difficulty_reason": {
+            "type": "string",
+            "description": _DIFFICULTY_REASON_DESCRIPTION,
+        },
+        "required_capabilities": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": _REQUIRED_CAPABILITIES_DESCRIPTION,
+        },
+        "minimum_model_class": {
+            "type": "string",
+            "enum": ["fast", "balanced", "advanced", "frontier"],
+            "description": _MINIMUM_MODEL_CLASS_DESCRIPTION,
+        },
+    }
+
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     # NOTE: description / tasks.description / role.description are placeholder
@@ -4776,6 +5836,7 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        **_routing_schema_properties(),
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4810,6 +5871,7 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
+            **_routing_schema_properties(),
             "background": {
                 "type": "boolean",
                 "description": (
@@ -4918,6 +5980,11 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        route=args.get("route"),
+        difficulty=args.get("difficulty"),
+        difficulty_reason=args.get("difficulty_reason"),
+        required_capabilities=args.get("required_capabilities"),
+        minimum_model_class=args.get("minimum_model_class"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

@@ -178,8 +178,8 @@ def _codex_curated_models() -> list[str]:
     This keeps the gateway /model picker in sync with the CLI `hermes model`
     flow without maintaining a separate static list.
     """
-    from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, _add_forward_compat_models
-    return _add_forward_compat_models(list(DEFAULT_CODEX_MODELS))
+    from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, _finalize_codex_models
+    return _finalize_codex_models(list(DEFAULT_CODEX_MODELS))
 
 
 # Static fallback for xAI when the models.dev disk cache is empty (fresh
@@ -365,6 +365,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3-pro-preview",
         "gemini-3-flash-preview",
         "gemini-2.5-pro",
+    ],
+    "google-antigravity": [
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
     ],
     "gemini": [
         "gemini-3.1-pro-preview",
@@ -1230,6 +1236,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
+    ProviderEntry("google-antigravity", "Google Antigravity",  "Google Antigravity (Gemini via Code Assist; subscription OAuth)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),
@@ -1302,7 +1309,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
-    "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
+    "google":   ("Google Gemini",   "AI Studio API key or Antigravity subscription",  ["gemini", "google-antigravity"]),
     "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
@@ -1393,6 +1400,9 @@ _PROVIDER_ALIASES = {
     "copilot-acp-agent": "copilot-acp",
     "google": "gemini",
     "google-gemini": "gemini",
+    "antigravity": "google-antigravity",
+    "agy": "google-antigravity",
+    "google-agy": "google-antigravity",
     "google-ai-studio": "gemini",
     "google-vertex": "vertex",
     "vertex-ai": "vertex",
@@ -4519,6 +4529,36 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         pass
 
 
+def _resolve_anthropic_pool_catalog_credentials() -> tuple[str, str]:
+    """Return a read-only API-key pool credential for model discovery.
+
+    ``resolve_anthropic_token()`` intentionally ignores ``api_key`` pool
+    entries because its runtime contract is OAuth-oriented. The model catalog
+    supports regular ``x-api-key`` auth, so it needs a narrow fallback that
+    preserves the credential's configured endpoint instead of sending a
+    proxy-scoped key to Anthropic's public host.
+    """
+    try:
+        from agent.credential_pool import AUTH_TYPE_API_KEY
+        from hermes_cli.auth import read_credential_pool
+
+        for entry in read_credential_pool("anthropic"):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("auth_type") != AUTH_TYPE_API_KEY:
+                continue
+            token = str(entry.get("access_token") or "").strip()
+            if not token:
+                continue
+            endpoint = str(
+                entry.get("base_url") or entry.get("inference_base_url") or ""
+            ).strip()
+            return token, endpoint
+    except Exception:
+        pass
+    return "", ""
+
+
 def _fetch_anthropic_models(
     timeout: float = 5.0,
     *,
@@ -4527,8 +4567,9 @@ def _fetch_anthropic_models(
 ) -> Optional[list[str]]:
     """Fetch available models from the Anthropic /v1/models endpoint.
 
-    Uses resolve_anthropic_token() to find credentials (env vars or
-    Claude Code auto-discovery) unless api_key is provided explicitly.
+    Uses resolve_anthropic_token() to find credentials (env vars, OAuth,
+    or Claude Code auto-discovery) unless api_key is provided explicitly. If
+    those sources are empty, a read-only API-key credential_pool entry is used.
     Returns sorted model IDs or None.
     """
     try:
@@ -4536,7 +4577,12 @@ def _fetch_anthropic_models(
     except ImportError:
         return None
 
+    resolved_base_url = base_url
     token = (api_key or "").strip() or resolve_anthropic_token()
+    if not token:
+        # A pool credential and its endpoint are one security boundary. Never
+        # pair the selected pool key with a caller-provided model endpoint.
+        token, resolved_base_url = _resolve_anthropic_pool_catalog_credentials()
     if not token:
         return None
 
@@ -4551,7 +4597,7 @@ def _fetch_anthropic_models(
 
     def _do_request(h: dict[str, str]):
         req = urllib.request.Request(
-            _anthropic_models_url(base_url),
+            _anthropic_models_url(resolved_base_url),
             headers=h,
         )
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
@@ -6522,6 +6568,45 @@ def validate_requested_model(
             catalog_models = provider_model_ids(normalized)
         except Exception:
             catalog_models = []
+        # Ineligible ``-900k`` aliases (e.g. `gpt-5.5-900k`) must be rejected
+        # BEFORE the hidden-slug soft-accept below: the suffix is a Hermes
+        # picker convention, so an unknown `*-900k` name can never be a real
+        # hidden provider slug — soft-accepting one silently runs at 272K on
+        # a different model than the user thinks (#92797 review).
+        if normalized == "openai-codex":
+            from agent.model_metadata import (
+                CODEX_CONTEXT_VARIANT_SUFFIX,
+                is_codex_context_variant,
+            )
+            _req_lower = requested_for_lookup.strip().lower()
+            if (
+                _req_lower.endswith(CODEX_CONTEXT_VARIANT_SUFFIX)
+                and requested_for_lookup not in set(catalog_models)
+            ):
+                if is_codex_context_variant(requested_for_lookup):
+                    # Valid variant that a stale catalog hasn't synthesized
+                    # yet. Accept it directly — falling through would let the
+                    # typo auto-corrector "fix" it to the base slug and
+                    # silently drop the large-context opt-in.
+                    return {
+                        "accepted": True,
+                        "persist": True,
+                        "recognized": True,
+                        "message": None,
+                    }
+                _base_guess = requested_for_lookup[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+                return {
+                    "accepted": False,
+                    "persist": False,
+                    "recognized": False,
+                    "message": (
+                        f"`{requested}` is not a valid large-context variant — "
+                        f"`{_base_guess}` enforces the standard 272K window on "
+                        f"Codex, so no `-900k` option exists for it. Pick the "
+                        f"base model, or a verified variant from the `/model` "
+                        f"picker (e.g. `gpt-5.6-sol-900k`)."
+                    ),
+                }
         if catalog_models:
             if requested_for_lookup in set(catalog_models):
                 return {

@@ -344,6 +344,36 @@ def test_progressing_runner_is_never_stalled(monkeypatch):
     assert evt["summary"] == "done"
 
 
+@pytest.mark.parametrize("terminal_phase", ["provider_stale", "interrupt"])
+def test_terminal_signal_force_finalizes_despite_heartbeat_progress(
+    monkeypatch, terminal_phase
+):
+    """Provider timeout and user stop both outrank the API-wait heartbeat."""
+    _fast_stale_monitor(monkeypatch, idle=10.0, in_tool=10.0, grace=0.12)
+    gate = threading.Event()
+    ticks = {"n": 0}
+
+    def progress_fn():
+        ticks["n"] += 1
+        return ((1, None, ticks["n"]),), False, terminal_phase
+
+    res = ad.dispatch_async_delegation(
+        goal="provider stale", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: (gate.wait(timeout=10), {"status": "completed"})[1],
+        progress_fn=progress_fn,
+    )
+
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    try:
+        assert evt is not None
+        assert evt["status"] == "stalled"
+        assert evt["stall_phase"] == terminal_phase
+        assert ad.active_count() == 0
+    finally:
+        gate.set()
+
+
 def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     """Interrupt-responsive children finalize through the NORMAL path.
 
@@ -621,6 +651,66 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_capacity_fallback_reattaches_child_for_parent_interrupt(monkeypatch):
+    """A rejected background dispatch falls back to synchronous execution.
+
+    The child must be reattached to the parent's active-child list before that
+    inline run so a parent interrupt still propagates to it.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "capacity-parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "capacity-child"
+
+    def build_child(**_kwargs):
+        parent._active_children.append(child)
+        return child
+
+    def run_child(*_args, **_kwargs):
+        assert child in parent._active_children
+        return {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "capacity"},
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="capacity fallback task",
+            background=True,
+            parent_agent=parent,
+        )
+    )
+    assert result["results"][0]["status"] == "completed"
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

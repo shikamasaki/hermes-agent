@@ -57,6 +57,26 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+def test_child_inherits_parent_provider_project_id_without_override():
+    parent = _make_mock_parent()
+    parent.provider_project_id = "parent-project"
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        mock_agent.return_value = MagicMock()
+        _build_child_agent(
+            task_index=0,
+            goal="inherit project context",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=5,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+    assert mock_agent.call_args.kwargs["provider_project_id"] == "parent-project"
+
+
 class TestDelegateRequirements(unittest.TestCase):
 
     def test_schema_valid(self):
@@ -872,6 +892,23 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             requested="crof.ai", target_model="deepseek-v4-pro-CEER"
         )
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_antigravity_runtime_project_reaches_delegation_credentials(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "google-antigravity",
+            "model": "gemini-3.1-pro-high",
+            "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            "api_key": "ya29.TEST",
+            "api_mode": "chat_completions",
+            "project_id": "proj-managed",
+        }
+        creds = _resolve_delegation_credentials(
+            {"provider": "google-antigravity", "model": "gemini-3.1-pro-high"},
+            _make_mock_parent(depth=0),
+        )
+        self.assertEqual(creds["provider_project_id"], "proj-managed")
+
+
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
@@ -908,6 +945,36 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
             self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_cross_brand_antigravity_project_reaches_child_agent(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "model": "gemini-3.1-pro-high",
+            "provider": "google-antigravity",
+        }
+        mock_creds.return_value = {
+            "model": "gemini-3.1-pro-high",
+            "provider": "google-antigravity",
+            "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            "api_key": "ya29.TEST",
+            "api_mode": "chat_completions",
+            "provider_project_id": "proj-managed",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openai-codex"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+            delegate_task(goal="Cross-brand Antigravity", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "google-antigravity")
+            self.assertEqual(kwargs["provider_project_id"], "proj-managed")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1384,6 +1451,39 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_model_routing_fields_are_forwarded(self):
+        """Explicit/adaptive routing hints must survive the live dispatch wrapper."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "route me",
+                    "route": "route-b-low",
+                    "difficulty": "routine",
+                    "difficulty_reason": "single literal response",
+                    "required_capabilities": ["reasoning"],
+                    "minimum_model_class": "fast",
+                    "output_schema": {"type": "object"},
+                },
+            )
+
+        self.assertEqual(captured["route"], "route-b-low")
+        self.assertEqual(captured["difficulty"], "routine")
+        self.assertEqual(captured["difficulty_reason"], "single literal response")
+        self.assertEqual(captured["required_capabilities"], ["reasoning"])
+        self.assertEqual(captured["minimum_model_class"], "fast")
+        self.assertEqual(captured["output_schema"], {"type": "object"})
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -1398,6 +1498,22 @@ class TestDelegateEventEnum(unittest.TestCase):
 
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
+
+    def test_progress_callback_maps_stream_tool_name_and_input_summary(self):
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
+        self.assertIsNotNone(cb)
+        summary = {"argument_keys": ["file_path"], "targets": {"file_path": "a.py"}}
+        cb("tool.start", tool="Read", input_summary=summary)
+
+        rendered = " ".join(str(call) for call in parent._delegate_spinner.print_above.call_args_list)
+        self.assertIn("Read", rendered)
+        relay_calls = parent.tool_progress_callback.call_args_list
+        self.assertTrue(any(call.args[:2] == ("subagent.tool", "Read") for call in relay_calls))
+        self.assertTrue(any(call.kwargs.get("input_summary") == summary for call in relay_calls))
 
 
     def test_progress_callback_ignores_unknown_events(self):
