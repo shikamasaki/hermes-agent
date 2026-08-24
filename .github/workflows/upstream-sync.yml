@@ -2,7 +2,7 @@ name: Upstream Sync
 
 on:
   schedule:
-    - cron: '0 0 * * 0' # Weekly on Sundays
+    - cron: '0 0 * * *' # Daily
   workflow_dispatch:
 
 permissions:
@@ -46,18 +46,73 @@ jobs:
           # commits that make its tree intentionally differ from upstream.
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date."
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "has_changes=false"
+              echo "has_conflict=false"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Preserve fork commits. Conflicts fail visibly; main is never reset.
           if git merge --no-edit upstream/main -m "Merge upstream main"; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "has_changes=true"
+              echo "has_conflict=false"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "Merge conflict detected; leaving main unchanged."
+            {
+              echo "has_changes=false"
+              echo "has_conflict=true"
+              echo "upstream_sha=$(git rev-parse upstream/main)"
+              echo "conflict_files=$(git diff --name-only --diff-filter=U | paste -sd, -)"
+            } >> "$GITHUB_OUTPUT"
             git merge --abort
-            exit 1
           fi
+
+      - name: Notify Hermes Gateway to resolve conflict
+        if: steps.merge.outputs.has_conflict == 'true'
+        env:
+          WEBHOOK_URL: ${{ secrets.UPSTREAM_SYNC_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.UPSTREAM_SYNC_WEBHOOK_SECRET }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+          FORK_MAIN_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PAYLOAD="$(
+            jq -nc \
+              --arg event upstream_sync_conflict \
+              --arg upstream_sha "$UPSTREAM_SHA" \
+              --arg fork_main_sha "$FORK_MAIN_SHA" \
+              --arg conflict_files "$CONFLICT_FILES" \
+              --arg run_url "$RUN_URL" \
+              '{event_type:$event,event:$event,upstream_sha:$upstream_sha,fork_main_sha:$fork_main_sha,conflict_files:$conflict_files,run_url:$run_url}'
+          )"
+          TIMESTAMP="$(date +%s)"
+          export PAYLOAD TIMESTAMP
+          SIGNATURE="$(python3 - <<'PY'
+          import hashlib
+          import hmac
+          import os
+
+          body = os.environ["PAYLOAD"].encode()
+          timestamp = os.environ["TIMESTAMP"].encode()
+          secret = os.environ["WEBHOOK_SECRET"].encode()
+          print(hmac.new(secret, timestamp + b"." + body, hashlib.sha256).hexdigest())
+          PY
+          )"
+          curl --fail-with-body --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --header 'X-GitHub-Event: upstream_sync_conflict' \
+            --header "X-Webhook-Timestamp: $TIMESTAMP" \
+            --header "X-Webhook-Signature-V2: $SIGNATURE" \
+            --data-binary "$PAYLOAD" \
+            "$WEBHOOK_URL"
+          echo "Hermes Gateway accepted the conflict event; failing this run visibly."
+          exit 1
 
       - name: Push sync branch and create PR
         if: steps.merge.outputs.has_changes == 'true'
