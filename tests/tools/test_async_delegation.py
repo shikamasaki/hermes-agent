@@ -653,6 +653,66 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_capacity_fallback_reattaches_child_for_parent_interrupt(monkeypatch):
+    """A rejected background dispatch falls back to synchronous execution.
+
+    The child must be reattached to the parent's active-child list before that
+    inline run so a parent interrupt still propagates to it.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "capacity-parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "capacity-child"
+
+    def build_child(**_kwargs):
+        parent._active_children.append(child)
+        return child
+
+    def run_child(*_args, **_kwargs):
+        assert child in parent._active_children
+        return {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "capacity"},
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="capacity fallback task",
+            background=True,
+            parent_agent=parent,
+        )
+    )
+    assert result["results"][0]["status"] == "completed"
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

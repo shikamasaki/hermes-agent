@@ -57,6 +57,26 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+def test_child_inherits_parent_provider_project_id_without_override():
+    parent = _make_mock_parent()
+    parent.provider_project_id = "parent-project"
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        mock_agent.return_value = MagicMock()
+        _build_child_agent(
+            task_index=0,
+            goal="inherit project context",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=5,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+    assert mock_agent.call_args.kwargs["provider_project_id"] == "parent-project"
+
+
 class TestDelegateRequirements(unittest.TestCase):
 
     def test_schema_valid(self):
