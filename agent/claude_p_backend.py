@@ -1149,7 +1149,7 @@ def _signal_process_group(process_group_id: int, sig: signal.Signals) -> None:
     if os.name == "nt":
         return
     try:
-        os.killpg(process_group_id, sig)
+        os.killpg(process_group_id, sig)  # windows-footgun: ok — guarded above
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
@@ -1285,7 +1285,10 @@ async def _cancel_process(
     # Do not return merely because the direct process exited. A descendant can
     # ignore SIGTERM and retain duplicated pipe handles. Escalate the saved
     # process-group id so output drains can reach EOF.
-    _signal_process_group(process_group_id or proc.pid, signal.SIGKILL)
+    _signal_process_group(
+        process_group_id or proc.pid,
+        signal.SIGKILL,  # windows-footgun: ok — Windows returns above
+    )
     try:
         await asyncio.wait_for(proc.wait(), timeout=PROCESS_KILL_GRACE_SECONDS)
     except asyncio.TimeoutError:
