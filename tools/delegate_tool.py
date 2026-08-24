@@ -4263,20 +4263,10 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
-<<<<<<< ours
-    #
     # ``credentials_cfg`` (internal callers only — never model-facing) is a
-    # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-=======
+    # per-call override used by the /review engine without changing the
+    # global delegation pin. Adaptive routing remains authoritative when it
+    # is enabled; otherwise resolve against that override when present.
     # Top-level routing hints; per-task fields override these (see
     # _route_request_from_args). Collected before task normalization so the
     # single-`goal` form and the batch form share one code path.
@@ -4297,11 +4287,12 @@ def delegate_task(
     else:
         try:
             creds = _resolve_delegation_credentials(
-                cfg, parent_agent, request=_route_request_from_args({}, _top_routing)
+                credentials_cfg if credentials_cfg else cfg,
+                parent_agent,
+                request=_route_request_from_args({}, _top_routing),
             )
         except ValueError as exc:
             return tool_error(str(exc))
->>>>>>> theirs
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4514,26 +4505,15 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-<<<<<<< ours
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_provider_project_id=creds.get("provider_project_id"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-=======
                 override_provider=task_creds["provider"],
                 override_base_url=task_creds["base_url"],
                 override_api_key=task_creds["api_key"],
                 override_api_mode=task_creds["api_mode"],
                 override_request_overrides=task_creds.get("request_overrides"),
                 override_max_tokens=task_creds.get("max_output_tokens"),
+                override_provider_project_id=task_creds.get("provider_project_id"),
                 override_acp_command=task_creds.get("command"),
                 override_acp_args=task_creds.get("args"),
->>>>>>> theirs
                 role=effective_role,
             )
         except ValueError as exc:

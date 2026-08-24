@@ -1,0 +1,76 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sundays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+      - name: Merge upstream into sync branch
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYNC_BRANCH="sync-upstream-main"
+          git checkout main
+          git checkout -B "$SYNC_BRANCH"
+
+          # If this exact upstream head is already in our history, there is
+          # nothing to sync. This remains correct when fork/main has custom
+          # commits that make its tree intentionally differ from upstream.
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Preserve fork commits. Conflicts fail visibly; main is never reset.
+          if git merge --no-edit upstream/main -m "Merge upstream main"; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge conflict detected; leaving main unchanged."
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push sync branch and create PR
+        if: steps.merge.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin sync-upstream-main --force-with-lease
+
+          PR_NUMBER="$(gh pr list --head sync-upstream-main --base main --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$PR_NUMBER" ]]; then
+            gh pr create \
+              --title "chore: sync with upstream main" \
+              --body "Automated PR to sync this fork with \`NousResearch/hermes-agent:main\`. Conflicts fail the workflow and never modify the default branch." \
+              --base main \
+              --head sync-upstream-main
+          else
+            echo "Updated existing PR #$PR_NUMBER."
+          fi
