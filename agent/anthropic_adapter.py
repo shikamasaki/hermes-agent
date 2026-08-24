@@ -1277,7 +1277,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             refreshed["refresh_token"],
             refreshed["expires_at_ms"],
         )
-        if not persisted:
+        if persisted is False:
             logger.debug("Refreshed Claude Code token could not be persisted")
             return None
         logger.debug("Successfully refreshed Claude Code OAuth token")

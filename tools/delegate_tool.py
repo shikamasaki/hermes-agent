@@ -4278,16 +4278,24 @@ def delegate_task(
         "minimum_model_class": minimum_model_class,
     }
 
-    routing_active = _routing_active(cfg)
-    if routing_active:
+    routing_active = _routing_active(cfg) and not credentials_cfg
+    if credentials_cfg:
+        try:
+            # Preserve the upstream internal-review override contract: this
+            # path intentionally bypasses adaptive routing and keeps the
+            # legacy two-argument resolver call used by review integrations.
+            creds = _resolve_delegation_credentials(credentials_cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+    elif _routing_active(cfg):
         # Adaptive batches have no single provider:model before their tasks are
-        # classified.  Do not perform a throwaway default-route resolution;
+        # classified. Do not perform a throwaway default-route resolution;
         # each task is resolved below against one shared invocation context.
         creds = {"model": "adaptive", "provider": "adaptive"}
     else:
         try:
             creds = _resolve_delegation_credentials(
-                credentials_cfg if credentials_cfg else cfg,
+                cfg,
                 parent_agent,
                 request=_route_request_from_args({}, _top_routing),
             )
