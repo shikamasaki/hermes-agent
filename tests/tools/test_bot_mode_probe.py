@@ -66,6 +66,9 @@ def test_protocol_routes_worker_spawns_and_detailed_work_through_kanban(tmp_path
     assert "create the Kanban card before" in section
     assert "detailed research" in section
     assert "status" in section and "active process" in section
+    assert "linked remediation child" in section
+    assert "continue the same branch/PR" in section
+    assert "only describe the gaps in chat" in section
 
 
 def test_emits_for_named_profile_with_own_handle(tmp_path):
