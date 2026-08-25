@@ -38,17 +38,19 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && matrix.runner || matrix.portable_runner }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 90 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macOS-only tests
             runner: macos-latest
+            portable_runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
             runner: windows-latest-32-core
+            portable_runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code

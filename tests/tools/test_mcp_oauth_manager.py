@@ -364,6 +364,40 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     assert not (d / "srv.client.json").exists()
     assert provider._initialized is False
     assert provider.context.client_info is None
+
+
+def test_oauth_metadata_issuer_tolerates_trailing_slash_only(tmp_path, monkeypatch):
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    provider.context.auth_server_url = "https://idp.example.com/"
+    response = _fake_response(
+        200,
+        "https://idp.example.com/.well-known/oauth-authorization-server",
+        b'{"issuer":"https://idp.example.com"}',
+    )
+
+    asyncio.run(provider._align_trailing_slash_only_metadata_issuer(response))
+
+    assert provider.context.auth_server_url == "https://idp.example.com"
+
+
+def test_oauth_metadata_issuer_does_not_normalize_real_mismatch(tmp_path, monkeypatch):
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    provider.context.auth_server_url = "https://idp.example.com/tenant/"
+    response = _fake_response(
+        200,
+        "https://idp.example.com/.well-known/oauth-authorization-server/tenant",
+        b'{"issuer":"https://evil.example.com/tenant"}',
+    )
+
+    asyncio.run(provider._align_trailing_slash_only_metadata_issuer(response))
+
+    assert provider.context.auth_server_url == "https://idp.example.com/tenant/"
+
+
 @pytest.mark.asyncio
 async def test_manager_provider_token_exchange_includes_dcr_secret(tmp_path, monkeypatch):
     """The manager provider path applies the same Supabase DCR secret fix."""
