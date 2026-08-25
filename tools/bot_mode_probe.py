@@ -34,6 +34,7 @@ import threading
 from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
+BOT_MODE_PROTOCOL_VERSION = 3
 
 # The canonical per-bot conversation title — the only session shape that
 # receives the protocol section. Must match the desktop plugin's
@@ -272,6 +273,15 @@ def _build_section(home: Path) -> str:
         "with message_agent, and report back naming which agent replied. Message "
         "ONE clearly relevant teammate; don't fan out to several unless the user "
         "explicitly asked.\n"
+        "Durability rule: in a canonical Bot Chat, every spawn-form `delegate_task` call "
+        "must go through Kanban first. If you decide a fresh worker is needed at all, "
+        "create the Kanban card before web research, external-source collection, or "
+        "delegation begins. This includes tenant-scoped detailed research, audits, "
+        "implementation, migrations, and Issue-to-PR delivery. Keep a short consultation "
+        "in Chief or use one message_agent turn. Kanban workers may delegate from their "
+        "durable task context. For status, inspect the Kanban task, active process, tenant "
+        "session, worktree, and original Issue/PR directly; never queue a progress DM "
+        "behind a busy Bot Chat turn.\n"
         f'When YOU receive a "Message from 🤖 <name> (@<handle>):" message, a '
         "teammate agent is talking to you (not the user): address them, reply "
         "concisely via message_agent to their handle, and if it is a pure FYI "
@@ -383,7 +393,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     # Protocol-text version salt: bumping this refreshes every eternal Bot
     # Chat prompt ONCE so existing bots adopt a new protocol section (e.g.
     # the v2 message_agent tool replacing the shellout instructions).
-    surface["protocol_version"] = 2
+    surface["protocol_version"] = BOT_MODE_PROTOCOL_VERSION
     try:
         # Peer gateways are part of the messaging surface: registering one
         # must refresh eternal Bot Chat prompts so the cross-machine DM

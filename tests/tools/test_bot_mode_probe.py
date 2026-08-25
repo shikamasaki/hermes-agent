@@ -55,6 +55,19 @@ def test_emits_for_default_when_any_profile_is_managed(tmp_path):
     assert "message_agent" in section
 
 
+def test_protocol_routes_worker_spawns_and_detailed_work_through_kanban(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=True)
+
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+
+    assert "every spawn-form `delegate_task` call" in section
+    assert "create the Kanban card before" in section
+    assert "detailed research" in section
+    assert "status" in section and "active process" in section
+
+
 def test_emits_for_named_profile_with_own_handle(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -196,6 +209,21 @@ def test_stored_prompt_staleness(tmp_path):
     # prompts without a stamp (every non-Bot-Chat session) are never stale
     assert not bot_mode_probe.stored_prompt_capability_stale("ordinary prompt", home)
     assert not bot_mode_probe.stored_prompt_capability_stale("", home)
+
+
+def test_protocol_v3_invalidates_a_v2_bot_chat_once(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "researcher", managed=True)
+
+    monkeypatch.setattr(bot_mode_probe, "BOT_MODE_PROTOCOL_VERSION", 2)
+    v2_prompt = "system stuff\n\n" + bot_mode_probe.epoch_line(home)
+
+    monkeypatch.setattr(bot_mode_probe, "BOT_MODE_PROTOCOL_VERSION", 3)
+    assert bot_mode_probe.stored_prompt_capability_stale(v2_prompt, home)
+
+    v3_prompt = "system stuff\n\n" + bot_mode_probe.epoch_line(home)
+    assert not bot_mode_probe.stored_prompt_capability_stale(v3_prompt, home)
 
 
 def test_legacy_bot_chat_upgrade(tmp_path):
