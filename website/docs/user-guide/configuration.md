@@ -1,10 +1,10 @@
 ---
 sidebar_position: 2
-title: "Configuration"
+title: "Hermes Agent Configuration"
 description: "Configure Hermes Agent — config.yaml, providers, models, API keys, and more"
 ---
 
-# Configuration
+# Hermes Agent Configuration
 
 All settings are stored in the `~/.hermes/` directory for easy access.
 
@@ -2004,6 +2004,15 @@ When `redact_pii` is `true`, the gateway redacts personally identifiable informa
 **Platform support:** Redaction applies to WhatsApp, Signal, and Telegram. Discord and Slack are excluded because their mention systems (`<@user_id>`) require the real ID in the LLM context.
 
 Hashes are deterministic — the same user always maps to the same hash, so the model can still distinguish between users in group chats. Routing and delivery use the original values internally.
+
+### OpenAI Codex request identity
+
+OpenAI requires third-party Codex harnesses to identify themselves.
+ChatGPT-authenticated requests to the official Codex endpoint automatically
+send `originator: hermes-agent` and `User-Agent: HermesAgent/<version>`.
+The existing ChatGPT account header is preserved. No additional prompt content
+or telemetry request is sent.
+Direct OpenAI API requests and custom proxy endpoints are unchanged.
 
 ## Speech-to-Text (STT)
 
