@@ -501,6 +501,39 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _align_trailing_slash_only_metadata_issuer(self, response) -> None:
+            """Tolerate only an OAuth metadata issuer trailing-slash difference.
+
+            The MCP SDK applies RFC 8414's exact-string issuer check. Some
+            otherwise compatible servers advertise ``https://idp.example/``
+            in protected-resource metadata but ``https://idp.example`` in the
+            authorization-server document. Align the expected value to the
+            advertised metadata issuer only when removing trailing slashes
+            makes the two strings identical. Scheme, host, port, and path
+            mismatches remain untouched and fail in the SDK as before.
+            """
+            expected = str(getattr(self.context, "auth_server_url", "") or "")
+            if not expected or getattr(response, "status_code", None) != 200:
+                return
+            try:
+                import json
+
+                body = await response.aread()
+                payload = json.loads(body)
+                advertised = str(payload.get("issuer", "") or "")
+            except (TypeError, ValueError, AttributeError):
+                return
+            if (
+                advertised
+                and advertised != expected
+                and advertised.rstrip("/") == expected.rstrip("/")
+            ):
+                self.context.auth_server_url = advertised
+                logger.debug(
+                    "MCP OAuth '%s': tolerated trailing-slash-only issuer difference",
+                    self._hermes_server_name,
+                )
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
@@ -535,6 +568,11 @@ def _make_hermes_provider_class() -> Optional[type]:
                 outgoing = await inner.__anext__()
                 while True:
                     incoming = yield outgoing
+                    # The next request after an authorization-server metadata
+                    # response is produced only after the SDK validates its
+                    # issuer, so align the trailing-slash-only case before
+                    # forwarding the response into the inner generator.
+                    await self._align_trailing_slash_only_metadata_issuer(incoming)
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
