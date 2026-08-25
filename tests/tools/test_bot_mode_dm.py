@@ -116,6 +116,59 @@ def test_config_toggle_disables_injection(tmp_path):
     assert agent.tools == []
 
 
+# ── durable delegation gate ──────────────────────────────────────────────────
+
+
+def test_bot_chat_spawn_delegation_requires_kanban(tmp_path):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = bot_mode_dm.bot_chat_delegate_spawn_refusal(
+        agent,
+        {"goal": "research one thing"},
+    )
+
+    payload = json.loads(result)
+    assert payload["error"] == "kanban_required"
+    assert "Kanban" in payload["message"]
+
+
+@pytest.mark.parametrize("action", ["list", "steer", "stop"])
+def test_bot_chat_delegation_control_actions_remain_available(tmp_path, action):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    assert bot_mode_dm.bot_chat_delegate_spawn_refusal(agent, {"action": action}) is None
+
+
+def test_delegate_spawn_gate_does_not_apply_outside_managed_bot_chat(tmp_path):
+    managed = _managed_home(tmp_path)
+    ordinary = _FakeAgent(managed, title="ordinary session")
+    assert bot_mode_dm.bot_chat_delegate_spawn_refusal(ordinary, {"goal": "work"}) is None
+
+    unmanaged = tmp_path / "plain"
+    unmanaged.mkdir()
+    plain_bot_chat = _FakeAgent(unmanaged, title="Bot Chat")
+    assert bot_mode_dm.bot_chat_delegate_spawn_refusal(plain_bot_chat, {"goal": "work"}) is None
+
+
+def test_delegate_spawn_gate_fails_closed_when_managed_probe_errors(
+    tmp_path,
+    monkeypatch,
+):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    agent.valid_tool_names.add(bot_mode_dm.MESSAGE_AGENT_TOOL_NAME)
+    monkeypatch.setattr(
+        bot_mode_probe,
+        "is_bot_mode_managed",
+        lambda _home: (_ for _ in ()).throw(OSError("probe failed")),
+    )
+
+    result = bot_mode_dm.bot_chat_delegate_spawn_refusal(agent, {"goal": "work"})
+
+    assert json.loads(result)["error"] == "kanban_required"
+
+
 def test_schema_never_in_global_registry():
     """message_agent must not be registered/toolset-reachable anywhere."""
     from tools.registry import registry

@@ -169,6 +169,62 @@ def ensure_message_agent_tool(agent: Any) -> bool:
         return False
 
 
+def _kanban_required_refusal() -> str:
+    return json.dumps(
+        {
+            "error": "kanban_required",
+            "message": (
+                "Canonical Bot Chat cannot spawn transient delegate_task workers. "
+                "Create or use the appropriate tenant Kanban task first, then let "
+                "the Kanban worker delegate from its durable task context. Keep "
+                "short consultations in Chief or use one message_agent turn."
+            ),
+        }
+    )
+
+
+def bot_chat_delegate_spawn_refusal(agent: Any, args: dict) -> Optional[str]:
+    """Fail closed when an eternal Bot Chat tries to spawn transient workers.
+
+    The user-facing canonical Bot Chat is the coordination surface, not a
+    durable work queue.  Any work important enough to need a fresh worker must
+    first become a Kanban task; that worker may then delegate normally from its
+    own non-Bot-Chat session.  Control actions remain available so a Chief can
+    recover legacy/in-flight delegations.
+
+    Returns a JSON refusal for managed canonical Bot Chats, otherwise ``None``.
+    Never raises.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    if action in {"list", "steer", "stop"}:
+        return None
+    if not getattr(agent, "_bot_mode_protocol", True):
+        return None
+
+    valid = getattr(agent, "valid_tool_names", None)
+    schema_proves_bot_chat = (
+        isinstance(valid, set) and MESSAGE_AGENT_TOOL_NAME in valid
+    )
+
+    try:
+        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+
+        home = _agent_home(agent)
+        if _session_title(agent) != BOT_CHAT_TITLE:
+            return None
+        if not is_bot_mode_managed(home):
+            return _kanban_required_refusal() if schema_proves_bot_chat else None
+    except Exception:
+        logger.warning(
+            "Bot Chat delegation gate could not verify the managed-install state; "
+            "failing closed because the message_agent schema proves this is a Bot Chat",
+            exc_info=True,
+        )
+        return _kanban_required_refusal() if schema_proves_bot_chat else None
+
+    return _kanban_required_refusal()
+
+
 # ── roster resolution ────────────────────────────────────────────────────────
 
 

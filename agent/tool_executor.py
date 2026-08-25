@@ -2399,6 +2399,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _delegate_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    from tools.bot_mode_dm import bot_chat_delegate_spawn_refusal
+
+                    refusal = bot_chat_delegate_spawn_refusal(agent, next_args)
+                    if refusal is not None:
+                        return refusal
                     return agent._dispatch_delegate_task(next_args)
                 function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                     agent,

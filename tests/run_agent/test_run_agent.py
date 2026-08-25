@@ -1679,6 +1679,31 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
+    def test_sequential_delegate_refusal_never_dispatches_child(self, agent):
+        refusal = json.dumps({
+            "error": "kanban_required",
+            "message": "Create a Kanban task first.",
+        })
+        tc = _mock_tool_call(
+            name="delegate_task",
+            arguments=json.dumps({"goal": "long research"}),
+            call_id="delegate-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with (
+            patch(
+                "tools.bot_mode_dm.bot_chat_delegate_spawn_refusal",
+                return_value=refusal,
+            ),
+            patch.object(agent, "_dispatch_delegate_task") as dispatch,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        dispatch.assert_not_called()
+        assert json.loads(messages[-1]["content"])["error"] == "kanban_required"
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(

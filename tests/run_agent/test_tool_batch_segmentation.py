@@ -121,6 +121,18 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
+    def test_delegate_task_is_an_explicit_sequential_barrier(self):
+        calls = [
+            _tc("web_search", call_id="r1"),
+            _tc("web_search", call_id="r2"),
+            _tc("delegate_task", '{"goal":"work"}', call_id="d1"),
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["parallel", "sequential"]
+        assert [tc.id for tc in segments[1][1]] == ["d1"]
+
 
 
     def test_overlapping_paths_split_across_segments(self, tmp_path, monkeypatch):
