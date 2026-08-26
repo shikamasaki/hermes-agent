@@ -237,7 +237,7 @@ class GatewayControlServer:
         self,
         home: Optional[Path] = None,
         *,
-        verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -248,7 +248,7 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload,
             "status": build_status_payload,
         }
@@ -361,10 +361,17 @@ class GatewayControlServer:
                     "supported_verbs": sorted(self._handlers),
                 }
             else:
+                if "payload" in request:
+                    request_payload = request["payload"]
+                    if not isinstance(request_payload, dict):
+                        raise ValueError("payload must be a JSON object")
+                    result = handler(request_payload)
+                else:
+                    result = handler()
                 response = {
                     "ok": True,
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "result": handler(),
+                    "result": result,
                 }
         except Exception as exc:
             response = {
@@ -441,6 +448,7 @@ def query_gateway_control(
     home: Path,
     verb: str,
     *,
+    payload: Optional[dict[str, Any]] = None,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
@@ -450,11 +458,19 @@ def query_gateway_control(
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    request_body: dict[str, Any] = {
+        "verb": verb,
+        "id": 1,
+        "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if payload is not None:
+        request_body["payload"] = payload
+    try:
+        request = json.dumps(request_body).encode("utf-8") + b"\n"
+    except (TypeError, ValueError):
+        return None
+    if len(request) > _MAX_REQUEST_BYTES:
+        return None
     try:
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
@@ -472,6 +488,32 @@ def query_gateway_control(
         return None
     result = response.get("result")
     return result if isinstance(result, dict) else None
+
+
+def signal_gateway_control(
+    home: Path,
+    verb: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 0.25,
+) -> bool:
+    """Send one bounded, best-effort post-commit signal to the local gateway.
+
+    The durable database remains authoritative: an absent, stale, busy, or
+    exiting gateway returns ``False`` and never raises. Callers can therefore
+    commit work first and use this only as a latency hint; startup recovery can
+    later rediscover any signal that was lost with the process.
+    """
+    if not isinstance(verb, str) or not verb.strip() or not isinstance(payload, dict):
+        return False
+    try:
+        timeout = max(0.001, float(timeout))
+        result = query_gateway_control(
+            Path(home), verb.strip(), payload=payload, timeout=timeout
+        )
+    except Exception:
+        return False
+    return result is not None
 
 
 def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[bytes]:

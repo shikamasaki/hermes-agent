@@ -16401,6 +16401,7 @@ from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
+    methods_kanban_notifications as _methods_kanban_notifications,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
     methods_session as _methods_session,
@@ -16416,6 +16417,7 @@ for _m in (
     _methods_tools,
     _methods_profiles,
     _methods_images,
+    _methods_kanban_notifications,
     _methods_bot_relay,
 ):
     _m.register(sys.modules[__name__])

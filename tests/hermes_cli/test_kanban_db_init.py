@@ -123,6 +123,27 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
+def test_legacy_text_event_ids_are_not_replayed_as_new_dispatch_signals(
+    tmp_path, monkeypatch
+):
+    """Migration is structural recovery, not a fresh lifecycle transition."""
+    from gateway import control_socket
+
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+    calls = []
+    monkeypatch.setattr(
+        control_socket,
+        "signal_gateway_control",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with kb.connect(db_path) as conn:
+        assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+
+    assert calls == []
+
+
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
     """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
     gone after migration; the notifier query returns an integer cursor."""

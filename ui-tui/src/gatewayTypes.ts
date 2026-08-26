@@ -632,6 +632,23 @@ export type GatewayEvent =
     }
   | { payload?: { key?: string }; session_id?: string; type: 'notification.clear' }
   | {
+      payload: {
+        board: string
+        created_at: number
+        delivery_key: string
+        delivery_seq: number
+        event_kind: string
+        outbox_id: number
+        reason?: null | string
+        status?: null | string
+        summary?: null | string
+        task_id: string
+        task_title: string
+      }
+      session_id?: string
+      type: 'kanban.notification'
+    }
+  | {
       payload: { user_code?: string; verification_url: string }
       session_id?: string
       type: 'billing.step_up.verification'

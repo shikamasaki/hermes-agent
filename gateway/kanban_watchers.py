@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -198,8 +199,208 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
-    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+    async def _kanban_outbox_notifier_watcher(self) -> None:
+        """Drain exact outbox ids and acknowledge successful adapter delivery."""
+        from gateway.config import Platform as _Platform
+        from hermes_cli import kanban_db as _kb
+
+        signal_bus = getattr(self, "_kanban_signal_bus", None)
+        if signal_bus is None:
+            logger.warning(
+                "kanban notifier: signal bus unavailable; refusing periodic fallback"
+            )
+            return
+
+        profile = self._active_profile_name()
+        profiles = {profile}
+        profiles.update(
+            str(value).strip()
+            for value in getattr(self, "_profile_adapters", {})
+            if str(value).strip()
+        )
+        failures: dict[str, int] = {}
+
+        def _consumer(row: dict[str, Any]) -> str:
+            return "gateway:%s:%s:%s:%s" % (
+                row.get("origin_profile") or "",
+                row.get("platform") or "",
+                row.get("chat_id") or "",
+                row.get("thread_id") or "",
+            )
+
+        def _load_rows(
+            requested: Optional[dict[str, set[int]]],
+        ) -> list[tuple[str, dict[str, Any]]]:
+            loaded: list[tuple[str, dict[str, Any]]] = []
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            for meta in boards:
+                slug = meta.get("slug") or _kb.DEFAULT_BOARD
+                ids = requested.get(slug) if requested is not None else None
+                if requested is not None and not ids:
+                    continue
+                conn = _kb.connect(board=slug)
+                try:
+                    if ids is None:
+                        rows = _kb.list_pending_gateway_notification_outbox(
+                            conn,
+                            profiles=profiles,
+                            board=slug,
+                            limit=100,
+                        )
+                        rows.extend(_kb.list_pending_bot_chat_notification_outbox(
+                            conn,
+                            profiles=profiles,
+                            board=slug,
+                            limit=500,
+                        ))
+                    else:
+                        rows = _kb.get_notification_outbox_by_ids(conn, ids)
+                    for row in rows:
+                        if str(row.get("origin_profile") or "") not in profiles:
+                            continue
+                        consumer = _consumer(row)
+                        if (row.get("platform") or "") != "bot-chat" and _kb.notification_outbox_acknowledged(
+                            conn, int(row["id"]), consumer=consumer
+                        ):
+                            continue
+                        loaded.append((slug, row))
+                finally:
+                    conn.close()
+            return loaded
+
+        def _ack(slug: str, row: dict[str, Any]) -> None:
+            conn = _kb.connect(board=slug)
+            try:
+                _kb.ack_notification_outbox(
+                    conn,
+                    int(row["id"]),
+                    consumer=_consumer(row),
+                    delivery_key=str(row["delivery_key"]),
+                )
+            finally:
+                conn.close()
+
+        def _task_title(slug: str, task_id: str) -> str:
+            conn = _kb.connect(board=slug)
+            try:
+                task = _kb.get_task(conn, task_id)
+                return (task.title if task else task_id)[:120]
+            finally:
+                conn.close()
+
+        def _render(slug: str, row: dict[str, Any]) -> Optional[str]:
+            kind = str(row.get("event_kind") or "")
+            if kind in {"heartbeat", "claimed", "spawned", "promoted", "unblocked", "archived"}:
+                return None
+            title = _task_title(slug, str(row["task_id"]))
+            payload: dict[str, Any] = {}
+            try:
+                parsed = json.loads(row.get("payload") or "{}")
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except (TypeError, ValueError):
+                pass
+            prefix = {
+                "completed": "✔",
+                "blocked": "⏸",
+                "gave_up": "✖",
+                "crashed": "✖",
+                "timed_out": "⏱",
+                "review_requested": "👀",
+                "block_loop_detected": "🛑",
+                "status": "🔄",
+            }.get(kind, "•")
+            detail = payload.get("summary") or payload.get("reason") or payload.get("status")
+            suffix = f"\n{str(detail)[:200]}" if detail else ""
+            return f"{prefix} [{slug}] Kanban {row['task_id']} {kind} — {title}{suffix}"
+
+        requested: Optional[dict[str, set[int]]] = None
+        while getattr(self, "_running", False):
+            rows = await _to_thread_process_service(_load_rows, requested)
+            for slug, row in rows:
+                if (row.get("platform") or "") == "bot-chat":
+                    from hermes_cli.kanban_client_delivery import publish_profile_signal
+
+                    await _to_thread_process_service(
+                        publish_profile_signal,
+                        str(row.get("origin_profile") or ""),
+                        {
+                            "outbox": [{
+                                "board": slug,
+                                "outbox_id": int(row["id"]),
+                                "task_id": str(row["task_id"]),
+                            }]
+                        },
+                    )
+                    continue
+                message = await _to_thread_process_service(_render, slug, row)
+                if message is None:
+                    await _to_thread_process_service(_ack, slug, row)
+                    continue
+                platform_name = str(row.get("platform") or "").lower()
+                try:
+                    platform = _Platform(platform_name)
+                except ValueError:
+                    continue
+                owner = str(row.get("origin_profile") or "").strip()
+                adapter = self._authorization_adapter(platform, owner or None)
+                if adapter is None:
+                    continue
+                metadata: dict[str, Any] = {}
+                try:
+                    parsed_meta = json.loads(row.get("delivery_metadata") or "{}")
+                    if isinstance(parsed_meta, dict):
+                        metadata = parsed_meta
+                except (TypeError, ValueError):
+                    pass
+                if row.get("thread_id") and not metadata.get("thread_id"):
+                    metadata["thread_id"] = row["thread_id"]
+                key = str(row["delivery_key"])
+                try:
+                    result = await adapter.send(
+                        str(row.get("chat_id") or ""), message, metadata=metadata
+                    )
+                    if getattr(result, "success", True) is False:
+                        raise RuntimeError(getattr(result, "error", None) or "send failed")
+                    await _to_thread_process_service(_ack, slug, row)
+                    failures.pop(key, None)
+                except Exception as exc:
+                    failures[key] = failures.get(key, 0) + 1
+                    logger.warning(
+                        "kanban outbox delivery failed for %s (attempt %d): %s",
+                        key, failures[key], exc,
+                    )
+                    # Durable row remains unacknowledged. Re-arm via a bounded
+                    # lifecycle timer rather than a board poll.
+                    payload = {
+                        "outbox": [{
+                            "board": slug,
+                            "outbox_id": int(row["id"]),
+                            "task_id": str(row["task_id"]),
+                        }]
+                    }
+                    asyncio.get_running_loop().call_later(
+                        min(60.0, float(2 ** min(failures[key], 5))),
+                        signal_bus.handle_signal,
+                        payload,
+                    )
+
+            batch = await signal_bus.next_batch()
+            requested = {
+                slug: set(ids)
+                for slug, ids in batch.outbox_by_board.items()
+            }
+
+    async def _kanban_notifier_watcher(self, interval: Optional[float] = None) -> None:
+        """Deliver terminal events after durable outbox/control-socket wakeups.
+
+        Production steady state is event-driven: startup performs one bounded
+        recovery drain, then the watcher blocks on ``KanbanSignalBus``.  The
+        optional ``interval`` is retained only as an explicit compatibility/test
+        mode for embedders that have not wired the control socket yet.
 
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
@@ -221,6 +422,13 @@ class GatewayKanbanWatchersMixin:
         adapters it hosts. The dispatch-owning gateway also handles legacy
         subscriptions without a profile stamp.
         """
+        if interval is None:
+            await self._kanban_outbox_notifier_watcher()
+            return
+
+        # Legacy explicit-interval compatibility path below. Production never
+        # enters it; it remains temporarily for downstream embedders and the
+        # existing adapter regression suite while they migrate to outbox acks.
         # Dispatch and delivery have separate ownership. A deployment may run
         # one dispatcher while each profile has its own gateway credentials;
         # those adapter-owning gateways must still poll and deliver their own
@@ -274,23 +482,38 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
-        # Initial delay so the gateway can finish wiring adapters.
-        await asyncio.sleep(5)
+        signal_bus = getattr(self, "_kanban_signal_bus", None)
+        event_driven = interval is None
+        if event_driven and signal_bus is None:
+            logger.warning(
+                "kanban notifier: control-socket signal bus unavailable; disabled "
+                "rather than falling back to periodic board polling"
+            )
+            return
+        if not event_driven:
+            # Compatibility/test mode only. Production never takes this branch.
+            await asyncio.sleep(5)
 
-        # Stale done-sub GC cadence. Subscriptions survive ``done`` (it is
-        # reversible), so boards that never archive would otherwise
-        # accumulate rows scanned on every 5s tick forever. The sweep is a
-        # single DELETE per board, gated to once per watcher startup and at
-        # most once per hour thereafter — cheap relative to the tick's own
-        # per-sub claims. Retention is kanban.done_sub_retention_days in
-        # config.yaml (default 30; 0 disables), re-read at each sweep so a
-        # config change applies without a restart.
+        # Startup recovery gets exactly one bounded all-board drain. Later
+        # iterations are scoped to boards named by committed outbox signals.
+        pending_batch = None
+        startup_recovery = True
+
+        # Retention GC is performed during startup recovery here; production
+        # steady-state retention is armed by the persisted deadline scheduler.
         _GC_INTERVAL_SECONDS = 3600.0
-        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup
+        _gc_next_at = 0.0
 
         while self._running:
+            requested_boards = (
+                set(getattr(pending_batch, "boards", set()))
+                if pending_batch is not None
+                else None
+            )
             try:
-                _gc_due = time.monotonic() >= _gc_next_at
+                _gc_due = startup_recovery or (
+                    not event_driven and time.monotonic() >= _gc_next_at
+                )
                 _gc_retention_days = 30
                 if _gc_due:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
@@ -350,6 +573,11 @@ class GatewayKanbanWatchersMixin:
                         boards = _kb.list_boards(include_archived=False)
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    if requested_boards is not None:
+                        boards = [
+                            meta for meta in boards
+                            if (meta.get("slug") or _kb.DEFAULT_BOARD) in requested_boards
+                        ]
                     seen_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
@@ -1027,11 +1255,19 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
-            # Sleep with cancellation checks.
-            for _ in range(int(max(1, interval))):
-                if not self._running:
-                    return
-                await asyncio.sleep(1)
+            startup_recovery = False
+            if event_driven:
+                # No timeout: a committed control-socket signal or cancellation
+                # is the only steady-state wake source.
+                assert signal_bus is not None
+                pending_batch = await signal_bus.next_batch()
+            else:
+                # Explicit compatibility/test mode only.
+                assert interval is not None
+                for _ in range(int(max(1, interval))):
+                    if not self._running:
+                        return
+                    await asyncio.sleep(1)
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -1275,16 +1511,6 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "
                 "on config control alone.", _lock_path,
             )
-
-        try:
-            interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
-        except (ValueError, TypeError):
-            logger.warning(
-                "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
-                kanban_cfg.get("dispatch_interval_seconds"),
-            )
-            interval = 60.0
-        interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1541,17 +1767,23 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
-        def _tick_once() -> "list[tuple[str, Optional[object]]]":
-            """Run one dispatch_once per board. Returns (slug, result) pairs.
+        def _tick_once(
+            requested_boards: Optional[set[str]] = None,
+        ) -> "list[tuple[str, Optional[object]]]":
+            """Run one bounded dispatch pass for requested boards.
 
-            Enumerating boards on every tick keeps the dispatcher honest
-            when users create a new board mid-run: no restart required,
-            the next tick picks it up automatically.
+            ``None`` is reserved for the one startup recovery pass. Steady-state
+            control-socket wakes always name their committed board(s).
             """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            if requested_boards is not None:
+                boards = [
+                    meta for meta in boards
+                    if (meta.get("slug") or _kb.DEFAULT_BOARD) in requested_boards
+                ]
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -1696,9 +1928,64 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        def _active_board_slugs() -> list[str]:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            return [b.get("slug") or _kb.DEFAULT_BOARD for b in boards]
+
+        try:
+            retention_days = int(kanban_cfg.get("done_sub_retention_days", 30))
+        except (TypeError, ValueError):
+            retention_days = 30
+
+        def _rebuild_deadlines_for_boards(slugs: set[str]) -> None:
+            for slug in slugs:
+                conn = _kb.connect(board=slug)
+                try:
+                    _kb.rebuild_kanban_deadlines(
+                        conn,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        retention_days=retention_days,
+                    )
+                finally:
+                    conn.close()
+
+        def _nearest_deadline() -> Optional[int]:
+            nearest: Optional[int] = None
+            for slug in _active_board_slugs():
+                conn = _kb.connect(board=slug)
+                try:
+                    candidate = _kb.next_kanban_deadline(conn)
+                finally:
+                    conn.close()
+                if candidate is not None and (nearest is None or candidate < nearest):
+                    nearest = candidate
+            return nearest
+
+        def _pop_due_deadline_boards() -> set[str]:
+            due_boards: set[str] = set()
+            now = int(time.time())
+            for slug in _active_board_slugs():
+                conn = _kb.connect(board=slug)
+                try:
+                    due = _kb.pop_due_kanban_deadlines(conn, now=now)
+                    if any(row.get("kind") == "retention_gc" for row in due):
+                        _kb.purge_stale_done_notify_subs(
+                            conn, max_age_days=retention_days
+                        )
+                finally:
+                    conn.close()
+                if due:
+                    due_boards.add(slug)
+            return due_boards
+
         logger.info(
-            "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
+            "kanban dispatcher: embedded in gateway (event-driven control socket)"
         )
+        pending_boards: Optional[set[str]] = None
+        signal_bus = getattr(self, "_kanban_signal_bus", None)
         while self._running:
             try:
                 # Reap zombie children before per-board work so a board DB
@@ -1727,7 +2014,16 @@ class GatewayKanbanWatchersMixin:
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(_tick_once)
+                    results = await _to_thread_process_service(
+                        _tick_once, pending_boards
+                    )
+                    touched_boards = {
+                        slug for slug, _res in (results or []) if _res is not None
+                    }
+                    if touched_boards:
+                        await _to_thread_process_service(
+                            _rebuild_deadlines_for_boards, touched_boards
+                        )
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
@@ -1769,11 +2065,41 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+            if not getattr(self, "_running", False):
+                break
+            if signal_bus is None:
+                # Legacy test/embedding without the control server gets the one
+                # startup recovery pass only; never fall back to interval scans.
+                break
+
+            try:
+                nearest = await _to_thread_process_service(_nearest_deadline)
+                if nearest is None:
+                    batch = await signal_bus.next_dispatch_batch()
+                    pending_boards = set(batch.boards)
+                    continue
+
+                delay = max(0.0, float(nearest - int(time.time())))
+                signal_task = asyncio.create_task(signal_bus.next_dispatch_batch())
+                timer_task = asyncio.create_task(asyncio.sleep(delay))
+                done, pending = await asyncio.wait(
+                    {signal_task, timer_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                if signal_task in done:
+                    batch = signal_task.result()
+                    pending_boards = set(batch.boards)
+                else:
+                    pending_boards = await _to_thread_process_service(
+                        _pop_due_deadline_boards
+                    )
+                    if not pending_boards:
+                        # Clock/race boundary: immediately recompute and re-arm.
+                        continue
+            except asyncio.CancelledError:
+                self._release_kanban_dispatcher_lock()
+                raise
 
         self._release_kanban_dispatcher_lock()

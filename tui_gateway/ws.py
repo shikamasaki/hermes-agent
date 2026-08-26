@@ -515,6 +515,12 @@ async def handle_ws(
         detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
+            try:
+                from tui_gateway.kanban_notifications import unsubscribe
+
+                unsubscribe(transport)
+            except Exception:
+                _log.debug("kanban notification unsubscribe failed", exc_info=True)
 
             # Owner-safely park browser controllers this transport registered.
             # A reconnect with the same stable identity may deliver a terminal
