@@ -3175,19 +3175,33 @@ def _notification_identities_after(
     ]
 
 
-def _task_event_high_water(conn: sqlite3.Connection) -> int:
-    """Return the current task-event id while the caller owns the write lock."""
+def _task_event_high_water(conn: sqlite3.Connection) -> Optional[int]:
+    """Return the canonical integer event high-water mark.
+
+    Legacy databases used TEXT primary keys such as ``e-2``. Their rebuild
+    runs inside :func:`write_txn`, but those historical rows must never be
+    replayed as freshly committed dispatcher signals after migration. ``None``
+    is an explicit "schema not signal-safe yet" sentinel; a normal empty
+    INTEGER-PK table still returns ``0``.
+    """
     try:
         row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()
     except (sqlite3.DatabaseError, AttributeError, TypeError):
+        return None
+    if not row:
         return 0
-    return int(row[0]) if row else 0
+    value = row[0]
+    if not isinstance(value, int):
+        return None
+    return value
 
 
 def _dispatch_identities_after(
-    conn: sqlite3.Connection, high_water: int
+    conn: sqlite3.Connection, high_water: Optional[int]
 ) -> list[dict[str, Any]]:
     """Capture committed task transitions even when they have no notification owner."""
+    if high_water is None:
+        return []
     try:
         rows = conn.execute(
             "SELECT id, task_id, kind FROM task_events WHERE id > ? ORDER BY id",
