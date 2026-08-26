@@ -266,3 +266,78 @@ def test_outbox_adapter_delivery_acks_once_and_duplicate_signal_is_harmless(
     adapter = None
     bus = None
     asyncio.run(scenario())
+
+
+def test_bot_chat_outbox_pushes_to_passive_client_lane_without_adapter_ack(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from hermes_cli import kanban_client_delivery
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("bot-chat", "tui", profile_name="default")
+    db.set_session_title("bot-chat", "Bot Chat")
+    db.close()
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn,
+        title="passive",
+        assignee="default",
+        origin_profile="default",
+        origin_session_id="bot-chat",
+        board="default",
+    )
+    assert kb.complete_task(conn, task_id, summary="done")
+    row = conn.execute(
+        "SELECT * FROM kanban_notification_outbox WHERE task_id = ? AND event_kind = 'completed' AND platform = 'bot-chat'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    outbox_id = int(row["id"])
+    delivery_key = str(row["delivery_key"])
+    conn.close()
+
+    pushed = []
+
+    def publish(profile, payload):
+        pushed.append((profile, payload))
+        runner._running = False
+        return 1
+
+    monkeypatch.setattr(kanban_client_delivery, "publish_profile_signal", publish)
+
+    class Runner(GatewayKanbanWatchersMixin):
+        _running = True
+        _profile_adapters = {}
+        adapters = {}
+
+        def _active_profile_name(self):
+            return "default"
+
+    async def scenario() -> None:
+        nonlocal runner
+        runner = Runner()
+        runner._kanban_signal_bus = KanbanSignalBus(asyncio.get_running_loop())
+        runner._kanban_signal_bus.handle_signal({
+            "outbox": [{"board": "default", "outbox_id": outbox_id, "task_id": task_id}]
+        })
+        await asyncio.wait_for(runner._kanban_outbox_notifier_watcher(), timeout=2)
+
+    runner = None
+    asyncio.run(scenario())
+    assert any(
+        profile == "default" and item["outbox_id"] == outbox_id
+        for profile, payload in pushed
+        for item in payload["outbox"]
+    )
+    with kb.connect() as reopened:
+        assert not kb.notification_outbox_acknowledged(
+            reopened, outbox_id, consumer="desktop:default"
+        )
+        assert not kb.notification_outbox_acknowledged(
+            reopened, outbox_id, consumer="tui:default"
+        )
+        assert reopened.execute(
+            "SELECT delivery_key FROM kanban_notification_outbox WHERE id = ?", (outbox_id,)
+        ).fetchone()["delivery_key"] == delivery_key

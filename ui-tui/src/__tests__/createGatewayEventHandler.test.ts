@@ -2146,4 +2146,37 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  it('renders and ACKs a Kanban card without mutating transcript or busy turn state', async () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const rpc = ctx.gateway.rpc as ReturnType<typeof vi.fn>
+
+    patchUiState({ busy: true, sid: 'bot-chat' })
+    createGatewayEventHandler(ctx)({
+      type: 'kanban.notification',
+      session_id: 'bot-chat',
+      payload: {
+        board: 'default',
+        created_at: 1,
+        delivery_key: 'chief:default:7',
+        delivery_seq: 7,
+        event_kind: 'blocked',
+        outbox_id: 42,
+        reason: 'needs input',
+        task_id: 't_42',
+        task_title: 'Finish passive delivery'
+      }
+    } as any)
+
+    expect(getUiState().busy).toBe(true)
+    expect(appended).toEqual([])
+    expect(ctx.system.sys).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledWith('kanban.notifications.ack', {
+      surface: 'tui',
+      board: 'default',
+      outbox_id: 42,
+      delivery_key: 'chief:default:7'
+    })
+  })
 })

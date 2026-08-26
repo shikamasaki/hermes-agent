@@ -11972,6 +11972,36 @@ def list_pending_gateway_notification_outbox(
     return [dict(row) for row in conn.execute(query, params).fetchall()]
 
 
+def list_pending_bot_chat_notification_outbox(
+    conn: sqlite3.Connection,
+    *,
+    profiles: Iterable[str],
+    board: Optional[str] = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Return durable passive-inbox rows owned by the served profiles."""
+    owners = sorted({
+        _canonical_assignee(value) or ""
+        for value in profiles
+        if _canonical_assignee(value)
+    })
+    if not owners:
+        return []
+    placeholders = ",".join("?" for _ in owners)
+    query = (
+        "SELECT o.* FROM kanban_notification_outbox o "
+        f"WHERE o.origin_profile IN ({placeholders}) "
+        "AND o.platform = 'bot-chat'"
+    )
+    params: list[Any] = list(owners)
+    if board is not None:
+        query += " AND o.board = ?"
+        params.append(_normalize_board_slug(board) or board)
+    query += " ORDER BY o.id LIMIT ?"
+    params.append(max(1, int(limit)))
+    return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
 def get_notification_outbox_by_ids(
     conn: sqlite3.Connection,
     outbox_ids: Iterable[int],

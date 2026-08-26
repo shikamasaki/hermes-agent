@@ -250,15 +250,19 @@ class GatewayKanbanWatchersMixin:
                             board=slug,
                             limit=100,
                         )
+                        rows.extend(_kb.list_pending_bot_chat_notification_outbox(
+                            conn,
+                            profiles=profiles,
+                            board=slug,
+                            limit=500,
+                        ))
                     else:
                         rows = _kb.get_notification_outbox_by_ids(conn, ids)
                     for row in rows:
-                        # Bot Chat passive inbox is consumed by the next slice;
-                        # never steal or acknowledge it from the adapter lane.
-                        if (row.get("platform") or "") == "bot-chat":
+                        if str(row.get("origin_profile") or "") not in profiles:
                             continue
                         consumer = _consumer(row)
-                        if _kb.notification_outbox_acknowledged(
+                        if (row.get("platform") or "") != "bot-chat" and _kb.notification_outbox_acknowledged(
                             conn, int(row["id"]), consumer=consumer
                         ):
                             continue
@@ -317,6 +321,21 @@ class GatewayKanbanWatchersMixin:
         while getattr(self, "_running", False):
             rows = await _to_thread_process_service(_load_rows, requested)
             for slug, row in rows:
+                if (row.get("platform") or "") == "bot-chat":
+                    from hermes_cli.kanban_client_delivery import publish_profile_signal
+
+                    await _to_thread_process_service(
+                        publish_profile_signal,
+                        str(row.get("origin_profile") or ""),
+                        {
+                            "outbox": [{
+                                "board": slug,
+                                "outbox_id": int(row["id"]),
+                                "task_id": str(row["task_id"]),
+                            }]
+                        },
+                    )
+                    continue
                 message = await _to_thread_process_service(_render, slug, row)
                 if message is None:
                     await _to_thread_process_service(_ack, slug, row)
