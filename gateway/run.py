@@ -31248,8 +31248,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _control_server = None
     try:
         from gateway.control_socket import GatewayControlServer
+        from gateway.kanban_event_loop import KanbanSignalBus
 
-        _control_server = GatewayControlServer()
+        # One process-owned bridge feeds both notifier and dispatcher. The
+        # control handler runs in the socket executor and only coalesces durable
+        # identities + schedules asyncio wakeups; it never blocks the adapter
+        # event loop on SQLite work.
+        _kanban_signal_bus = KanbanSignalBus(asyncio.get_running_loop())
+        setattr(runner, "_kanban_signal_bus", _kanban_signal_bus)
+        _control_server = GatewayControlServer(
+            verb_handlers={
+                "kanban_outbox_ready": _kanban_signal_bus.handle_signal,
+            }
+        )
         if not await _control_server.start():
             _control_server = None
         else:

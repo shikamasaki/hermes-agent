@@ -1575,6 +1575,19 @@ CREATE TABLE IF NOT EXISTS kanban_notification_acks (
     PRIMARY KEY (consumer, outbox_id)
 );
 
+-- Persisted lifecycle timers. Gateway startup rebuilds this compact index from
+-- authoritative task state once, then arms only the nearest due timestamp.
+-- Rows are removed atomically when popped; processing re-arms any continuing
+-- lifecycle (for example, a live worker whose claim is extended).
+CREATE TABLE IF NOT EXISTS kanban_deadlines (
+    kind       TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    due_at     INTEGER NOT NULL,
+    payload    TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, task_id)
+);
+
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
@@ -1589,6 +1602,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 CREATE INDEX IF NOT EXISTS idx_outbox_profile_board  ON kanban_notification_outbox(origin_profile, board, id);
 CREATE INDEX IF NOT EXISTS idx_outbox_event          ON kanban_notification_outbox(task_event_id);
 CREATE INDEX IF NOT EXISTS idx_notification_acks_outbox ON kanban_notification_acks(outbox_id);
+CREATE INDEX IF NOT EXISTS idx_kanban_deadlines_due ON kanban_deadlines(due_at, kind, task_id);
 
 """
 
@@ -11778,6 +11792,213 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
         for key, value in data.items()
         if isinstance(value, (str, int, float, bool))
     }
+
+
+def rebuild_kanban_deadlines(
+    conn: sqlite3.Connection,
+    *,
+    stale_timeout_seconds: int = 0,
+    retention_days: int = 30,
+    now: Optional[int] = None,
+) -> int:
+    """Rebuild the persisted nearest-deadline index from authoritative rows.
+
+    This is a bounded startup/recovery operation, not a steady-state scan.
+    Subsequent Gateway wakeups pop only due ids and re-arm from changed task
+    state.  Scheduled cards have no timestamp in the v1 schema and therefore
+    remain explicitly operator-resumed rather than inventing a hidden start.
+    """
+    ts = int(time.time()) if now is None else int(now)
+    try:
+        stale_after = max(0, int(stale_timeout_seconds))
+    except (TypeError, ValueError):
+        stale_after = 0
+    try:
+        retention_seconds = max(0, int(retention_days)) * 86400
+    except (TypeError, ValueError):
+        retention_seconds = 30 * 86400
+
+    rows: list[tuple[str, str, int, Optional[str], int]] = []
+    running = conn.execute(
+        "SELECT id, claim_expires, started_at, max_runtime_seconds, "
+        "last_heartbeat_at FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    for row in running:
+        task_id = str(row["id"])
+        if row["claim_expires"] is not None:
+            rows.append(("claim_expiry", task_id, int(row["claim_expires"]), None, ts))
+        if row["started_at"] is not None and row["max_runtime_seconds"] is not None:
+            rows.append((
+                "runtime_timeout",
+                task_id,
+                int(row["started_at"]) + int(row["max_runtime_seconds"]),
+                None,
+                ts,
+            ))
+        if stale_after and row["last_heartbeat_at"] is not None:
+            rows.append((
+                "stale_check",
+                task_id,
+                int(row["last_heartbeat_at"]) + stale_after,
+                None,
+                ts,
+            ))
+
+    # Timed retry starts (currently provider rate-limit cooldowns) are persisted
+    # as lifecycle deadlines so a deferred ready task gets one exact wake when
+    # its guard expires rather than relying on a dispatcher sweep.
+    retry_cooldown = _resolve_rate_limit_cooldown_seconds()
+    if retry_cooldown > 0:
+        deferred = conn.execute(
+            """
+            SELECT t.id, r.ended_at
+              FROM tasks t
+              JOIN task_runs r ON r.id = (
+                    SELECT r2.id FROM task_runs r2
+                     WHERE r2.task_id = t.id AND r2.ended_at IS NOT NULL
+                     ORDER BY r2.ended_at DESC, r2.id DESC LIMIT 1
+              )
+             WHERE t.status IN ('ready', 'review')
+               AND r.outcome = 'rate_limited'
+            """
+        ).fetchall()
+        rows.extend(
+            (
+                "scheduled_start",
+                str(row["id"]),
+                int(row["ended_at"]) + retry_cooldown,
+                None,
+                ts,
+            )
+            for row in deferred
+        )
+
+    if retention_seconds:
+        settled = conn.execute(
+            """
+            SELECT t.id,
+                   COALESCE((SELECT MAX(e.created_at) FROM task_events e
+                              WHERE e.task_id = t.id),
+                            t.completed_at, t.created_at, 0) AS settled_at
+              FROM tasks t
+             WHERE t.status = 'done'
+               AND EXISTS (SELECT 1 FROM kanban_notify_subs s
+                            WHERE s.task_id = t.id)
+            """
+        ).fetchall()
+        rows.extend(
+            (
+                "retention_gc",
+                str(row["id"]),
+                int(row["settled_at"]) + retention_seconds,
+                None,
+                ts,
+            )
+            for row in settled
+        )
+
+    with write_txn(conn):
+        conn.execute("DELETE FROM kanban_deadlines")
+        conn.executemany(
+            "INSERT INTO kanban_deadlines "
+            "(kind, task_id, due_at, payload, updated_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def next_kanban_deadline(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute("SELECT MIN(due_at) AS due_at FROM kanban_deadlines").fetchone()
+    if row is None or row["due_at"] is None:
+        return None
+    return int(row["due_at"])
+
+
+def pop_due_kanban_deadlines(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Atomically remove and return only lifecycle ids due by ``now``."""
+    ts = int(time.time()) if now is None else int(now)
+    cap = max(1, int(limit))
+    with write_txn(conn):
+        due = conn.execute(
+            "SELECT kind, task_id, due_at, payload FROM kanban_deadlines "
+            "WHERE due_at <= ? ORDER BY due_at, kind, task_id LIMIT ?",
+            (ts, cap),
+        ).fetchall()
+        if due:
+            conn.executemany(
+                "DELETE FROM kanban_deadlines WHERE kind = ? AND task_id = ?",
+                [(row["kind"], row["task_id"]) for row in due],
+            )
+    return [dict(row) for row in due]
+
+
+def list_pending_gateway_notification_outbox(
+    conn: sqlite3.Connection,
+    *,
+    profiles: Iterable[str],
+    board: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return the bounded oldest unacked adapter rows for startup recovery."""
+    owners = sorted({
+        _canonical_assignee(value) or ""
+        for value in profiles
+        if _canonical_assignee(value)
+    })
+    if not owners:
+        return []
+    placeholders = ",".join("?" for _ in owners)
+    query = (
+        "SELECT o.* FROM kanban_notification_outbox o "
+        f"WHERE o.origin_profile IN ({placeholders}) "
+        "AND o.platform <> 'bot-chat' "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM kanban_notification_acks a"
+        " WHERE a.outbox_id = o.id"
+        "   AND a.consumer = 'gateway:' || o.origin_profile || ':' ||"
+        "       o.platform || ':' || o.chat_id || ':' || o.thread_id)"
+    )
+    params: list[Any] = list(owners)
+    if board is not None:
+        query += " AND o.board = ?"
+        params.append(_normalize_board_slug(board) or board)
+    query += " ORDER BY o.id LIMIT ?"
+    params.append(max(1, int(limit)))
+    return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def get_notification_outbox_by_ids(
+    conn: sqlite3.Connection,
+    outbox_ids: Iterable[int],
+) -> list[dict[str, Any]]:
+    """Fetch exact durable identities named by a control-socket signal."""
+    ids = sorted({int(value) for value in outbox_ids if int(value) > 0})
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT * FROM kanban_notification_outbox WHERE id IN ({placeholders}) ORDER BY id",
+        ids,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def notification_outbox_acknowledged(
+    conn: sqlite3.Connection,
+    outbox_id: int,
+    *,
+    consumer: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM kanban_notification_acks WHERE consumer = ? AND outbox_id = ?",
+        (str(consumer or "").strip(), int(outbox_id)),
+    ).fetchone()
+    return row is not None
 
 
 def list_notification_outbox(
