@@ -3113,6 +3113,74 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _notification_outbox_high_water(conn: sqlite3.Connection) -> int:
+    """Return the current outbox id while the caller owns the write lock."""
+    try:
+        cursor = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM kanban_notification_outbox"
+        )
+        if cursor is None:
+            return 0
+        row = cursor.fetchone()
+    except (sqlite3.DatabaseError, AttributeError, TypeError):
+        # Schema initialization and legacy test databases can use write_txn
+        # before the notification table exists.
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _notification_identities_after(
+    conn: sqlite3.Connection, high_water: int
+) -> list[dict[str, Any]]:
+    """Capture this transaction's signal identities before releasing its lock."""
+    try:
+        cursor = conn.execute(
+            """
+            SELECT id, board, task_id, task_event_id, event_kind, delivery_key
+              FROM kanban_notification_outbox
+             WHERE id > ?
+             ORDER BY id
+            """,
+            (int(high_water),),
+        )
+        if cursor is None:
+            return []
+        rows = cursor.fetchall()
+    except (sqlite3.DatabaseError, AttributeError, TypeError):
+        return []
+    return [
+        {
+            "outbox_id": int(row["id"]),
+            "board": row["board"],
+            "task_id": row["task_id"],
+            "event_id": int(row["task_event_id"]),
+            "event_kind": row["event_kind"],
+            "delivery_key": row["delivery_key"],
+        }
+        for row in rows
+    ]
+
+
+def _signal_committed_notification_outbox(identities: list[dict[str, Any]]) -> None:
+    """Best-effort latency hint; durable outbox recovery is authoritative."""
+    if not identities:
+        return
+    try:
+        from gateway.control_socket import signal_gateway_control
+
+        signal_gateway_control(
+            kanban_home(),
+            "kanban_outbox_ready",
+            {"outbox": identities},
+            timeout=0.25,
+        )
+    except Exception:
+        # The commit is already durable. Gateway absence, timeout, process
+        # exit, or even an optional-client import failure must never turn a
+        # delivered commit into a reported rollback.
+        _log.debug("Kanban post-commit Gateway signal was lost", exc_info=True)
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -3161,6 +3229,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    outbox_high_water = _notification_outbox_high_water(conn)
+    committed_identities: list[dict[str, Any]] = []
     try:
         yield conn
     except Exception:
@@ -3174,6 +3244,12 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         raise
     else:
         try:
+            # Capture under this transaction's write lock. Reading after COMMIT
+            # could accidentally coalesce a different connection's faster
+            # follow-up commit into this signal batch.
+            committed_identities = _notification_identities_after(
+                conn, outbox_high_water
+            )
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
@@ -3186,6 +3262,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Synchronous and bounded: no background thread can outlive the caller,
+        # and the durable rows above survive process exit or a lost signal.
+        _signal_committed_notification_outbox(committed_identities)
 
 
 # ---------------------------------------------------------------------------
