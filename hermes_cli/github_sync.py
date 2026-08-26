@@ -252,6 +252,7 @@ class GitHubIntakeService:
         full_name = str(repository.get("full_name") or "").lower()
         owner_obj = repository.get("owner") or {}
         owner = str(owner_obj.get("login") or "").lower()
+        owner_type = str(owner_obj.get("type") or "").lower()
         name = str(repository.get("name") or "").lower()
         exact: list[Mapping[str, Any]] = []
         wildcard: list[Mapping[str, Any]] = []
@@ -264,6 +265,14 @@ class GitHubIntakeService:
                 continue
             if str(route.get("owner") or "").lower() != owner:
                 continue
+            # Owner-wide routes are powerful. Personal wildcard routes default
+            # to ``user`` for back-compat; organizations must opt in explicitly
+            # so a copied personal route can never absorb a client org.
+            account_type = str(route.get("account_type") or "user").lower()
+            if account_type not in {"user", "organization"}:
+                continue
+            if owner_type != account_type:
+                continue
             enabled = {str(value).lower() for value in route.get("repositories") or ()}
             if name in enabled or full_name in enabled or "*" in enabled:
                 wildcard.append(route)
@@ -271,8 +280,6 @@ class GitHubIntakeService:
         if len(matches) != 1:
             raise GitHubIntakeError("delivery does not resolve to exactly one explicit route")
         route = matches[0]
-        if not exact and str(owner_obj.get("type") or "") != "User":
-            raise GitHubIntakeError("owner wildcard is limited to personal repositories")
         required = ("profile", "board", "tenant", "assignee", "webhook_secret_ref")
         if any(not str(route.get(key) or "").strip() for key in required):
             raise GitHubIntakeError("route is incomplete")

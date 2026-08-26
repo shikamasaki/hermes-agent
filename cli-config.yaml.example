@@ -327,6 +327,7 @@ kanban:
 #   routes:
 #     - installation_id: 123456
 #       owner: shikamasaki
+#       account_type: user  # user | organization; org wildcard requires explicit organization
 #       repositories: ["demo"]
 #       assignee: shikamasaki
 #       profile: personal

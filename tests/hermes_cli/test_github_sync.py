@@ -276,6 +276,51 @@ def test_exact_repo_route_can_allow_team_assignment(conn, route):
     assert kdb.get_task(conn, result.task_id).status == "ready"
 
 
+def test_explicit_organization_installation_route_can_start_allowlisted_repo(
+    conn, route
+):
+    route.update(
+        {
+            "owner": "MedicalDataCard",
+            "account_type": "organization",
+            "repositories": ["operation-and-maintenance"],
+            "allow_team_assignments": True,
+            "profile": "welby",
+            "tenant": "welby",
+            "board": "default",
+        }
+    )
+    payload = _payload(
+        sender="team-maintainer",
+        repo="MedicalDataCard/operation-and-maintenance",
+    )
+    payload["repository"]["owner"]["type"] = "Organization"
+    raw, headers = _headers(payload)
+
+    result = _service(route).process(conn, headers=headers, body=raw)
+
+    task = kdb.get_task(conn, result.task_id)
+    assert result.disposition == "created"
+    assert task.assignee == "welby"
+    assert task.tenant == "welby"
+
+
+def test_organization_wildcard_requires_explicit_account_type(conn, route):
+    route.update(
+        {
+            "owner": "MedicalDataCard",
+            "repositories": ["*"],
+            "allow_team_assignments": True,
+        }
+    )
+    payload = _payload(repo="MedicalDataCard/private-repo")
+    payload["repository"]["owner"]["type"] = "Organization"
+    raw, headers = _headers(payload)
+
+    with pytest.raises(GitHubIntakeError, match="exactly one explicit route"):
+        _service(route).process(conn, headers=headers, body=raw)
+
+
 def test_unassign_queues_to_triage_but_running_work_requires_human_decision(conn, route):
     payload = _payload()
     raw, headers = _headers(payload)
