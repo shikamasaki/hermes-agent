@@ -28,7 +28,9 @@ def _(rid, params: dict) -> dict:
     try:
         from tui_gateway.kanban_notifications import acknowledge
 
+        transport = current_transport() or _stdio_transport
         ok = acknowledge(
+            transport=transport,
             surface=str(params.get("surface") or ""),
             board=str(params.get("board") or ""),
             outbox_id=int(params.get("outbox_id") or 0),

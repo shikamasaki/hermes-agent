@@ -909,6 +909,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       case 'kanban.notification': {
+        if (!ev.session_id || ev.session_id !== getUiState().sid) {
+          return
+        }
+
         const p = ev.payload
         const detail = p.summary || p.reason || p.status
         const glyph = p.event_kind === 'completed' ? '✓' : p.event_kind === 'review_requested' ? '◉' : '⚑'

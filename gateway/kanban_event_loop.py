@@ -61,18 +61,40 @@ class KanbanSignalBus:
             if not board or not task_id or outbox_id < 1:
                 continue
             accepted.append((board, outbox_id, task_id))
-        if not accepted:
+        dispatch_rows = payload.get("dispatch", []) if isinstance(payload, dict) else []
+        if not isinstance(dispatch_rows, list):
+            raise ValueError("payload.dispatch must be a list")
+        dispatch_accepted: list[tuple[str, str]] = []
+        for row in dispatch_rows:
+            if not isinstance(row, dict):
+                continue
+            board = str(row.get("board") or "").strip()
+            task_id = str(row.get("task_id") or "").strip()
+            try:
+                event_id = int(str(row.get("event_id")))
+            except (TypeError, ValueError):
+                continue
+            if board and task_id and event_id > 0:
+                dispatch_accepted.append((board, task_id))
+        if not accepted and not dispatch_accepted:
             return {"accepted": 0}
         with self._lock:
-            for stream in self._pending.values():
-                for board, outbox_id, task_id in accepted:
+            notification = self._pending["notification"]
+            dispatch = self._pending["dispatch"]
+            for board, outbox_id, task_id in accepted:
+                for stream in (notification, dispatch):
                     stream["boards"].add(board)
                     stream["outbox_ids"].add(outbox_id)
                     stream["task_ids"].add(task_id)
                     stream["outbox_by_board"].setdefault(board, set()).add(outbox_id)
-        for event in self._events.values():
-            self._loop.call_soon_threadsafe(event.set)
-        return {"accepted": len(accepted)}
+            for board, task_id in dispatch_accepted:
+                dispatch["boards"].add(board)
+                dispatch["task_ids"].add(task_id)
+        if accepted:
+            self._loop.call_soon_threadsafe(self._events["notification"].set)
+        if accepted or dispatch_accepted:
+            self._loop.call_soon_threadsafe(self._events["dispatch"].set)
+        return {"accepted": len(accepted) + len(dispatch_accepted)}
 
     async def _next(self, stream_name: str) -> KanbanSignalBatch:
         event = self._events[stream_name]

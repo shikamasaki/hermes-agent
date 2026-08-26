@@ -13,7 +13,7 @@ from hermes_cli.kanban_client_delivery import NotificationSignalListener
 
 _VISIBLE_KINDS = frozenset({
     "blocked", "block_loop_detected", "completed", "crashed", "gave_up",
-    "review_requested", "timed_out",
+    "review_requested", "status", "timed_out",
 })
 _SUBSCRIBERS: dict[Any, tuple[str, str, str]] = {}
 _SENT: dict[Any, set[str]] = {}
@@ -183,16 +183,34 @@ def deliver_signal(payload: dict[str, Any]) -> int:
     return sent
 
 
-def acknowledge(*, surface: str, board: str, outbox_id: int, delivery_key: str) -> bool:
+def acknowledge(
+    *,
+    transport: Any,
+    surface: str,
+    board: str,
+    outbox_id: int,
+    delivery_key: str,
+) -> bool:
     profile = _active_profile()
     consumer = _consumer(surface, profile)
+    with _LOCK:
+        subscription = _SUBSCRIBERS.get(transport)
+    if subscription is None:
+        return False
+    subscribed_profile, subscribed_consumer, canonical_session = subscription
+    if subscribed_profile != profile or subscribed_consumer != consumer:
+        return False
     conn = kb.connect(board=board)
     try:
         rows = kb.get_notification_outbox_by_ids(conn, [outbox_id])
         if len(rows) != 1:
             return False
         row = rows[0]
-        if row.get("platform") != "bot-chat" or row.get("origin_profile") != profile:
+        if (
+            row.get("platform") != "bot-chat"
+            or row.get("origin_profile") != profile
+            or row.get("origin_session_id") != canonical_session
+        ):
             return False
         return kb.ack_notification_outbox(
             conn, outbox_id, consumer=consumer, delivery_key=delivery_key

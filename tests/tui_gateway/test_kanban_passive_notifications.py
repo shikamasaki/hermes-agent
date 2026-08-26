@@ -75,10 +75,19 @@ def test_subscribe_replays_card_without_history_or_turn_state_and_ack_is_idempot
     assert db.get_messages_as_conversation(session_id) == before
     db.close()
 
+    assert not inbox.acknowledge(
+        transport=FakeTransport(),
+        surface="tui",
+        board="default",
+        outbox_id=row["id"],
+        delivery_key=row["delivery_key"],
+    )
     assert inbox.acknowledge(
+        transport=transport,
         surface="tui", board="default", outbox_id=row["id"], delivery_key=row["delivery_key"]
     )
     assert inbox.acknowledge(
+        transport=transport,
         surface="tui", board="default", outbox_id=row["id"], delivery_key=row["delivery_key"]
     )
     inbox.unsubscribe(transport)
@@ -147,6 +156,13 @@ def test_blocked_review_and_completed_cards_are_scoped_to_exact_session(owned_bo
         )
         assert kb.block_task(conn, blocked_id, reason="human decision", kind="needs_input")
         assert kb.request_review(conn, review_id, summary="inspect me", force=True)
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                review_id,
+                "status",
+                {"status": "review", "reason": "user-visible transition"},
+            )
 
     wrong = FakeTransport()
     with pytest.raises(ValueError, match="canonical Bot Chat"):
@@ -154,9 +170,9 @@ def test_blocked_review_and_completed_cards_are_scoped_to_exact_session(owned_bo
     assert wrong.frames == []
 
     exact = FakeTransport()
-    assert inbox.subscribe(exact, surface="tui", session_id=session_id) == 3
+    assert inbox.subscribe(exact, surface="tui", session_id=session_id) == 4
     kinds = [frame["params"]["payload"]["event_kind"] for frame in exact.frames]
-    assert kinds == ["completed", "blocked", "review_requested"]
+    assert kinds == ["completed", "blocked", "review_requested", "status"]
 
 
 def test_json_rpc_transport_replays_then_acks_across_reconnect(owned_board):

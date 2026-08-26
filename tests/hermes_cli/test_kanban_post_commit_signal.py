@@ -71,6 +71,36 @@ def test_nested_writes_signal_once_only_after_outer_commit(
         assert all(item["delivery_key"] for item in identities)
 
 
+def test_unowned_task_create_still_wakes_dispatch_after_commit(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        control,
+        "signal_gateway_control",
+        lambda _home, _verb, payload, **_kwargs: calls.append(payload) or True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dispatch without a notification destination",
+            assignee="worker",
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["outbox"] == []
+    assert calls[0]["dispatch"] == [
+        {
+            "board": "default",
+            "task_id": task_id,
+            "event_id": calls[0]["dispatch"][0]["event_id"],
+            "event_kind": "created",
+        }
+    ]
+    assert calls[0]["dispatch"][0]["event_id"] > 0
+
+
 def test_rollback_sends_no_signal_and_leaves_no_event_or_outbox(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

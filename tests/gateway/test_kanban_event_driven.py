@@ -69,6 +69,31 @@ def test_duplicate_signals_coalesce_without_losing_named_ids():
     asyncio.run(scenario())
 
 
+def test_dispatch_only_signal_wakes_dispatch_without_notifier_outbox():
+    async def scenario() -> None:
+        bus = KanbanSignalBus(asyncio.get_running_loop())
+        assert bus.handle_signal(
+            {
+                "outbox": [],
+                "dispatch": [
+                    {
+                        "board": "default",
+                        "task_id": "t_unowned",
+                        "event_id": 9,
+                        "event_kind": "created",
+                    }
+                ],
+            }
+        ) == {"accepted": 1}
+        batch = await asyncio.wait_for(bus.next_dispatch_batch(), timeout=1)
+        assert batch.boards == {"default"}
+        assert batch.task_ids == {"t_unowned"}
+        assert batch.outbox_ids == set()
+        assert bus.empty()
+
+    asyncio.run(scenario())
+
+
 def test_persisted_nearest_deadline_rebuild_and_due_ids(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     conn = kb.connect()

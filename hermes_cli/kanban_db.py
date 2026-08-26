@@ -3175,9 +3175,44 @@ def _notification_identities_after(
     ]
 
 
-def _signal_committed_notification_outbox(identities: list[dict[str, Any]]) -> None:
-    """Best-effort latency hint; durable outbox recovery is authoritative."""
-    if not identities:
+def _task_event_high_water(conn: sqlite3.Connection) -> int:
+    """Return the current task-event id while the caller owns the write lock."""
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()
+    except (sqlite3.DatabaseError, AttributeError, TypeError):
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _dispatch_identities_after(
+    conn: sqlite3.Connection, high_water: int
+) -> list[dict[str, Any]]:
+    """Capture committed task transitions even when they have no notification owner."""
+    try:
+        rows = conn.execute(
+            "SELECT id, task_id, kind FROM task_events WHERE id > ? ORDER BY id",
+            (int(high_water),),
+        ).fetchall()
+        board = _board_for_connection(conn)
+    except (sqlite3.DatabaseError, AttributeError, TypeError, ValueError):
+        return []
+    return [
+        {
+            "board": board,
+            "task_id": str(row["task_id"]),
+            "event_id": int(row["id"]),
+            "event_kind": str(row["kind"]),
+        }
+        for row in rows
+    ]
+
+
+def _signal_committed_notification_outbox(
+    identities: list[dict[str, Any]],
+    dispatch_identities: list[dict[str, Any]],
+) -> None:
+    """Best-effort latency hint; durable DB recovery is authoritative."""
+    if not identities and not dispatch_identities:
         return
     try:
         from gateway.control_socket import signal_gateway_control
@@ -3185,7 +3220,7 @@ def _signal_committed_notification_outbox(identities: list[dict[str, Any]]) -> N
         signal_gateway_control(
             kanban_home(),
             "kanban_outbox_ready",
-            {"outbox": identities},
+            {"outbox": identities, "dispatch": dispatch_identities},
             timeout=0.25,
         )
     except Exception:
@@ -3244,7 +3279,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     outbox_high_water = _notification_outbox_high_water(conn)
+    event_high_water = _task_event_high_water(conn)
     committed_identities: list[dict[str, Any]] = []
+    committed_dispatch_identities: list[dict[str, Any]] = []
     try:
         yield conn
     except Exception:
@@ -3264,6 +3301,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             committed_identities = _notification_identities_after(
                 conn, outbox_high_water
             )
+            committed_dispatch_identities = _dispatch_identities_after(
+                conn, event_high_water
+            )
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
@@ -3278,7 +3318,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         _check_file_length_invariant(conn)
         # Synchronous and bounded: no background thread can outlive the caller,
         # and the durable rows above survive process exit or a lost signal.
-        _signal_committed_notification_outbox(committed_identities)
+        _signal_committed_notification_outbox(
+            committed_identities, committed_dispatch_identities
+        )
 
 
 # ---------------------------------------------------------------------------
