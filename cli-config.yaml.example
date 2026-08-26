@@ -316,6 +316,41 @@ kanban:
   review_dispatch: true
 
 # =============================================================================
+# GitHub App Issue Intake + Projects v2 Projection (optional)
+# =============================================================================
+# The Gateway exposes POST /api/github/events. Every route is fail-closed and
+# references its own credential environment variables; Hermes never falls back
+# to gh CLI/default-profile credentials. Owner routes still require an explicit
+# repository allowlist (use "*" only when every personal repo is intended).
+#
+# github_intake:
+#   routes:
+#     - installation_id: 123456
+#       owner: shikamasaki
+#       repositories: ["demo"]
+#       assignee: shikamasaki
+#       profile: personal
+#       tenant: personal
+#       board: personal-github
+#       webhook_secret_ref: PERSONAL_GITHUB_WEBHOOK_SECRET
+#       project_token_ref: PERSONAL_GITHUB_PROJECT_TOKEN
+#       auto_start: self_assigned
+#       workspace:
+#         mode: repository
+#         clone_root: ~/.hermes/workspaces/github
+#       skills: [github-issue-to-pr, test-driven-development]
+#       project:
+#         id: PVT_kwDO...
+#         fields:
+#           task_id: PVTF_lADO...
+#           execution_status: PVTF_lADO...
+#           tenant_board: PVTF_lADO...
+#           assignee_profile: PVTF_lADO...
+#           last_summary: PVTF_lADO...
+#           linked_pr: PVTF_lADO...
+#           last_event_at: PVTF_lADO...
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.

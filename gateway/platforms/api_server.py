@@ -2258,6 +2258,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            # GitHub App webhook intake. Authenticated by the route's exact
+            # X-Hub-Signature-256 secret, never API_SERVER_KEY or ambient gh auth.
+            ("POST", "/api/github/events", self._handle_github_event),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -6799,6 +6802,30 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
+    async def _handle_github_event(self, request: "web.Request") -> "web.Response":
+        """POST /api/github/events — signed, explicitly routed GitHub App intake."""
+        from hermes_cli.github_sync import GitHubIntakeError, process_configured_delivery
+
+        body = await request.read()
+        try:
+            result = await asyncio.to_thread(
+                process_configured_delivery,
+                headers=dict(request.headers),
+                body=body,
+            )
+        except GitHubIntakeError as exc:
+            # Do not distinguish route existence from signature validity to an
+            # unauthenticated caller. The detailed reason stays in local logs.
+            logger.warning("github intake rejected: %s", exc)
+            return web.json_response({"error": "invalid GitHub delivery"}, status=401)
+        except Exception:
+            logger.exception("github intake failed after authentication")
+            return web.json_response({"error": "GitHub intake unavailable"}, status=503)
+        status = 202 if result.disposition in {"created", "triage"} else 200
+        return web.json_response(
+            {"status": result.disposition, "task_id": result.task_id}, status=status
+        )
+
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos managed-cron fire webhook (NAS → agent).
 
@@ -8456,6 +8483,15 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             try:
                 await self._site.start()
+                # One bounded recovery drain. Steady-state projection is driven
+                # by transactional outbox rows and GitHub webhook/lifecycle wakes;
+                # there is deliberately no periodic reconciliation loop.
+                try:
+                    from hermes_cli.github_sync import recover_configured_project_outboxes
+
+                    await asyncio.to_thread(recover_configured_project_outboxes)
+                except Exception:
+                    logger.exception("GitHub Projects startup recovery drain failed")
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None

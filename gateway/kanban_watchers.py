@@ -317,8 +317,31 @@ class GatewayKanbanWatchersMixin:
             suffix = f"\n{str(detail)[:200]}" if detail else ""
             return f"{prefix} [{slug}] Kanban {row['task_id']} {kind} — {title}{suffix}"
 
+        def _drain_github_projection(requested_boards: Optional[dict[str, set[int]]]) -> None:
+            """Drain only boards woken by committed Kanban events."""
+            if requested_boards is None:
+                return
+            try:
+                from hermes_cli.github_sync import (
+                    GitHubProjector,
+                    env_secret_resolver,
+                    github_graphql,
+                )
+            except ImportError:
+                return
+            projector = GitHubProjector(
+                token_resolver=env_secret_resolver, graphql=github_graphql
+            )
+            for slug in requested_boards:
+                conn = _kb.connect(board=slug)
+                try:
+                    projector.drain(conn, limit=100)
+                finally:
+                    conn.close()
+
         requested: Optional[dict[str, set[int]]] = None
         while getattr(self, "_running", False):
+            await _to_thread_process_service(_drain_github_projection, requested)
             rows = await _to_thread_process_service(_load_rows, requested)
             for slug, row in rows:
                 if (row.get("platform") or "") == "bot-chat":

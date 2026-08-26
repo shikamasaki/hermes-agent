@@ -4786,6 +4786,17 @@ def _append_event(
         created_at=now,
         run_id=run_id,
     )
+    # Optional GitHub Projects projection. The helper is a no-op unless this
+    # task came from signed GitHub intake and its additive tables/link exist.
+    # Import locally so ordinary Kanban users pay no startup or schema cost.
+    try:
+        from hermes_cli.github_sync import enqueue_project_event
+
+        enqueue_project_event(
+            conn, task_id, event_id, kind, created_at=now
+        )
+    except ImportError:  # pragma: no cover - only partial installs
+        pass
     return event_id
 
 
