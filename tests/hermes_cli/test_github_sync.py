@@ -2,6 +2,8 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+import subprocess
+from contextlib import nullcontext
 
 import pytest
 
@@ -10,7 +12,9 @@ from hermes_cli.github_sync import (
     GitHubIntakeError,
     GitHubIntakeService,
     GitHubProjector,
+    default_repository_resolver,
     initialize_github_sync,
+    process_configured_delivery,
 )
 
 
@@ -157,6 +161,102 @@ def test_bad_signature_fails_before_delivery_or_task_write(conn, route):
         _service(route).process(conn, headers=headers, body=raw)
     assert conn.execute("SELECT COUNT(*) FROM github_webhook_deliveries").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_controlled_clone_disables_ambient_git_credentials(
+    tmp_path, monkeypatch, route
+):
+    """A private checkout must not silently borrow the operator's Git auth."""
+    from hermes_cli import projects_db
+
+    class _Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(projects_db, "connect_closing", lambda: _Context())
+    monkeypatch.setattr(projects_db, "list_projects", lambda _conn: [])
+    monkeypatch.setattr(projects_db, "find_by_primary_path", lambda *_args: None)
+    monkeypatch.setattr(
+        projects_db, "create_project", lambda *_args, **_kwargs: "p-1"
+    )
+    observed = {}
+
+    def fake_run(args, **kwargs):
+        observed["args"] = list(args)
+        observed["env"] = dict(kwargs["env"])
+        (Path(args[-1]) / ".git").mkdir(parents=True)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    route["workspace"] = {
+        "mode": "repository",
+        "clone_root": str(tmp_path / "controlled"),
+    }
+    payload = _payload()
+    payload["repository"]["clone_url"] = (
+        "https://github.com/shikamasaki/demo.git"
+    )
+
+    project_id, repo_path = default_repository_resolver(route, payload)
+
+    assert project_id == "p-1"
+    assert repo_path == str(tmp_path / "controlled" / "shikamasaki" / "demo")
+    assert observed["args"][:5] == [
+        "git",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=",
+    ]
+    assert observed["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert observed["env"]["GCM_INTERACTIVE"] == "Never"
+
+
+def test_configured_webhook_returns_without_inline_project_graphql(
+    conn, route, tmp_path, monkeypatch
+):
+    """Projects mutations belong to the event-driven outbox consumer."""
+    from hermes_cli import github_sync, profiles
+    from gateway import run as gateway_run
+
+    profile_dir = tmp_path / "profiles" / "personal"
+    profile_dir.mkdir(parents=True)
+
+    class _ConnectionContext:
+        def __enter__(self):
+            return conn
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(github_sync, "configured_routes", lambda: [route])
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    monkeypatch.setattr(
+        gateway_run, "_profile_runtime_scope", lambda _home: nullcontext()
+    )
+    monkeypatch.setattr(kdb, "connect_closing", lambda **_kwargs: _ConnectionContext())
+    monkeypatch.setattr(
+        GitHubIntakeService,
+        "process",
+        lambda *_args, **_kwargs: github_sync.IntakeResult("created", "t_1"),
+    )
+    monkeypatch.setattr(
+        GitHubProjector,
+        "drain",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GraphQL drain ran inline")
+        ),
+    )
+    payload = _payload()
+    raw, headers = _headers(payload)
+
+    result = process_configured_delivery(headers=headers, body=raw)
+
+    assert result.disposition == "created"
+    assert result.task_id == "t_1"
 
 
 def test_other_sender_is_passive_triage(conn, route):

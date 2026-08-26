@@ -288,6 +288,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        # First-class GitHub App intake shares the always-on webhook listener
+        # used by Funnel deployments. Keeping this on WebhookAdapter (in
+        # addition to API-server deployments) avoids requiring the Desktop or
+        # a second public listener to stay running.
+        app.router.add_post("/api/github/events", self._handle_github_event)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -500,6 +505,38 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_github_event(self, request: "web.Request") -> "web.Response":
+        """Receive signed GitHub App deliveries on the public webhook lane."""
+        from hermes_cli.github_sync import (
+            GitHubIntakeError,
+            process_configured_delivery,
+        )
+
+        body = await request.read()
+        try:
+            result = await asyncio.to_thread(
+                process_configured_delivery,
+                headers=dict(request.headers),
+                body=body,
+            )
+        except GitHubIntakeError as exc:
+            # Do not expose whether a route, installation, repository, or
+            # signature matched. Detailed diagnostics stay in local logs.
+            logger.warning("[webhook] GitHub intake rejected: %s", exc)
+            return web.json_response(
+                {"error": "invalid GitHub delivery"}, status=401
+            )
+        except Exception:
+            logger.exception("[webhook] GitHub intake failed after authentication")
+            return web.json_response(
+                {"error": "GitHub intake unavailable"}, status=503
+            )
+        status = 202 if result.disposition in {"created", "triage"} else 200
+        return web.json_response(
+            {"status": result.disposition, "task_id": result.task_id},
+            status=status,
+        )
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""

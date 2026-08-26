@@ -170,11 +170,26 @@ def default_repository_resolver(
         if url != expected:
             raise GitHubIntakeError("repository clone URL does not match routed repository")
         completed = subprocess.run(
-            ["git", "clone", "--", url, str(repo_path)],
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.askPass=",
+                "clone",
+                "--",
+                url,
+                str(repo_path),
+            ],
             check=False,
             capture_output=True,
             text=True,
             timeout=300,
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+            },
         )
         if completed.returncode != 0:
             raise GitHubIntakeError("controlled repository clone failed")
@@ -603,11 +618,11 @@ def process_configured_delivery(
         raise GitHubIntakeError(f"routed profile {profile!r} does not exist")
     with _profile_runtime_scope(profile_dir):
         with kdb.connect_closing(board=str(route["board"])) as conn:
-            result = service.process(conn, headers=headers, body=body)
-            GitHubProjector(
-                token_resolver=env_secret_resolver, graphql=github_graphql
-            ).drain(conn, limit=100)
-            return result
+            # Return after the authenticated intake transaction commits. The
+            # resulting Kanban event wakes the Gateway's event-driven outbox
+            # drain; performing GraphQL mutations inline here would turn a
+            # webhook acknowledgement into a slow, failure-coupled sync path.
+            return service.process(conn, headers=headers, body=body)
 
 
 def recover_configured_project_outboxes() -> int:
