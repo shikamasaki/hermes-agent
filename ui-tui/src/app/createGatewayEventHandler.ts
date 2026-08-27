@@ -781,13 +781,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         setHistoryItems(prev => prev.map(m => (m.kind === 'intro' ? { ...m, info } : m)))
 
-        if (ev.session_id && ev.session_id === getUiState().sid) {
-          void rpc('kanban.notifications.subscribe', {
-            surface: 'tui',
-            session_id: ev.session_id
-          }).catch(() => undefined)
-        }
-
         return
       }
 
@@ -908,33 +901,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.clearNotice(ev.payload?.key)
 
         return
-      case 'kanban.notification': {
-        if (!ev.session_id || ev.session_id !== getUiState().sid) {
-          return
-        }
-
-        const p = ev.payload
-        const detail = p.summary || p.reason || p.status
-        const glyph = p.event_kind === 'completed' ? '✓' : p.event_kind === 'review_requested' ? '◉' : '⚑'
-        turnController.showNotice({
-          id: p.delivery_key,
-          key: p.delivery_key,
-          kind: 'sticky',
-          level: p.event_kind === 'completed' ? 'success' : p.event_kind === 'blocked' ? 'warn' : 'info',
-          text: `${glyph} [${p.board}] ${p.task_title || p.task_id} (${p.task_id}) ${p.event_kind}${detail ? ` — ${detail}` : ''}`,
-          ttl_ms: null
-        })
-
-        void rpc('kanban.notifications.ack', {
-          surface: 'tui',
-          board: p.board,
-          outbox_id: p.outbox_id,
-          delivery_key: p.delivery_key
-        }).catch(() => undefined)
-
-        return
-      }
-
       case 'billing.step_up.verification': {
         // The billing step-up device flow runs in the headless gateway, so it
         // can't open a browser or print the URL where the user sees it. Surface
