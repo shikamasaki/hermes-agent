@@ -1,6 +1,5 @@
 import type { HermesSkin } from '@hermes/shared/skin'
 
-import { $gateway } from '@/store/gateway'
 import {
   notifyCronChanged,
   notifyPairingChanged,
@@ -10,7 +9,6 @@ import {
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
-import { notify } from '@/store/notifications'
 import { dropSessionState, unbindTileRuntime } from '@/store/session-states'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
 // module graph into the gateway event hot path.
@@ -20,47 +18,7 @@ import type { GatewayEventContext } from './types'
 
 /** gateway.ready / skin.changed / change-watcher broadcasts / session.reclaimed. */
 export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
-  const { deps, event, payload, fromActiveSource, isActiveEvent } = ctx
-
-  if (event.type === 'kanban.notification') {
-    const card = payload as
-      | {
-          board?: string
-          delivery_key?: string
-          event_kind?: string
-          outbox_id?: number
-          reason?: string
-          status?: string
-          summary?: string
-          task_id?: string
-          task_title?: string
-        }
-      | undefined
-
-    // Only the exact active canonical session may consume/ACK its card. A
-    // background-profile or non-Bot-Chat window leaves the durable row pending
-    // for replay when the owner opens that session.
-    if (fromActiveSource() && isActiveEvent && card?.delivery_key && card.board && card.outbox_id) {
-      const detail = card.summary || card.reason || card.status
-      const kind = card.event_kind === 'completed' ? 'success' : card.event_kind === 'blocked' ? 'warning' : 'info'
-      notify({
-        id: card.delivery_key,
-        kind,
-        title: `Kanban · ${card.event_kind || 'update'}`,
-        message: `[${card.board}] ${card.task_title || card.task_id || 'task'}${card.task_title && card.task_id ? ` (${card.task_id})` : ''}${detail ? ` — ${detail}` : ''}`,
-        durationMs: kind === 'success' ? 8_000 : 0
-      })
-      void $gateway.get()?.request('kanban.notifications.ack', {
-          surface: 'desktop',
-          board: card.board,
-          outbox_id: card.outbox_id,
-          delivery_key: card.delivery_key
-        })
-        .catch(() => undefined)
-    }
-
-    return true
-  }
+  const { deps, event, payload, fromActiveSource } = ctx
 
   if (event.type === 'gateway.ready') {
     // Seed the active skin into the desktop theme registry without applying,
@@ -71,16 +29,6 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
     setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
 
     return true
-  }
-
-  if (event.type === 'session.info' && event.session_id && isActiveEvent && fromActiveSource()) {
-    void $gateway.get()?.request('kanban.notifications.subscribe', {
-        surface: 'desktop',
-        session_id: event.session_id
-      })
-      .catch(() => undefined)
-
-    return false
   }
 
   if (event.type === 'skin.changed') {

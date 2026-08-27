@@ -1134,12 +1134,6 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
-    # Passive-notification ownership. These fields are intentionally separate
-    # from ``session_id``: delivery is allowed only when the complete canonical
-    # origin tuple is present.
-    origin_profile: Optional[str] = None
-    origin_session_id: Optional[str] = None
-    origin_board: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1232,15 +1226,6 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
-            ),
-            origin_profile=(
-                row["origin_profile"] if "origin_profile" in keys else None
-            ),
-            origin_session_id=(
-                row["origin_session_id"] if "origin_session_id" in keys else None
-            ),
-            origin_board=(
-                row["origin_board"] if "origin_board" in keys else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1425,10 +1410,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
-    origin_profile       TEXT,
-    origin_session_id    TEXT,
-    origin_board         TEXT,
-
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1533,62 +1514,6 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
-CREATE TABLE IF NOT EXISTS kanban_notification_outbox (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    delivery_seq      INTEGER NOT NULL,
-    delivery_key      TEXT NOT NULL UNIQUE,
-    board             TEXT NOT NULL,
-    task_id           TEXT NOT NULL,
-    task_event_id     INTEGER NOT NULL,
-    run_id            INTEGER,
-    event_kind        TEXT NOT NULL,
-    origin_profile    TEXT NOT NULL,
-    origin_session_id TEXT,
-    platform          TEXT NOT NULL DEFAULT 'bot-chat',
-    chat_id           TEXT NOT NULL DEFAULT '',
-    thread_id         TEXT NOT NULL DEFAULT '',
-    user_id           TEXT,
-    user_id_alt       TEXT,
-    chat_type         TEXT,
-    delivery_mode     TEXT NOT NULL DEFAULT 'notify',
-    delivery_metadata TEXT,
-    payload           TEXT,
-    created_at        INTEGER NOT NULL,
-    delivered_at      INTEGER,
-    delivered_to      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS kanban_notification_cursors (
-    consumer       TEXT NOT NULL,
-    origin_profile TEXT NOT NULL,
-    board          TEXT NOT NULL,
-    last_outbox_id INTEGER NOT NULL DEFAULT 0,
-    updated_at     INTEGER NOT NULL,
-    PRIMARY KEY (consumer, origin_profile, board)
-);
-
-CREATE TABLE IF NOT EXISTS kanban_notification_acks (
-    consumer         TEXT NOT NULL,
-    outbox_id        INTEGER NOT NULL,
-    delivery_key     TEXT NOT NULL,
-    acknowledged_at INTEGER NOT NULL,
-    PRIMARY KEY (consumer, outbox_id)
-);
-
--- Persisted lifecycle timers. Gateway startup rebuilds this compact index from
--- authoritative task state once, then arms only the nearest due timestamp.
--- Rows are removed atomically when popped; processing re-arms any continuing
--- lifecycle (for example, a live worker whose claim is extended).
-CREATE TABLE IF NOT EXISTS kanban_deadlines (
-    kind       TEXT NOT NULL,
-    task_id    TEXT NOT NULL,
-    due_at     INTEGER NOT NULL,
-    payload    TEXT,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (kind, task_id)
-);
-
-
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1599,11 +1524,6 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-CREATE INDEX IF NOT EXISTS idx_outbox_profile_board  ON kanban_notification_outbox(origin_profile, board, id);
-CREATE INDEX IF NOT EXISTS idx_outbox_event          ON kanban_notification_outbox(task_event_id);
-CREATE INDEX IF NOT EXISTS idx_notification_acks_outbox ON kanban_notification_acks(outbox_id);
-CREATE INDEX IF NOT EXISTS idx_kanban_deadlines_due ON kanban_deadlines(due_at, kind, task_id);
-
 """
 
 
@@ -2743,13 +2663,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
-    if "origin_profile" not in cols:
-        _add_column_if_missing(conn, "tasks", "origin_profile", "origin_profile TEXT")
-    if "origin_session_id" not in cols:
-        _add_column_if_missing(conn, "tasks", "origin_session_id", "origin_session_id TEXT")
-    if "origin_board" not in cols:
-        _add_column_if_missing(conn, "tasks", "origin_board", "origin_board TEXT")
-
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -3127,123 +3040,6 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
-def _notification_outbox_high_water(conn: sqlite3.Connection) -> int:
-    """Return the current outbox id while the caller owns the write lock."""
-    try:
-        cursor = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM kanban_notification_outbox"
-        )
-        if cursor is None:
-            return 0
-        row = cursor.fetchone()
-    except (sqlite3.DatabaseError, AttributeError, TypeError):
-        # Schema initialization and legacy test databases can use write_txn
-        # before the notification table exists.
-        return 0
-    return int(row[0]) if row else 0
-
-
-def _notification_identities_after(
-    conn: sqlite3.Connection, high_water: int
-) -> list[dict[str, Any]]:
-    """Capture this transaction's signal identities before releasing its lock."""
-    try:
-        cursor = conn.execute(
-            """
-            SELECT id, board, task_id, task_event_id, event_kind, delivery_key
-              FROM kanban_notification_outbox
-             WHERE id > ?
-             ORDER BY id
-            """,
-            (int(high_water),),
-        )
-        if cursor is None:
-            return []
-        rows = cursor.fetchall()
-    except (sqlite3.DatabaseError, AttributeError, TypeError):
-        return []
-    return [
-        {
-            "outbox_id": int(row["id"]),
-            "board": row["board"],
-            "task_id": row["task_id"],
-            "event_id": int(row["task_event_id"]),
-            "event_kind": row["event_kind"],
-            "delivery_key": row["delivery_key"],
-        }
-        for row in rows
-    ]
-
-
-def _task_event_high_water(conn: sqlite3.Connection) -> Optional[int]:
-    """Return the canonical integer event high-water mark.
-
-    Legacy databases used TEXT primary keys such as ``e-2``. Their rebuild
-    runs inside :func:`write_txn`, but those historical rows must never be
-    replayed as freshly committed dispatcher signals after migration. ``None``
-    is an explicit "schema not signal-safe yet" sentinel; a normal empty
-    INTEGER-PK table still returns ``0``.
-    """
-    try:
-        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()
-    except (sqlite3.DatabaseError, AttributeError, TypeError):
-        return None
-    if not row:
-        return 0
-    value = row[0]
-    if not isinstance(value, int):
-        return None
-    return value
-
-
-def _dispatch_identities_after(
-    conn: sqlite3.Connection, high_water: Optional[int]
-) -> list[dict[str, Any]]:
-    """Capture committed task transitions even when they have no notification owner."""
-    if high_water is None:
-        return []
-    try:
-        rows = conn.execute(
-            "SELECT id, task_id, kind FROM task_events WHERE id > ? ORDER BY id",
-            (int(high_water),),
-        ).fetchall()
-        board = _board_for_connection(conn)
-    except (sqlite3.DatabaseError, AttributeError, TypeError, ValueError):
-        return []
-    return [
-        {
-            "board": board,
-            "task_id": str(row["task_id"]),
-            "event_id": int(row["id"]),
-            "event_kind": str(row["kind"]),
-        }
-        for row in rows
-    ]
-
-
-def _signal_committed_notification_outbox(
-    identities: list[dict[str, Any]],
-    dispatch_identities: list[dict[str, Any]],
-) -> None:
-    """Best-effort latency hint; durable DB recovery is authoritative."""
-    if not identities and not dispatch_identities:
-        return
-    try:
-        from gateway.control_socket import signal_gateway_control
-
-        signal_gateway_control(
-            kanban_home(),
-            "kanban_outbox_ready",
-            {"outbox": identities, "dispatch": dispatch_identities},
-            timeout=0.25,
-        )
-    except Exception:
-        # The commit is already durable. Gateway absence, timeout, process
-        # exit, or even an optional-client import failure must never turn a
-        # delivered commit into a reported rollback.
-        _log.debug("Kanban post-commit Gateway signal was lost", exc_info=True)
-
-
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -3292,10 +3088,6 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
-    outbox_high_water = _notification_outbox_high_water(conn)
-    event_high_water = _task_event_high_water(conn)
-    committed_identities: list[dict[str, Any]] = []
-    committed_dispatch_identities: list[dict[str, Any]] = []
     try:
         yield conn
     except Exception:
@@ -3309,15 +3101,6 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         raise
     else:
         try:
-            # Capture under this transaction's write lock. Reading after COMMIT
-            # could accidentally coalesce a different connection's faster
-            # follow-up commit into this signal batch.
-            committed_identities = _notification_identities_after(
-                conn, outbox_high_water
-            )
-            committed_dispatch_identities = _dispatch_identities_after(
-                conn, event_high_water
-            )
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
@@ -3330,11 +3113,6 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
-        # Synchronous and bounded: no background thread can outlive the caller,
-        # and the durable rows above survive process exit or a lost signal.
-        _signal_committed_notification_outbox(
-            committed_identities, committed_dispatch_identities
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -3377,115 +3155,6 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
-def _profile_state_db_path(profile: str) -> Path:
-    # ``default`` lives at the Hermes root while named profiles live under
-    # ``profiles/<name>``. Reuse the canonical profile resolver rather than
-    # assuming every profile has the named-profile layout.
-    from hermes_cli.profiles import get_profile_dir
-
-    return get_profile_dir(profile) / "state.db"
-
-
-def _validate_canonical_bot_chat_origin(profile: str, session_id: str) -> tuple[str, str]:
-    profile = _canonical_assignee(profile) or ""
-    session_id = str(session_id or "").strip()
-    if not profile or not session_id:
-        raise ValueError("origin_profile and origin_session_id are required together")
-    db_path = _profile_state_db_path(profile)
-    if not db_path.exists():
-        raise ValueError(f"canonical Bot Chat SessionDB is missing for profile {profile!r}")
-    from hermes_state import SessionDB
-
-    db = SessionDB(db_path=db_path)
-    try:
-        row = db.get_session_by_title("Bot Chat")
-    finally:
-        db.close()
-    if not row or row.get("id") != session_id:
-        raise ValueError("origin_session_id must be the profile's canonical Bot Chat session")
-    return profile, session_id
-
-
-def _board_for_connection(conn: sqlite3.Connection) -> str:
-    """Resolve the board identity from the open SQLite database, fail closed."""
-    main = next(
-        (row for row in conn.execute("PRAGMA database_list").fetchall() if row[1] == "main"),
-        None,
-    )
-    if main is None or not main[2]:
-        raise ValueError("cannot resolve Kanban board from SQLite connection")
-    path = Path(main[2]).resolve()
-    root = kanban_home().resolve()
-    if path == (root / "kanban.db").resolve():
-        return DEFAULT_BOARD
-    boards = (root / "kanban" / "boards").resolve()
-    try:
-        relative = path.relative_to(boards)
-    except ValueError:
-        # Explicit legacy/custom DB paths rely on the already-pinned board
-        # context; never trust a caller-supplied destination over that context.
-        return get_current_board()
-    if len(relative.parts) == 2 and relative.parts[1] == "kanban.db":
-        return _normalize_board_slug(relative.parts[0]) or DEFAULT_BOARD
-    raise ValueError("cannot resolve Kanban board from SQLite connection")
-
-
-def _resolve_task_origin(
-    conn: sqlite3.Connection,
-    *,
-    origin_profile: Optional[str],
-    origin_session_id: Optional[str],
-    board: Optional[str],
-    parents: Iterable[str],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    connection_board = _board_for_connection(conn)
-    requested_board = _normalize_board_slug(board) if board is not None else connection_board
-    if requested_board != connection_board:
-        raise ValueError(
-            f"notification origin board {requested_board!r} does not match connection board {connection_board!r}"
-        )
-    if origin_profile is not None or origin_session_id is not None:
-        profile, session_id = _validate_canonical_bot_chat_origin(
-            origin_profile or "", origin_session_id or ""
-        )
-        return profile, session_id, connection_board
-
-    parent_ids = tuple(dict.fromkeys(p for p in parents if p))
-    if not parent_ids:
-        return None, None, None
-    placeholders = ",".join("?" * len(parent_ids))
-    rows = conn.execute(
-        f"""
-        SELECT origin_profile, origin_session_id, origin_board
-          FROM tasks
-         WHERE id IN ({placeholders})
-           AND origin_profile IS NOT NULL
-           AND origin_session_id IS NOT NULL
-         ORDER BY created_at ASC, id ASC
-        """,
-        parent_ids,
-    ).fetchall()
-    if not rows:
-        return None, None, None
-    origins = {
-        (row["origin_profile"], row["origin_session_id"], row["origin_board"])
-        for row in rows
-    }
-    if len(origins) != 1:
-        raise ValueError(
-            "parent tasks have conflicting notification origins; provide an explicit destination"
-        )
-    inherited_profile, inherited_session, inherited_board = next(iter(origins))
-    if inherited_board != connection_board:
-        raise ValueError(
-            "parent notification origin belongs to a different Kanban board"
-        )
-    inherited_profile, inherited_session = _validate_canonical_bot_chat_origin(
-        inherited_profile, inherited_session
-    )
-    return inherited_profile, inherited_session, connection_board
-
-
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3511,8 +3180,6 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
-    origin_profile: Optional[str] = None,
-    origin_session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3680,13 +3347,6 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
-    origin_profile, origin_session_id, origin_board = _resolve_task_origin(
-        conn,
-        origin_profile=origin_profile,
-        origin_session_id=origin_session_id,
-        board=board,
-        parents=parents,
-    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3837,9 +3497,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id,
-                        origin_profile, origin_session_id, origin_board
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3865,9 +3524,6 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
-                        origin_profile,
-                        origin_session_id,
-                        origin_board,
                     ),
                 )
                 for pid in parents:
@@ -4641,123 +4297,6 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
-def _notification_payload_json(payload: Optional[dict]) -> Optional[str]:
-    return json.dumps(payload, ensure_ascii=False) if payload else None
-
-
-def _next_delivery_seq(conn: sqlite3.Connection, profile: str, board: str) -> int:
-    row = conn.execute(
-        "SELECT COALESCE(MAX(delivery_seq), 0) AS seq FROM kanban_notification_outbox WHERE origin_profile = ? AND board = ?",
-        (profile, board),
-    ).fetchone()
-    return int(row["seq"] if row else 0) + 1
-
-
-def _insert_notification_outbox(
-    conn: sqlite3.Connection,
-    *,
-    board: str,
-    task_id: str,
-    event_id: int,
-    run_id: Optional[int],
-    event_kind: str,
-    origin_profile: str,
-    origin_session_id: Optional[str],
-    payload_json: Optional[str],
-    created_at: int,
-    platform: str = "bot-chat",
-    chat_id: str = "",
-    thread_id: str = "",
-    user_id: Optional[str] = None,
-    user_id_alt: Optional[str] = None,
-    chat_type: Optional[str] = None,
-    delivery_mode: str = "notify",
-    delivery_metadata: Optional[str] = None,
-) -> int:
-    seq = _next_delivery_seq(conn, origin_profile, board)
-    delivery_key = f"{origin_profile}:{board}:{seq}:{event_id}:{platform}:{chat_id}:{thread_id}"
-    cur = conn.execute(
-        """
-        INSERT INTO kanban_notification_outbox (
-            delivery_seq, delivery_key, board, task_id, task_event_id, run_id,
-            event_kind, origin_profile, origin_session_id, platform, chat_id,
-            thread_id, user_id, user_id_alt, chat_type, delivery_mode,
-            delivery_metadata, payload, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (seq, delivery_key, board, task_id, event_id, run_id, event_kind,
-         origin_profile, origin_session_id, platform, chat_id or "", thread_id or "",
-         user_id, user_id_alt, chat_type, delivery_mode or "notify", delivery_metadata,
-         payload_json, created_at),
-    )
-    return int(cur.lastrowid or 0)
-
-
-def _task_origin_for_outbox(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    row = conn.execute(
-        "SELECT origin_profile, origin_session_id, origin_board FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        return None, None, None
-    return row["origin_profile"], row["origin_session_id"], row["origin_board"]
-
-
-def _write_notification_outbox_for_event(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    event_id: int,
-    kind: str,
-    payload_json: Optional[str],
-    created_at: int,
-    run_id: Optional[int],
-) -> None:
-    origin_profile, origin_session_id, origin_board = _task_origin_for_outbox(conn, task_id)
-    board = origin_board or get_current_board()
-    destinations: set[tuple[str, str, str, str]] = set()
-    if origin_profile and origin_session_id:
-        _insert_notification_outbox(
-            conn, board=board, task_id=task_id, event_id=event_id, run_id=run_id,
-            event_kind=kind, origin_profile=origin_profile, origin_session_id=origin_session_id,
-            payload_json=payload_json, created_at=created_at,
-        )
-        destinations.add((origin_profile, "bot-chat", "", ""))
-    for sub in conn.execute(
-        """
-        SELECT platform, chat_id, thread_id, user_id, user_id_alt, chat_type,
-               notifier_profile, delivery_mode, delivery_metadata
-          FROM kanban_notify_subs WHERE task_id = ?
-        """,
-        (task_id,),
-    ).fetchall():
-        profile = (sub["notifier_profile"] or origin_profile or "").strip()
-        if not profile:
-            # Legacy rows without explicit ownership remain deliberately
-            # unroutable: guessing a profile would violate tenant isolation.
-            continue
-        destination = (
-            profile,
-            sub["platform"] or "gateway",
-            sub["chat_id"] or "",
-            sub["thread_id"] or "",
-        )
-        if destination in destinations:
-            continue
-        destinations.add(destination)
-        _insert_notification_outbox(
-            conn, board=board, task_id=task_id, event_id=event_id, run_id=run_id,
-            event_kind=kind, origin_profile=profile,
-            origin_session_id=origin_session_id if profile == origin_profile else None,
-            platform=destination[1], chat_id=destination[2],
-            thread_id=destination[3], user_id=sub["user_id"],
-            user_id_alt=sub["user_id_alt"], chat_type=sub["chat_type"],
-            delivery_mode=sub["delivery_mode"] or "notify",
-            delivery_metadata=sub["delivery_metadata"], payload_json=payload_json,
-            created_at=created_at,
-        )
-
-
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4765,28 +4304,21 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> int:
-    """Record an event row and its durable notification outbox rows in one txn."""
+) -> None:
+    """Record an event row.  Called from within an already-open txn.
+
+    ``run_id`` is optional: pass the current run id so UIs can group
+    events by attempt. For events that aren't scoped to a single run
+    (task created/edited/archived, dependency promotion) leave it None
+    and the row carries NULL.
+    """
     now = int(time.time())
-    pl = _notification_payload_json(payload)
-    cur = conn.execute(
+    pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
-    if cur.lastrowid is None:  # pragma: no cover - SQLite INSERT always supplies it
-        raise sqlite3.DatabaseError("task event insert did not allocate an id")
-    event_id = int(cur.lastrowid)
-    _write_notification_outbox_for_event(
-        conn,
-        task_id=task_id,
-        event_id=event_id,
-        kind=kind,
-        payload_json=pl,
-        created_at=now,
-        run_id=run_id,
-    )
-    return event_id
 
 
 def _end_run(
@@ -11848,374 +11380,6 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
         for key, value in data.items()
         if isinstance(value, (str, int, float, bool))
     }
-
-
-def rebuild_kanban_deadlines(
-    conn: sqlite3.Connection,
-    *,
-    stale_timeout_seconds: int = 0,
-    retention_days: int = 30,
-    now: Optional[int] = None,
-) -> int:
-    """Rebuild the persisted nearest-deadline index from authoritative rows.
-
-    This is a bounded startup/recovery operation, not a steady-state scan.
-    Subsequent Gateway wakeups pop only due ids and re-arm from changed task
-    state.  Scheduled cards have no timestamp in the v1 schema and therefore
-    remain explicitly operator-resumed rather than inventing a hidden start.
-    """
-    ts = int(time.time()) if now is None else int(now)
-    try:
-        stale_after = max(0, int(stale_timeout_seconds))
-    except (TypeError, ValueError):
-        stale_after = 0
-    try:
-        retention_seconds = max(0, int(retention_days)) * 86400
-    except (TypeError, ValueError):
-        retention_seconds = 30 * 86400
-
-    rows: list[tuple[str, str, int, Optional[str], int]] = []
-    running = conn.execute(
-        "SELECT id, claim_expires, started_at, max_runtime_seconds, "
-        "last_heartbeat_at FROM tasks WHERE status = 'running'"
-    ).fetchall()
-    for row in running:
-        task_id = str(row["id"])
-        if row["claim_expires"] is not None:
-            rows.append(("claim_expiry", task_id, int(row["claim_expires"]), None, ts))
-        if row["started_at"] is not None and row["max_runtime_seconds"] is not None:
-            rows.append((
-                "runtime_timeout",
-                task_id,
-                int(row["started_at"]) + int(row["max_runtime_seconds"]),
-                None,
-                ts,
-            ))
-        if stale_after and row["last_heartbeat_at"] is not None:
-            rows.append((
-                "stale_check",
-                task_id,
-                int(row["last_heartbeat_at"]) + stale_after,
-                None,
-                ts,
-            ))
-
-    # Timed retry starts (currently provider rate-limit cooldowns) are persisted
-    # as lifecycle deadlines so a deferred ready task gets one exact wake when
-    # its guard expires rather than relying on a dispatcher sweep.
-    retry_cooldown = _resolve_rate_limit_cooldown_seconds()
-    if retry_cooldown > 0:
-        deferred = conn.execute(
-            """
-            SELECT t.id, r.ended_at
-              FROM tasks t
-              JOIN task_runs r ON r.id = (
-                    SELECT r2.id FROM task_runs r2
-                     WHERE r2.task_id = t.id AND r2.ended_at IS NOT NULL
-                     ORDER BY r2.ended_at DESC, r2.id DESC LIMIT 1
-              )
-             WHERE t.status IN ('ready', 'review')
-               AND r.outcome = 'rate_limited'
-            """
-        ).fetchall()
-        rows.extend(
-            (
-                "scheduled_start",
-                str(row["id"]),
-                int(row["ended_at"]) + retry_cooldown,
-                None,
-                ts,
-            )
-            for row in deferred
-        )
-
-    if retention_seconds:
-        settled = conn.execute(
-            """
-            SELECT t.id,
-                   COALESCE((SELECT MAX(e.created_at) FROM task_events e
-                              WHERE e.task_id = t.id),
-                            t.completed_at, t.created_at, 0) AS settled_at
-              FROM tasks t
-             WHERE t.status = 'done'
-               AND EXISTS (SELECT 1 FROM kanban_notify_subs s
-                            WHERE s.task_id = t.id)
-            """
-        ).fetchall()
-        rows.extend(
-            (
-                "retention_gc",
-                str(row["id"]),
-                int(row["settled_at"]) + retention_seconds,
-                None,
-                ts,
-            )
-            for row in settled
-        )
-
-    with write_txn(conn):
-        conn.execute("DELETE FROM kanban_deadlines")
-        conn.executemany(
-            "INSERT INTO kanban_deadlines "
-            "(kind, task_id, due_at, payload, updated_at) VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
-    return len(rows)
-
-
-def next_kanban_deadline(conn: sqlite3.Connection) -> Optional[int]:
-    row = conn.execute("SELECT MIN(due_at) AS due_at FROM kanban_deadlines").fetchone()
-    if row is None or row["due_at"] is None:
-        return None
-    return int(row["due_at"])
-
-
-def pop_due_kanban_deadlines(
-    conn: sqlite3.Connection,
-    *,
-    now: Optional[int] = None,
-    limit: int = 100,
-) -> list[dict[str, Any]]:
-    """Atomically remove and return only lifecycle ids due by ``now``."""
-    ts = int(time.time()) if now is None else int(now)
-    cap = max(1, int(limit))
-    with write_txn(conn):
-        due = conn.execute(
-            "SELECT kind, task_id, due_at, payload FROM kanban_deadlines "
-            "WHERE due_at <= ? ORDER BY due_at, kind, task_id LIMIT ?",
-            (ts, cap),
-        ).fetchall()
-        if due:
-            conn.executemany(
-                "DELETE FROM kanban_deadlines WHERE kind = ? AND task_id = ?",
-                [(row["kind"], row["task_id"]) for row in due],
-            )
-    return [dict(row) for row in due]
-
-
-def list_pending_gateway_notification_outbox(
-    conn: sqlite3.Connection,
-    *,
-    profiles: Iterable[str],
-    board: Optional[str] = None,
-    limit: int = 100,
-) -> list[dict[str, Any]]:
-    """Return the bounded oldest unacked adapter rows for startup recovery."""
-    owners = sorted({
-        _canonical_assignee(value) or ""
-        for value in profiles
-        if _canonical_assignee(value)
-    })
-    if not owners:
-        return []
-    placeholders = ",".join("?" for _ in owners)
-    query = (
-        "SELECT o.* FROM kanban_notification_outbox o "
-        f"WHERE o.origin_profile IN ({placeholders}) "
-        "AND o.platform <> 'bot-chat' "
-        "AND NOT EXISTS ("
-        " SELECT 1 FROM kanban_notification_acks a"
-        " WHERE a.outbox_id = o.id"
-        "   AND a.consumer = 'gateway:' || o.origin_profile || ':' ||"
-        "       o.platform || ':' || o.chat_id || ':' || o.thread_id)"
-    )
-    params: list[Any] = list(owners)
-    if board is not None:
-        query += " AND o.board = ?"
-        params.append(_normalize_board_slug(board) or board)
-    query += " ORDER BY o.id LIMIT ?"
-    params.append(max(1, int(limit)))
-    return [dict(row) for row in conn.execute(query, params).fetchall()]
-
-
-def list_pending_bot_chat_notification_outbox(
-    conn: sqlite3.Connection,
-    *,
-    profiles: Iterable[str],
-    board: Optional[str] = None,
-    limit: int = 500,
-) -> list[dict[str, Any]]:
-    """Return durable passive-inbox rows owned by the served profiles."""
-    owners = sorted({
-        _canonical_assignee(value) or ""
-        for value in profiles
-        if _canonical_assignee(value)
-    })
-    if not owners:
-        return []
-    placeholders = ",".join("?" for _ in owners)
-    query = (
-        "SELECT o.* FROM kanban_notification_outbox o "
-        f"WHERE o.origin_profile IN ({placeholders}) "
-        "AND o.platform = 'bot-chat'"
-    )
-    params: list[Any] = list(owners)
-    if board is not None:
-        query += " AND o.board = ?"
-        params.append(_normalize_board_slug(board) or board)
-    query += " ORDER BY o.id LIMIT ?"
-    params.append(max(1, int(limit)))
-    return [dict(row) for row in conn.execute(query, params).fetchall()]
-
-
-def get_notification_outbox_by_ids(
-    conn: sqlite3.Connection,
-    outbox_ids: Iterable[int],
-) -> list[dict[str, Any]]:
-    """Fetch exact durable identities named by a control-socket signal."""
-    ids = sorted({int(value) for value in outbox_ids if int(value) > 0})
-    if not ids:
-        return []
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT * FROM kanban_notification_outbox WHERE id IN ({placeholders}) ORDER BY id",
-        ids,
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def notification_outbox_acknowledged(
-    conn: sqlite3.Connection,
-    outbox_id: int,
-    *,
-    consumer: str,
-) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM kanban_notification_acks WHERE consumer = ? AND outbox_id = ?",
-        (str(consumer or "").strip(), int(outbox_id)),
-    ).fetchone()
-    return row is not None
-
-
-def list_notification_outbox(
-    conn: sqlite3.Connection,
-    *,
-    profile: str,
-    board: Optional[str] = None,
-    after_id: int = 0,
-    limit: int = 100,
-    include_delivered: bool = False,
-    consumer: Optional[str] = None,
-) -> list[dict[str, Any]]:
-    profile = _canonical_assignee(profile) or ""
-    consumer = str(consumer or "").strip()
-    if not profile:
-        return []
-    query = (
-        "SELECT o.* FROM kanban_notification_outbox AS o "
-        "WHERE o.origin_profile = ? AND o.id > ?"
-    )
-    params: list[Any] = [profile, int(after_id)]
-    if board is not None:
-        query += " AND o.board = ?"
-        params.append(_normalize_board_slug(board) or board)
-    if not include_delivered:
-        if consumer:
-            query += (
-                " AND NOT EXISTS (SELECT 1 FROM kanban_notification_acks AS a "
-                "WHERE a.consumer = ? AND a.outbox_id = o.id)"
-            )
-            params.append(consumer)
-        else:
-            # Legacy single-consumer callers retain the historical diagnostic
-            # semantics. Multi-surface drains must pass ``consumer``.
-            query += " AND o.delivered_at IS NULL"
-    query += " ORDER BY o.id LIMIT ?"
-    params.append(max(1, int(limit)))
-    return [dict(row) for row in conn.execute(query, params).fetchall()]
-
-
-def ack_notification_outbox(
-    conn: sqlite3.Connection,
-    outbox_id: int,
-    *,
-    consumer: str,
-    delivery_key: str,
-) -> bool:
-    consumer = str(consumer or "").strip()
-    delivery_key = str(delivery_key or "").strip()
-    if not consumer or not delivery_key:
-        raise ValueError("consumer and delivery_key are required")
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT delivery_key FROM kanban_notification_outbox WHERE id = ?",
-            (int(outbox_id),),
-        ).fetchone()
-        if row is None or row["delivery_key"] != delivery_key:
-            return False
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notification_acks (
-                consumer, outbox_id, delivery_key, acknowledged_at
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (consumer, int(outbox_id), delivery_key, int(time.time())),
-        )
-        if cur.rowcount != 1:
-            existing = conn.execute(
-                """
-                SELECT 1 FROM kanban_notification_acks
-                 WHERE consumer = ? AND outbox_id = ? AND delivery_key = ?
-                """,
-                (consumer, int(outbox_id), delivery_key),
-            ).fetchone()
-            return existing is not None
-        # Retain the first acknowledgement on the outbox row for compatibility
-        # with existing single-destination diagnostics. Per-consumer truth is
-        # the acknowledgement table above.
-        conn.execute(
-            """
-            UPDATE kanban_notification_outbox
-               SET delivered_at = COALESCE(delivered_at, ?),
-                   delivered_to = COALESCE(delivered_to, ?)
-             WHERE id = ?
-            """,
-            (int(time.time()), consumer, int(outbox_id)),
-        )
-        return True
-
-
-def set_notification_cursor(
-    conn: sqlite3.Connection,
-    consumer: str,
-    profile: str,
-    board: str,
-    last_outbox_id: int,
-) -> None:
-    consumer = str(consumer or "").strip()
-    profile = _canonical_assignee(profile) or ""
-    board = _normalize_board_slug(board) or board
-    if not consumer or not profile or not board:
-        raise ValueError("consumer, profile, and board are required")
-    now = int(time.time())
-    with write_txn(conn):
-        conn.execute(
-            """
-            INSERT INTO kanban_notification_cursors (
-                consumer, origin_profile, board, last_outbox_id, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(consumer, origin_profile, board) DO UPDATE SET
-                last_outbox_id = MAX(kanban_notification_cursors.last_outbox_id, excluded.last_outbox_id),
-                updated_at = excluded.updated_at
-            """,
-            (consumer, profile, board, int(last_outbox_id), now),
-        )
-
-
-def get_notification_cursor(
-    conn: sqlite3.Connection,
-    consumer: str,
-    profile: str,
-    board: str,
-) -> int:
-    row = conn.execute(
-        """
-        SELECT last_outbox_id FROM kanban_notification_cursors
-         WHERE consumer = ? AND origin_profile = ? AND board = ?
-        """,
-        (str(consumer or "").strip(), _canonical_assignee(profile) or "", _normalize_board_slug(board) or board),
-    ).fetchone()
-    return int(row["last_outbox_id"]) if row else 0
 
 
 def add_notify_sub(
