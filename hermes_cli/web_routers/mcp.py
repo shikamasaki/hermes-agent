@@ -300,7 +300,10 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     oauth_config = cfg.get("oauth")
     if not isinstance(oauth_config, dict):
         oauth_config = None
-    resolved_credential_home = resolve_credential_home(name, oauth_config)
+    try:
+        resolved_credential_home = resolve_credential_home(name, oauth_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     credential_home = (
         str(resolved_credential_home)
         if resolved_credential_home is not None

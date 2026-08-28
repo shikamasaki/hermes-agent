@@ -229,6 +229,30 @@ class TestProfileScopedMcp:
         assert resp.status_code == 200
         assert resp.json()["tools"] == [{"name": "tool-a", "description": "desc"}]
 
+    def test_mcp_auth_invalid_credential_profile_returns_400(
+        self,
+        client,
+        isolated_profiles,
+    ):
+        worker_home = isolated_profiles["worker_beta"]
+        worker_home.joinpath("config.yaml").write_text(
+            "mcp_servers:\n"
+            "  reports:\n"
+            "    url: https://example.test/mcp\n"
+            "    auth: oauth\n"
+            "    oauth:\n"
+            "      credential_profile: missing\n",
+            encoding="utf-8",
+        )
+
+        response = client.post(
+            "/api/mcp/servers/reports/auth",
+            params={"profile": "worker_beta"},
+        )
+
+        assert response.status_code == 400
+        assert "credential profile 'missing' does not exist" in response.json()["detail"]
+
     def test_mcp_replace_cleans_removed_owner_profile_state(
         self,
         client,
