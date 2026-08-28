@@ -150,6 +150,7 @@ jobs:
           # run with both an unguessable-per-run token and the exact head SHA.
           SYNC_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SYNC_SHA:0:12}"
           gh workflow run ci.yaml \
+            --repo "$GITHUB_REPOSITORY" \
             --ref sync-upstream-main \
             -f sync_token="$SYNC_TOKEN"
 
@@ -157,6 +158,7 @@ jobs:
           for _ in {1..30}; do
             RUN_ID="$(
               gh run list \
+                --repo "$GITHUB_REPOSITORY" \
                 --workflow ci.yaml \
                 --branch sync-upstream-main \
                 --event workflow_dispatch \
@@ -173,7 +175,7 @@ jobs:
             exit 1
           fi
 
-          gh run watch "$RUN_ID" --exit-status
+          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
 
           # Fail closed if the branch or PR moved while CI was running.
           remote_head="$(git ls-remote --heads origin refs/heads/sync-upstream-main | cut -f1)"

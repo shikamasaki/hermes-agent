@@ -1,6 +1,7 @@
 """Contract tests for the fork's self-completing upstream-sync workflows."""
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -69,6 +70,15 @@ def test_clean_sync_dispatches_and_selects_ci_by_token_and_exact_sha():
     assert "headSha" in scripts
     assert "SYNC_SHA" in scripts
     assert "gh run watch" in scripts
+
+
+def test_clean_sync_scopes_gh_workflow_and_run_commands_to_the_fork():
+    scripts = _run_scripts(SYNC_WORKFLOW)
+    assert re.search(
+        r'gh workflow run ci\.yaml \\\n\s+--repo "\$GITHUB_REPOSITORY"', scripts
+    )
+    assert re.search(r'gh run list \\\n\s+--repo "\$GITHUB_REPOSITORY"', scripts)
+    assert 'gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status' in scripts
 
 
 def test_merge_is_exact_sha_guarded_and_preserves_upstream_ancestry():
