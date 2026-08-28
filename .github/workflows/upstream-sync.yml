@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: upstream-sync-main
@@ -114,7 +115,7 @@ jobs:
           echo "Hermes Gateway accepted the conflict event; failing this run visibly."
           exit 1
 
-      - name: Push sync branch and create PR
+      - name: Validate and merge sync PR
         if: steps.merge.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,18 +125,77 @@ jobs:
         run: |
           set -euo pipefail
           git push origin sync-upstream-main --force-with-lease
+          SYNC_SHA="$(git rev-parse HEAD)"
 
           PR_NUMBER="$(
             gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&head=${GITHUB_REPOSITORY_OWNER}:sync-upstream-main" \
               --jq '.[0].number // empty'
           )"
           if [[ -z "$PR_NUMBER" ]]; then
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
-              -f title="$PR_TITLE" \
-              -f body="$PR_BODY" \
-              -f base=main \
-              -f head=sync-upstream-main \
-              --jq '.html_url'
+            PR_NUMBER="$(
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+                -f title="$PR_TITLE" \
+                -f body="$PR_BODY" \
+                -f base=main \
+                -f head=sync-upstream-main \
+                --jq '.number'
+            )"
+            echo "Created PR #$PR_NUMBER."
           else
             echo "Updated existing PR #$PR_NUMBER."
           fi
+
+          # PRs created with GITHUB_TOKEN do not recursively trigger the
+          # pull_request workflow. Dispatch CI explicitly and correlate the
+          # run with both an unguessable-per-run token and the exact head SHA.
+          SYNC_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SYNC_SHA:0:12}"
+          gh workflow run ci.yaml \
+            --ref sync-upstream-main \
+            -f sync_token="$SYNC_TOKEN"
+
+          RUN_ID=""
+          for _ in {1..30}; do
+            RUN_ID="$(
+              gh run list \
+                --workflow ci.yaml \
+                --branch sync-upstream-main \
+                --event workflow_dispatch \
+                --limit 20 \
+                --json databaseId,displayTitle,headSha \
+                --jq ".[] | select(.headSha == \"$SYNC_SHA\" and .displayTitle == \"CI upstream-sync $SYNC_TOKEN\") | .databaseId" \
+                | head -n 1
+            )"
+            [[ -n "$RUN_ID" ]] && break
+            sleep 5
+          done
+          if [[ -z "$RUN_ID" ]]; then
+            echo "Could not locate dispatched CI for exact SHA $SYNC_SHA."
+            exit 1
+          fi
+
+          gh run watch "$RUN_ID" --exit-status
+
+          # Fail closed if the branch or PR moved while CI was running.
+          remote_head="$(git ls-remote --heads origin refs/heads/sync-upstream-main | cut -f1)"
+          [[ "$remote_head" == "$SYNC_SHA" ]] || {
+            echo "Sync branch moved after CI: expected $SYNC_SHA, got $remote_head"
+            exit 1
+          }
+          PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER")"
+          jq -e \
+            --arg sha "$SYNC_SHA" \
+            '.state == "open" and .base.ref == "main" and .head.ref == "sync-upstream-main" and .head.sha == $sha' \
+            <<<"$PR_JSON" >/dev/null
+
+          # Use a real merge commit. Squashing would discard upstream ancestry
+          # and make the same upstream commits appear unsynced on the next day.
+          MERGE_JSON="$(
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER/merge" \
+              -f merge_method=merge \
+              -f sha="$SYNC_SHA" \
+              -f commit_title="$PR_TITLE"
+          )"
+          jq -e '.merged == true' <<<"$MERGE_JSON" >/dev/null
+
+          git fetch origin main
+          git merge-base --is-ancestor "$SYNC_SHA" origin/main
