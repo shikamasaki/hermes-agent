@@ -5866,9 +5866,12 @@ DELEGATE_TASK_SCHEMA = {
                 # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
-            # Legacy top-level single-task fields (including route, role,
-            # output_schema, and background) remain handler-accepted but are
-            # deliberately unadvertised. Model-facing spawns use tasks=[...].
+            # Legacy top-level role, output_schema, and background remain
+            # handler-accepted but deliberately unadvertised. Keep routing
+            # fields advertised for legacy single-task callers and catalog
+            # selection; model-facing batch spawns carry the same fields in
+            # each tasks[] entry.
+            **_routing_schema_properties(),
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
