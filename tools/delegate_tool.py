@@ -5866,32 +5866,9 @@ DELEGATE_TASK_SCHEMA = {
                 # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "output_schema": {
-                "type": "object",
-                "description": (
-                    "Optional JSON Schema for the single-goal form — the "
-                    "subagent's final answer must validate against it "
-                    "(same semantics as tasks[].output_schema)."
-                ),
-            },
-            **_routing_schema_properties(),
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
+            # Legacy top-level single-task fields (including route, role,
+            # output_schema, and background) remain handler-accepted but are
+            # deliberately unadvertised. Model-facing spawns use tasks=[...].
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],

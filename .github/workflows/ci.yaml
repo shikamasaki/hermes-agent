@@ -18,6 +18,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      sync_token:
+        description: 'Correlation token for trusted upstream-sync dispatches'
+        required: false
+        type: string
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI upstream-sync {0}', inputs.sync_token) || 'CI' }}
 
 permissions:
   contents: read
@@ -61,8 +69,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
