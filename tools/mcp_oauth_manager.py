@@ -829,7 +829,11 @@ class MCPOAuthManager:
 
         from tools.mcp_oauth import remove_oauth_tokens, resolve_credential_home
 
-        config = entry.oauth_config if entry is not None else oauth_config
+        config = (
+            oauth_config
+            if oauth_config is not None
+            else (entry.oauth_config if entry is not None else None)
+        )
         credential_home = resolve_credential_home(server_name, config)
         remove_oauth_tokens(
             server_name,

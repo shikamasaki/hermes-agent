@@ -49,6 +49,14 @@ def test_token_presence_uses_credential_profile(monkeypatch, tmp_path) -> None:
     assert not (caller_home / "mcp-tokens" / "tracery.json").exists()
 
 
+def test_token_presence_rejects_missing_credential_profile(monkeypatch) -> None:
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False)
+    cfg = {"oauth": {"credential_profile": "missing"}}
+
+    with pytest.raises(ValueError, match="does not exist"):
+        _oauth_tokens_present("tracery", cfg)
+
+
 def test_storage_round_trip_stays_in_credential_profile(monkeypatch, tmp_path) -> None:
     caller_home = tmp_path / "caller"
     owner_home = tmp_path / "owner"
@@ -88,6 +96,35 @@ def test_manager_remove_deletes_owner_only(monkeypatch, tmp_path) -> None:
         path.write_text("{}")
 
     manager = MCPOAuthManager()
+    manager.remove(
+        "tracery",
+        hermes_home=caller_home,
+        oauth_config={"credential_profile": "welby"},
+    )
+
+    assert caller_token.exists()
+    assert not owner_token.exists()
+
+
+def test_manager_remove_prefers_explicit_config_over_stale_cache(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    caller_home = tmp_path / "caller"
+    owner_home = tmp_path / "owner"
+    _install_profile(monkeypatch, owner_home)
+
+    caller_token = caller_home / "mcp-tokens" / "tracery.json"
+    owner_token = owner_home / "mcp-tokens" / "tracery.json"
+    for path in (caller_token, owner_token):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+
+    manager = MCPOAuthManager()
+    manager._entries[manager._key("tracery", caller_home)] = _ProviderEntry(
+        "https://beproud.tracery.jp/mcp",
+        {},
+    )
     manager.remove(
         "tracery",
         hermes_home=caller_home,

@@ -418,6 +418,10 @@ def _oauth_tokens_present(name: str, server_config: dict | None = None) -> bool:
             name,
             hermes_home=resolve_credential_home(name, oauth_config),
         ).has_cached_tokens()
+    except ValueError:
+        # Invalid or missing credential_profile is a configuration error, not
+        # evidence that OAuth succeeded. Surface it to the caller fail-closed.
+        raise
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
         # Be permissive on unexpected errors: don't block a real success.
