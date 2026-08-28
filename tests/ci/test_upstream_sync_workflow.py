@@ -81,6 +81,20 @@ def test_clean_sync_scopes_gh_workflow_and_run_commands_to_the_fork():
     assert 'gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status' in scripts
 
 
+def test_clean_sync_reruns_failed_ci_once_before_failing_closed():
+    scripts = _run_scripts(SYNC_WORKFLOW)
+    watch = 'gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status'
+    rerun = 'gh run rerun "$RUN_ID" --repo "$GITHUB_REPOSITORY" --failed'
+    assert f"if ! {watch}; then" in scripts
+    assert scripts.count(rerun) == 1
+    assert scripts.count(watch) == 2
+    assert re.search(
+        r'previous_attempt="\$\(\s+gh run view "\$RUN_ID"', scripts
+    )
+    assert "current_attempt > previous_attempt" in scripts
+    assert '[[ "$rerun_started" == true ]]' in scripts
+
+
 def test_merge_is_exact_sha_guarded_and_preserves_upstream_ancestry():
     scripts = _run_scripts(SYNC_WORKFLOW)
     assert 'sha="$SYNC_SHA"' in scripts
