@@ -175,7 +175,42 @@ jobs:
             exit 1
           fi
 
-          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+          # Hosted runners occasionally expose a known timing flake under full
+          # suite pressure. Retry failed jobs once; a deterministic failure
+          # fails again and still blocks the merge.
+          if ! gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status; then
+            echo "CI failed; rerunning failed jobs once before failing closed."
+            previous_attempt="$(
+              gh run view "$RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json attempt \
+                --jq '.attempt'
+            )"
+            gh run rerun "$RUN_ID" --repo "$GITHUB_REPOSITORY" --failed
+
+            # The rerun API is asynchronous. Wait until GitHub exposes a new
+            # attempt so watch cannot observe the completed first attempt and
+            # return its stale failure immediately.
+            rerun_started=false
+            for _ in {1..30}; do
+              current_attempt="$(
+                gh run view "$RUN_ID" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --json attempt \
+                  --jq '.attempt'
+              )"
+              if (( current_attempt > previous_attempt )); then
+                rerun_started=true
+                break
+              fi
+              sleep 2
+            done
+            [[ "$rerun_started" == true ]] || {
+              echo "GitHub did not expose the requested CI rerun in time."
+              exit 1
+            }
+            gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+          fi
 
           # Fail closed if the branch or PR moved while CI was running.
           remote_head="$(git ls-remote --heads origin refs/heads/sync-upstream-main | cut -f1)"
