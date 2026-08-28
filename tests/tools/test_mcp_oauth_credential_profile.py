@@ -84,6 +84,35 @@ def test_storage_round_trip_stays_in_credential_profile(monkeypatch, tmp_path) -
     assert not (caller_home / "mcp-tokens" / "tracery.json").exists()
 
 
+def test_manager_rebuilds_provider_when_credential_profile_changes(monkeypatch) -> None:
+    manager = MCPOAuthManager()
+    built = []
+
+    def _build(server_name, entry):
+        provider = SimpleNamespace(build_index=len(built))
+        built.append((server_name, dict(entry.oauth_config or {}), provider))
+        return provider
+
+    monkeypatch.setattr(manager, "_build_provider", _build)
+
+    first = manager.get_or_build_provider(
+        "tracery",
+        "https://beproud.tracery.jp/mcp",
+        {},
+    )
+    second = manager.get_or_build_provider(
+        "tracery",
+        "https://beproud.tracery.jp/mcp",
+        {"credential_profile": "welby"},
+    )
+
+    assert first is not second
+    assert [config for _, config, _ in built] == [
+        {},
+        {"credential_profile": "welby"},
+    ]
+
+
 def test_manager_remove_deletes_owner_only(monkeypatch, tmp_path) -> None:
     caller_home = tmp_path / "caller"
     owner_home = tmp_path / "owner"

@@ -689,10 +689,19 @@ class MCPOAuthManager:
         key = self._key(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)
+            config_changed = entry is not None and dict(entry.oauth_config or {}) != dict(
+                oauth_config or {}
+            )
             if entry is not None and entry.server_url != server_url:
                 logger.info(
                     "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
                     server_name, entry.server_url, server_url,
+                )
+                entry = None
+            elif config_changed:
+                logger.info(
+                    "MCP OAuth '%s': OAuth config changed, discarding cache",
+                    server_name,
                 )
                 entry = None
 
