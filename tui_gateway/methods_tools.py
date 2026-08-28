@@ -2270,7 +2270,7 @@ def _(rid, params: dict) -> dict:
         details: dict = {}
         try:
             tools = _probe_single_server(name, cfg, details=details)
-            token_present = _oauth_tokens_present(name) if needs_oauth_token else True
+            token_present = _oauth_tokens_present(name, cfg) if needs_oauth_token else True
         except Exception as exc:
             return _ok(
                 rid,
@@ -2279,7 +2279,7 @@ def _(rid, params: dict) -> dict:
                     "error": str(exc),
                     "tools": [],
                     "oauth_needed": needs_oauth_token,
-                    "oauth_tokens_present": _oauth_tokens_present(name)
+                    "oauth_tokens_present": _oauth_tokens_present(name, cfg)
                     if needs_oauth_token
                     else None,
                 },

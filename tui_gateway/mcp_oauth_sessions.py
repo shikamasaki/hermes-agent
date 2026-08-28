@@ -186,7 +186,7 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
             set_secret_scope,
         )
         from tools.mcp_dashboard_oauth import dashboard_oauth_flow
-        from tools.mcp_oauth import force_interactive_oauth
+        from tools.mcp_oauth import force_interactive_oauth, resolve_credential_home
         from tools.mcp_oauth_manager import get_manager
 
         home_token = set_hermes_home_override(hermes_home)
@@ -196,17 +196,30 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
                 from tools.mcp_oauth import HermesTokenStorage
 
                 manager = get_manager()
-                storage = HermesTokenStorage(server_name)
+                oauth_config = cfg.get("oauth")
+                if not isinstance(oauth_config, dict):
+                    oauth_config = None
+                credential_home = resolve_credential_home(server_name, oauth_config)
+                storage = HermesTokenStorage(
+                    server_name,
+                    hermes_home=(
+                        credential_home if credential_home is not None else hermes_home
+                    ),
+                )
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
-                    previous_entry = manager.remove(server_name, hermes_home=hermes_home)
+                    previous_entry = manager.remove(
+                        server_name,
+                        hermes_home=hermes_home,
+                        oauth_config=oauth_config,
+                    )
                     tools = _probe_single_server(
                         server_name,
                         cfg,
                         connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
                     )
-                    if not _oauth_tokens_present(server_name):
+                    if not _oauth_tokens_present(server_name, cfg):
                         raise RuntimeError(
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."

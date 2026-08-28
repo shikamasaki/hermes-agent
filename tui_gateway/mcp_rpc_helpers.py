@@ -59,7 +59,7 @@ def summarize_server(name: str, cfg: dict) -> Dict[str, Any]:
         str(key).lower() == "authorization" for key in headers
     ):
         auth = "header"
-    tokens_present = _oauth_tokens_present(name) if auth == "oauth" else None
+    tokens_present = _oauth_tokens_present(name, cfg) if auth == "oauth" else None
     return {
         "name": name,
         "transport": transport,

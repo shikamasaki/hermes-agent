@@ -189,6 +189,47 @@ _USER_SKIPPED_SENTINEL = "__hermes_user_skipped__"
 # ---------------------------------------------------------------------------
 
 
+def resolve_credential_home(server_name: str, oauth_config: dict | None) -> Path | None:
+    """Resolve an optional OAuth credential-owning Hermes profile.
+
+    Only an existing, validated profile name is accepted. Arbitrary filesystem
+    paths are deliberately unsupported so MCP config cannot escape the Hermes
+    profile namespace.
+    """
+    cfg = oauth_config or {}
+    if "credential_profile" not in cfg or cfg["credential_profile"] is None:
+        return None
+
+    profile = cfg["credential_profile"]
+    if not isinstance(profile, str) or not profile.strip():
+        raise ValueError(
+            f"MCP OAuth for '{server_name}': credential_profile must be a "
+            "non-empty Hermes profile name"
+        )
+
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+
+    canonical = normalize_profile_name(profile)
+    try:
+        validate_profile_name(canonical)
+    except ValueError as exc:
+        raise ValueError(
+            f"MCP OAuth for '{server_name}': invalid credential_profile "
+            f"{profile!r}: {exc}"
+        ) from exc
+    if not profile_exists(canonical):
+        raise ValueError(
+            f"MCP OAuth for '{server_name}': credential profile "
+            f"{canonical!r} does not exist"
+        )
+    return get_profile_dir(canonical)
+
+
 def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
     """Return the directory for MCP OAuth token files.
 
@@ -1911,7 +1952,10 @@ def build_oauth_auth(
     apply_oauth_provider_defaults(
         cfg, server_name=server_name, server_url=server_url
     )
-    storage = HermesTokenStorage(server_name)
+    storage = HermesTokenStorage(
+        server_name,
+        hermes_home=resolve_credential_home(server_name, cfg),
+    )
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(

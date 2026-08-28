@@ -759,12 +759,18 @@ class MCPOAuthManager:
             return None
 
         cfg = dict(entry.oauth_config or {})
-        from tools.mcp_oauth import apply_oauth_provider_defaults
+        from tools.mcp_oauth import (
+            apply_oauth_provider_defaults,
+            resolve_credential_home,
+        )
 
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(
+            server_name,
+            hermes_home=resolve_credential_home(server_name, cfg),
+        )
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -811,6 +817,7 @@ class MCPOAuthManager:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        oauth_config: dict | None = None,
     ) -> _ProviderEntry | None:
         """Evict the provider from cache AND delete tokens from disk.
 
@@ -820,8 +827,14 @@ class MCPOAuthManager:
         with self._entries_lock:
             entry = self._entries.pop(self._key(server_name, hermes_home), None)
 
-        from tools.mcp_oauth import remove_oauth_tokens
-        remove_oauth_tokens(server_name, hermes_home=hermes_home)
+        from tools.mcp_oauth import remove_oauth_tokens, resolve_credential_home
+
+        config = entry.oauth_config if entry is not None else oauth_config
+        credential_home = resolve_credential_home(server_name, config)
+        remove_oauth_tokens(
+            server_name,
+            hermes_home=credential_home if credential_home is not None else hermes_home,
+        )
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
             server_name,
@@ -867,14 +880,23 @@ class MCPOAuthManager:
         fresh tokens to disk, and on the next tool call the running MCP
         session picks them up without a restart.
         """
-        from tools.mcp_oauth import _get_token_dir, _safe_filename
+        from tools.mcp_oauth import (
+            _get_token_dir,
+            _safe_filename,
+            resolve_credential_home,
+        )
 
         entry = self._entries.get(self._key(server_name, hermes_home))
         if entry is None or entry.provider is None:
             return False
 
         async with entry.lock:
-            tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            credential_home = resolve_credential_home(
+                server_name,
+                entry.oauth_config,
+            )
+            token_home = credential_home if credential_home is not None else hermes_home
+            tokens_path = _get_token_dir(token_home) / f"{_safe_filename(server_name)}.json"
             try:
                 mtime_ns = tokens_path.stat().st_mtime_ns
             except (FileNotFoundError, OSError):
