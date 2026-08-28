@@ -199,6 +199,35 @@ def test_remove_scoped_to_profile(hermes_root):
     assert "temp" in _read_yaml(root / "profiles" / "other" / "config.yaml").get("mcp_servers", {})
 
 
+def test_remove_cleans_shared_owner_oauth_state(hermes_root):
+    root = hermes_root
+    _result(
+        _call(
+            "mcp.servers.add",
+            {
+                "profile": "work",
+                "name": "tracery",
+                "config": {
+                    "url": "https://beproud.tracery.jp/mcp",
+                    "auth": "oauth",
+                    "oauth": {"credential_profile": "other"},
+                },
+            },
+        )
+    )
+    owner_token = root / "profiles" / "other" / "mcp-tokens" / "tracery.json"
+    owner_token.parent.mkdir(parents=True)
+    owner_token.write_text("{}", encoding="utf-8")
+
+    resp = _result(
+        _call("mcp.servers.remove", {"profile": "work", "name": "tracery"})
+    )
+
+    assert resp["removed"] is True
+    assert not owner_token.exists()
+    assert not (root / "profiles" / "work" / "mcp-tokens" / "tracery.json").exists()
+
+
 def test_add_duplicate_and_missing_errors(hermes_root):
     _result(
         _call(

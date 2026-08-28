@@ -295,12 +295,25 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         raise HTTPException(status_code=400, detail="This server uses header/API-key auth, not OAuth")
     cfg["auth"] = "oauth"
 
+    from tools.mcp_oauth import resolve_credential_home
+
+    oauth_config = cfg.get("oauth")
+    if not isinstance(oauth_config, dict):
+        oauth_config = None
+    resolved_credential_home = resolve_credential_home(name, oauth_config)
+    credential_home = (
+        str(resolved_credential_home)
+        if resolved_credential_home is not None
+        else flow_home
+    )
+
     flow_id = secrets.token_urlsafe(24)
     flow = DashboardOAuthFlow(
         flow_id=flow_id,
         server_name=name,
         profile=profile,
         hermes_home=flow_home,
+        credential_home=credential_home,
         redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri")
         or _mcp_oauth_callback_url(request, name),
         reconnect_live=flow_home == process_home,
@@ -317,7 +330,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
             )
         if any(
             flow.server_name == name
-            and flow.hermes_home == flow_home
+            and (flow.credential_home or flow.hermes_home) == credential_home
             and not flow.worker_done
             for flow in _mcp_oauth_flows.values()
         ):

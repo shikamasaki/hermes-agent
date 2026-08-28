@@ -2326,11 +2326,19 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from hermes_cli.mcp_config import _remove_mcp_server
+        from hermes_cli.mcp_config import _get_mcp_servers, _remove_mcp_server
 
+        server_config = _get_mcp_servers().get(name)
         removed = _remove_mcp_server(name)
         if not removed:
             return _err(rid, 4064, f"server '{name}' not found")
+        if isinstance(server_config, dict):
+            from tools.mcp_oauth_manager import get_manager
+
+            oauth_config = server_config.get("oauth")
+            if not isinstance(oauth_config, dict):
+                oauth_config = None
+            get_manager().remove(name, oauth_config=oauth_config)
         return _ok(rid, {"ok": True, "removed": True})
     except Exception as e:
         return _err(rid, 5024, str(e))

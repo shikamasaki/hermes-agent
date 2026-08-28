@@ -84,6 +84,67 @@ def test_storage_round_trip_stays_in_credential_profile(monkeypatch, tmp_path) -
     assert not (caller_home / "mcp-tokens" / "tracery.json").exists()
 
 
+def test_storage_rollback_replaces_partial_new_state(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._client_info_path().write_bytes(b"partial-new-client")
+    storage.restore(backup)
+
+    assert storage._tokens_path().read_bytes() == b"old-token"
+    assert storage._client_info_path().read_bytes() == b"old-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_web_transaction_lock_is_keyed_by_credential_owner() -> None:
+    from hermes_cli.web_server import _mcp_oauth_transaction
+
+    first = SimpleNamespace(
+        hermes_home="/profiles/caller-a",
+        credential_home="/profiles/owner",
+        server_name="tracery",
+    )
+    second = SimpleNamespace(
+        hermes_home="/profiles/caller-b",
+        credential_home="/profiles/owner",
+        server_name="tracery",
+    )
+
+    assert _mcp_oauth_transaction(first) is _mcp_oauth_transaction(second)
+
+
+def test_tui_flow_rejects_duplicate_shared_owner(monkeypatch, tmp_path) -> None:
+    from tui_gateway import mcp_oauth_sessions
+
+    owner_home = tmp_path / "owner"
+    _install_profile(monkeypatch, owner_home)
+    first_flow = SimpleNamespace(worker_done=False)
+    mcp_oauth_sessions._sessions["existing"] = {
+        "server_name": "tracery",
+        "credential_home": str(owner_home),
+        "flow": first_flow,
+        "created_at": float("inf"),
+    }
+    try:
+        with pytest.raises(RuntimeError, match="already in progress"):
+            mcp_oauth_sessions.start_flow(
+                str(tmp_path / "caller-b"),
+                "tracery",
+                {
+                    "url": "https://beproud.tracery.jp/mcp",
+                    "oauth": {"credential_profile": "welby"},
+                },
+            )
+    finally:
+        mcp_oauth_sessions._sessions.pop("existing", None)
+
+
 def test_manager_rebuilds_provider_when_credential_profile_changes(monkeypatch) -> None:
     manager = MCPOAuthManager()
     built = []

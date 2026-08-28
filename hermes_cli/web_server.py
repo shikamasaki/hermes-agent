@@ -13954,7 +13954,7 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
 
 
 def _mcp_oauth_transaction(flow) -> threading.Lock:
-    key = (flow.hermes_home, flow.server_name)
+    key = (flow.credential_home or flow.hermes_home, flow.server_name)
     with _mcp_oauth_transactions_lock:
         return _mcp_oauth_transactions.setdefault(key, threading.Lock())
 
@@ -14028,7 +14028,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
 
                         reconnect_mcp_server(flow.server_name)
                 except Exception:
-                    storage.restore(backup, only_if_absent=True)
+                    storage.restore(backup)
                     manager.restore_entry(
                         flow.server_name,
                         previous_entry,
