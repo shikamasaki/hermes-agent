@@ -127,12 +127,31 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
     endpoint sets the whole map so removals actually persist.  Storage stays
     the config.yaml ``mcp_servers`` key the CLI/TUI already read.
     """
-    from hermes_cli.mcp_config import _replace_mcp_servers
+    from hermes_cli.mcp_config import _get_mcp_servers, _replace_mcp_servers
 
     def _run():
         with _profile_scope(body.profile or profile):
             with _CONFIG_MUTATION_LOCK:
-                return _replace_mcp_servers(body.servers)
+                previous = _get_mcp_servers()
+                ok, issues = _replace_mcp_servers(body.servers)
+                if not ok:
+                    return ok, issues
+
+                removed_names = set(previous) - set(body.servers)
+                if removed_names:
+                    try:
+                        from tools.mcp_oauth_manager import get_manager
+
+                        manager = get_manager()
+                        for name in removed_names:
+                            server_config = previous[name]
+                            oauth_config = server_config.get("oauth")
+                            if not isinstance(oauth_config, dict):
+                                oauth_config = None
+                            manager.remove(name, oauth_config=oauth_config)
+                    except Exception:
+                        pass
+                return ok, issues
 
     ok, issues = await asyncio.to_thread(_run)
     if not ok:
