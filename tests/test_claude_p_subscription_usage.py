@@ -265,6 +265,7 @@ class TestResolveClaudeSubscriptionToken:
         self, monkeypatch, caplog
     ):
         from agent import anthropic_adapter as aa
+        from agent import anthropic_credentials as ac
 
         expired = {
             "accessToken": "cc-old",
@@ -274,7 +275,7 @@ class TestResolveClaudeSubscriptionToken:
         monkeypatch.setattr(aa, "read_claude_code_credentials", lambda: expired)
         monkeypatch.setattr(aa, "is_claude_code_token_valid", lambda creds: False)
         monkeypatch.setattr(
-            aa,
+            ac,
             "refresh_anthropic_oauth_pure",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("account@example.com cc-refresh-secret")
@@ -285,6 +286,7 @@ class TestResolveClaudeSubscriptionToken:
         with caplog.at_level("DEBUG"):
             assert aa.resolve_claude_subscription_token() is None
 
+        assert "RuntimeError" in caplog.text
         assert "account@example.com" not in caplog.text
         assert "cc-refresh-secret" not in caplog.text
 
