@@ -939,7 +939,20 @@ def classify_api_error(
         )
         return _result(reason, **plugin_classification)
 
-    # ── 1. Provider-specific patterns (highest priority) ────────────
+    # ── 1. Provider-specific patterns (highest priority) ─────────────
+
+    # Code Assist refuses to generate without a resolved project. The adapter
+    # emits this exact local code before any model request; retrying or
+    # switching providers would hide an actionable configuration failure.
+    if (
+        provider_lower == "google-antigravity"
+        and getattr(error, "code", None) == "antigravity_project_unresolved"
+    ):
+        return _result(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=False,
+        )
 
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged

@@ -1860,3 +1860,142 @@ class TestQuotaSummaryFetch:
                 )
                 is None
             )
+
+
+# ── Regression: fail-closed project resolution and bounded errors ────────
+
+
+class TestCodeAssistFailClosedRegression:
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_unresolved_project_never_sends_generate_request(self, stream):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        urls = []
+
+        def handler(request):
+            urls.append(str(request.url))
+            if str(request.url).endswith(":loadCodeAssist"):
+                return httpx.Response(200, json={"private": "ya29.DISCOVERYSECRET"})
+            raise AssertionError("projectless model request escaped")
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodeAssistClient(api_key="ya29.CLIENTSECRET", base_url=CODE_ASSIST_BASE_URL, http_client=http_client)
+            with pytest.raises(GeminiAPIError) as raised:
+                result = client._create_chat_completion(model="gemini-3.1-pro-high", stream=stream, messages=[{"role": "user", "content": "hello"}])
+                if stream:
+                    list(result)
+
+        error = raised.value
+        assert urls == [f"{CODE_ASSIST_BASE_URL}:loadCodeAssist"]
+        assert error.code == "antigravity_project_unresolved"
+        assert error.response is None
+        assert "SECRET" not in repr(error)
+        assert error.__cause__ is None and error.__context__ is None
+
+    def test_nonstream_invalid_json_does_not_retain_raw_body(self):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        secret = "ya29.INVALIDJSONBODYSECRET"
+        with httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=f"credential={secret} <<not json>>")
+            )
+        ) as http_client:
+            client = CodeAssistClient(
+                api_key="ya29.CLIENTSECRET",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=http_client,
+                project="p",
+            )
+            with pytest.raises(GeminiAPIError) as raised:
+                client._create_chat_completion(
+                    model="gemini-3.1-pro-high",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        error = raised.value
+        assert error.code == "antigravity_invalid_json"
+        assert error.response is None
+        assert error.__cause__ is None and error.__context__ is None
+        assert str(error) == "Invalid JSON from Code Assist API."
+        assert "credential" not in str(error).lower()
+        assert "token" not in str(error).lower()
+        assert secret not in repr(error)
+        assert "Expecting value" not in repr(error)
+        frames = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            frames.append(traceback.tb_frame)
+            traceback = traceback.tb_next
+        assert not any(
+            isinstance(value, (httpx.Response, ValueError))
+            for frame in frames
+            for value in frame.f_locals.values()
+        )
+
+    def test_nonstream_429_keeps_only_allowlisted_error_details(self, monkeypatch):
+        import httpx
+
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        monkeypatch.setattr("agent.agent_runtime_helpers.time.time", lambda: 1000.0)
+        body = {"error": {"status": "RESOURCE_EXHAUSTED", "message": "token=ya29.BODYSECRET", "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED", "metadata": {"secret": "nope"}}, {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "12.5s"}]}}
+        with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(429, json=body))) as http_client:
+            client = CodeAssistClient(api_key="ya29.CLIENTSECRET", base_url=CODE_ASSIST_BASE_URL, http_client=http_client, project="p")
+            with pytest.raises(GeminiAPIError) as raised:
+                client._create_chat_completion(model="gemini-3.1-pro-high", messages=[{"role": "user", "content": "hello"}])
+
+        error = raised.value
+        assert error.details == {"status": "RESOURCE_EXHAUSTED", "reason": "RATE_LIMIT_EXCEEDED", "retry_after": 12.5}
+        assert error.retry_after == 12.5
+        assert extract_api_error_context(error)["reset_at"] == 1012.5
+        assert error.response is None and error.__cause__ is None and error.__context__ is None
+        assert "SECRET" not in repr(error)
+
+    def test_streaming_429_reads_unread_body_then_sanitizes_it(self, monkeypatch):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        payload = b'{"error":{"status":"RESOURCE_EXHAUSTED","message":"ya29.STREAMSECRET","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":{"seconds":9}}]}}'
+
+        class _UnreadBody(httpx.SyncByteStream):
+            def __iter__(self):
+                yield payload
+
+            def close(self):
+                pass
+
+        sanitized_bodies = []
+        from agent import gemini_cloudcode_adapter as adapter
+        original = adapter.sanitize_code_assist_error_payload
+        monkeypatch.setattr(adapter, "sanitize_code_assist_error_payload", lambda body: sanitized_bodies.append(body) or original(body))
+        with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(429, stream=_UnreadBody()))) as http_client:
+            client = CodeAssistClient(api_key="ya29.CLIENTSECRET", base_url=CODE_ASSIST_BASE_URL, http_client=http_client, project="p")
+            with pytest.raises(GeminiAPIError) as raised:
+                list(client._create_chat_completion(model="gemini-3.1-pro-high", stream=True, messages=[{"role": "user", "content": "hello"}]))
+
+        assert sanitized_bodies == [payload.decode()]
+        assert raised.value.details == {"status": "RESOURCE_EXHAUSTED", "reason": "RATE_LIMIT_EXCEEDED", "retry_after": 9.0}
+        assert raised.value.retry_after == 9.0 and raised.value.response is None
+        assert "STREAMSECRET" not in repr(raised.value)
+
+    def test_retry_delay_returns_none_for_overflowing_integer(self):
+        from agent.gemini_cloudcode_adapter import _parse_retry_delay_seconds
+
+        assert _parse_retry_delay_seconds(10**10000) is None
+
+    @pytest.mark.parametrize(("value", "expected"), [("nan", None), ("inf", None), ("-1", None), ("1e3", None), ("Wed, 21 Oct 2015 07:28:00 GMT", None), ("3599", 3599.0), ("3601", 3601.0), ("999999999", 604800.0)])
+    def test_retry_delay_accepts_only_bounded_decimal_seconds(self, value, expected):
+        from agent.gemini_cloudcode_adapter import _parse_retry_delay_seconds
+
+        assert _parse_retry_delay_seconds(value) == expected

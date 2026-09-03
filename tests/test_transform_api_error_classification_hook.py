@@ -214,3 +214,23 @@ def test_synthetic_plugin_end_to_end(tmp_path, monkeypatch):
         provider="acmecloud",
     )
     assert other.reason == FailoverReason.rate_limit
+
+
+def test_antigravity_project_unresolved_is_classified_after_normal_provider_discovery():
+    """Provider discovery must not leave the exact local Code Assist error retryable."""
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("google-antigravity")
+    assert profile is not None and profile.name == "google-antigravity"
+    error = _FakeAPIError("project resolution failed")
+    setattr(error, "code", "antigravity_project_unresolved")
+
+    claimed = classify_api_error(error, provider="google-antigravity")
+    assert claimed.reason == FailoverReason.format_error
+    assert claimed.retryable is False
+    assert claimed.should_fallback is False
+
+    unrelated_provider = classify_api_error(error, provider="gemini")
+    unrelated_error = classify_api_error(_FakeAPIError(_UNCLAIMED_MESSAGE), provider="google-antigravity")
+    assert unrelated_provider.reason == FailoverReason.unknown
+    assert unrelated_error.reason == FailoverReason.unknown

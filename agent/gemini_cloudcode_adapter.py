@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -462,23 +463,158 @@ def fetch_quota_summary(
     return windows or None
 
 
-def _safe_code_assist_http_error(response: Any) -> Exception:
+_SAFE_ERROR_TOKEN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SAFE_ERROR_STATUSES = frozenset({
+    "ABORTED",
+    "ALREADY_EXISTS",
+    "CANCELLED",
+    "DATA_LOSS",
+    "DEADLINE_EXCEEDED",
+    "FAILED_PRECONDITION",
+    "INTERNAL",
+    "INVALID_ARGUMENT",
+    "NOT_FOUND",
+    "OUT_OF_RANGE",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "UNAUTHENTICATED",
+    "UNAVAILABLE",
+    "UNKNOWN",
+})
+_MAX_RETRY_AFTER_S = 7 * 24 * 3600
+
+
+def _safe_error_token(value: Any, *, allowed: Optional[frozenset[str]] = None) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = value.strip().upper()
+    if allowed is not None:
+        return token if token in allowed else None
+    return token if _SAFE_ERROR_TOKEN.fullmatch(token) else None
+
+
+def _parse_retry_delay_seconds(value: Any) -> Optional[float]:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            seconds = float(value)
+        except OverflowError:
+            return None
+    elif isinstance(value, str):
+        text = value.strip()
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)(?:s)?", text)
+        if not match:
+            return None
+        seconds = float(match.group(1))
+    elif isinstance(value, dict):
+        raw_seconds = value.get("seconds", 0)
+        raw_nanos = value.get("nanos", 0)
+        if isinstance(raw_seconds, bool) or isinstance(raw_nanos, bool):
+            return None
+        try:
+            seconds = float(raw_seconds or 0) + (float(raw_nanos or 0) / 1_000_000_000)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+        return None
+    return min(seconds, float(_MAX_RETRY_AFTER_S))
+
+
+def sanitize_code_assist_error_payload(payload: Any) -> Dict[str, Any]:
+    """Return bounded allowlisted Code Assist error fields.
+
+    Accepts parsed dicts plus bytes/text JSON. Drops messages, metadata,
+    URLs, headers, and every unreviewed free-text field so exceptions can carry
+    retry/fallback context without retaining provider bodies or credentials.
+    """
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = bytes(payload).decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+    if not isinstance(error, dict):
+        return {}
+
+    safe: Dict[str, Any] = {}
+    status = _safe_error_token(error.get("status"), allowed=_SAFE_ERROR_STATUSES)
+    if status:
+        safe["status"] = status
+
+    details = error.get("details")
+    if isinstance(details, list):
+        for detail in details[:10]:
+            if not isinstance(detail, dict):
+                continue
+            type_url = str(detail.get("@type") or "")
+            if type_url.endswith("/google.rpc.ErrorInfo") and "reason" not in safe:
+                reason = _safe_error_token(detail.get("reason"))
+                if reason:
+                    safe["reason"] = reason
+            elif type_url.endswith("/google.rpc.RetryInfo") and "retry_after" not in safe:
+                delay = _parse_retry_delay_seconds(detail.get("retryDelay") or detail.get("retry_delay"))
+                if delay is not None:
+                    safe["retry_after"] = delay
+
+    return safe
+
+
+def _safe_code_assist_http_error(response: Any, *, body: Any = None) -> Exception:
     """Return a retry-classifiable error without retaining provider payloads."""
     from agent.gemini_native_adapter import GeminiAPIError
 
     status = int(getattr(response, "status_code", 0) or 0)
-    retry_after = None
+    safe_details: Dict[str, Any] = {}
     try:
-        retry_after = float(response.headers.get("retry-after"))
-    except (TypeError, ValueError, AttributeError):
-        pass
+        safe_details = sanitize_code_assist_error_payload(response.content if body is None else body)
+    except Exception:
+        safe_details = {}
+    retry_after = safe_details.get("retry_after")
+    if retry_after is None:
+        try:
+            retry_after = _parse_retry_delay_seconds(response.headers.get("retry-after"))
+        except AttributeError:
+            retry_after = None
+    code = f"antigravity_http_{status or 'error'}"
+    if status == 401:
+        code = "antigravity_unauthorized"
+    elif status == 429:
+        code = "antigravity_rate_limited"
+    elif status == 404:
+        code = "antigravity_model_not_found"
+    if retry_after is not None:
+        safe_details["retry_after"] = retry_after
     return GeminiAPIError(
         f"Antigravity Code Assist returned HTTP {status or 'error'}.",
-        code=f"antigravity_http_{status or 'error'}",
+        code=code,
         status_code=status or None,
         response=None,
         retry_after=retry_after,
-        details={},
+        details=safe_details,
+    )
+
+
+def _code_assist_project_unresolved_error() -> Exception:
+    """Distinct safe error for fail-closed project resolution failures."""
+    from agent.gemini_native_adapter import GeminiAPIError
+
+    return GeminiAPIError(
+        "Antigravity Code Assist project could not be resolved; refusing to send a projectless model request.",
+        code="antigravity_project_unresolved",
+        status_code=None,
+        response=None,
+        details={"reason": "PROJECT_UNRESOLVED"},
     )
 
 
@@ -540,8 +676,18 @@ class CodeAssistClient(GeminiNativeClient):
             thinking_config=thinking_config,
             model=model,
         )
+        project = self._ensure_project()
+        if not project:
+            error = _code_assist_project_unresolved_error()
+            if stream:
+                def _raise_project_error():
+                    raise error from None
+                    yield  # pragma: no cover - make this a generator
+
+                return _raise_project_error()
+            raise error from None
         envelope = build_code_assist_request(
-            model=model, gemini_request=request, project=self._ensure_project()
+            model=model, gemini_request=request, project=project
         )
 
         if stream:
@@ -553,15 +699,20 @@ class CodeAssistClient(GeminiNativeClient):
         )
         if response.status_code != 200:
             raise _safe_code_assist_http_error(response)
+        invalid_json_error = None
+        payload: Any = None
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise GeminiAPIError(
-                f"Invalid JSON from Code Assist API: {exc}",
+        except ValueError:
+            invalid_json_error = GeminiAPIError(
+                "Invalid JSON from Code Assist API.",
                 code="antigravity_invalid_json",
                 status_code=response.status_code,
                 response=None,
-            ) from exc
+            )
+            response = None
+        if invalid_json_error is not None:
+            raise invalid_json_error from None
         return translate_code_assist_response(payload, model)
 
     def _stream_completion(self, *, model: str, request: Dict[str, Any], timeout: Any = None):
@@ -585,8 +736,8 @@ class CodeAssistClient(GeminiNativeClient):
                     "POST", url, json=request, headers=stream_headers, timeout=timeout
                 ) as response:
                     if response.status_code != 200:
-                        read_streaming_error_body(response)
-                        raise _safe_code_assist_http_error(response)
+                        body = read_streaming_error_body(response)
+                        raise _safe_code_assist_http_error(response, body=body)
                     tool_call_indices: Dict[str, Dict[str, Any]] = {}
                     for event in _iter_sse_events(response):
                         for chunk in translate_code_assist_stream_event(
@@ -618,6 +769,7 @@ __all__ = [
     "build_gemini_request",
     "parse_entitled_models",
     "parse_quota_summary",
+    "sanitize_code_assist_error_payload",
     "translate_code_assist_response",
     "translate_code_assist_stream_event",
     "unwrap_code_assist_response",
