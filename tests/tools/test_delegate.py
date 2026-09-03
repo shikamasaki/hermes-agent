@@ -434,7 +434,7 @@ class TestDelegateTask(unittest.TestCase):
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    str(child_db.db_path.resolve()), str(parent_db.db_path.resolve())
                 )
             finally:
                 if child_db is not None:
