@@ -1885,6 +1885,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1982,7 +1983,10 @@ def resolve_runtime_provider(
             resolve_antigravity_runtime_credentials,
         )
 
-        creds = resolve_antigravity_runtime_credentials()
+        if force_refresh:
+            creds = resolve_antigravity_runtime_credentials(force_refresh=True)
+        else:
+            creds = resolve_antigravity_runtime_credentials()
         return {
             "provider": "google-antigravity",
             "api_mode": "chat_completions",
