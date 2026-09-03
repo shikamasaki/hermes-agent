@@ -135,13 +135,11 @@ jobs:
     # single job in the workflow — while still running the full pytest lanes.
     #
     # Re-disabled (Sep 2026): the Sep 1 re-enable is still incredibly flaky.
-    # Keep this a bare `if: false`. The earlier
-    # `${{ false && (... || ...) }}` form on this reusable-workflow job made
-    # GitHub's workflow parser fail at startup ("An unexpected error has
-    # occurred") — every ci.yaml run repo-wide dispatched 0 jobs from
-    # 24f5a60ed1 until this line changed. To re-enable, restore:
+    # The fork orchestrator retains a dynamic never-true expression for
+    # compatibility; hosted execution is authoritative, and bare false does not
+    # universally fail. To re-enable, restore:
     #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
-    if: false
+    if: github.run_id == '0'
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
