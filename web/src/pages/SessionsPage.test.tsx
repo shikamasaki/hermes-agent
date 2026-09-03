@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
@@ -31,9 +31,33 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/components/PlatformsCard", () => ({ PlatformsCard: () => null }));
 vi.mock("@/components/Markdown", () => ({ Markdown: () => null }));
 
+let SessionsPage: typeof import("./SessionsPage").default;
+let I18nProvider: typeof import("@/i18n").I18nProvider;
+let SystemActionsProvider: typeof import("@/contexts/SystemActions").SystemActionsProvider;
+let ProfileProvider: typeof import("@/contexts/ProfileProvider").ProfileProvider;
+let PageHeaderProvider: typeof import("@/contexts/PageHeaderProvider").PageHeaderProvider;
 let container: HTMLDivElement;
 let root: Root;
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+beforeAll(async () => {
+  // Load the component tree after hoisted mocks are installed, but before the
+  // timed test body. Hosted CI runs this workspace check concurrently with
+  // other builds, and cold Vite transforms for this page can consume the
+  // default 5s per-test budget before the routing assertions run.
+  const modules = await Promise.all([
+    import("./SessionsPage"),
+    import("@/i18n"),
+    import("@/contexts/SystemActions"),
+    import("@/contexts/ProfileProvider"),
+    import("@/contexts/PageHeaderProvider"),
+  ]);
+  SessionsPage = modules[0].default;
+  I18nProvider = modules[1].I18nProvider;
+  SystemActionsProvider = modules[2].SystemActionsProvider;
+  ProfileProvider = modules[3].ProfileProvider;
+  PageHeaderProvider = modules[4].PageHeaderProvider;
+});
 
 async function waitFor(cond: () => boolean, timeoutMs = 5000) {
   const start = Date.now();
@@ -61,14 +85,6 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
     limit,
     offset: 0,
   }));
-  const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
-    await Promise.all([
-      import("./SessionsPage"),
-      import("@/i18n"),
-      import("@/contexts/SystemActions"),
-      import("@/contexts/ProfileProvider"),
-      import("@/contexts/PageHeaderProvider"),
-    ]);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
