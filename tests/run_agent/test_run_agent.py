@@ -2162,6 +2162,163 @@ class TestAntigravityAuthRefresh:
         assert result.get("failed") is True
 
 
+def test_antigravity_partial_function_call_retries_without_dispatching_partial_tool(agent, monkeypatch):
+    """A dropped Code Assist tool stream must replay before any tool dispatch."""
+    import httpx
+
+    from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+    import agent.conversation_loop as conversation_loop
+
+    class PartialStream(httpx.SyncByteStream):
+        def __init__(self, body, request):
+            self.body, self.request = body, request
+
+        def __iter__(self):
+            yield self.body
+            raise httpx.ReadError("dropped after partial tool", request=self.request)
+
+    posts, dispatched = [], []
+
+    def event(part, finish=None):
+        candidate = {"content": {"role": "model", "parts": [part]}}
+        if finish:
+            candidate["finishReason"] = finish
+        return f"data: {json.dumps({'response': {'candidates': [candidate]}})}\n\n".encode()
+
+    partial = event({"functionCall": {"name": "web_search", "args": {"q": "partial"}}})
+    complete = event({"functionCall": {"name": "web_search", "args": {"q": "complete"}}}, "STOP")
+    done = event({"text": "done"}, "STOP")
+
+    def handler(request):
+        posts.append(json.loads(request.read()))
+        if len(posts) == 1:
+            return httpx.Response(200, stream=PartialStream(partial, request))
+        return httpx.Response(200, content=complete if len(posts) == 2 else done)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = CodeAssistClient(api_key="ya29.TEST", base_url=CODE_ASSIST_BASE_URL, http_client=http_client, project="proj-test")
+    agent.provider = "google-antigravity"
+    agent.api_mode = "chat_completions"
+    agent.model = "gemini-3.1-pro-high"
+    agent.client = client
+    agent._persist_session = lambda *args, **kwargs: None
+    agent._save_trajectory = lambda *args, **kwargs: None
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kwargs: client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "run_agent.handle_function_call",
+        lambda name, args, *_args, **_kwargs: dispatched.append((name, args)) or "result",
+    )
+
+    try:
+        with (
+            patch.object(conversation_loop, "jittered_backoff", return_value=0.0),
+            patch.object(conversation_loop, "adaptive_rate_limit_backoff", return_value=(0.0, None)),
+            patch.object(conversation_loop.time, "sleep", return_value=None),
+            patch("time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("search")
+    finally:
+        http_client.close()
+
+    assert len(posts) == 3
+    assert posts[1]["request"]["contents"] == posts[0]["request"]["contents"]
+    assert dispatched == [("web_search", {"q": "complete"})]
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+
+
+def test_antigravity_partial_text_stream_continues_from_delivered_text(agent, monkeypatch):
+    """A dropped text-only stream continues from its delivered Code Assist text."""
+    import httpx
+
+    from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+
+    class PartialStream(httpx.SyncByteStream):
+        def __init__(self, request):
+            self.request = request
+
+        def __iter__(self):
+            yield b'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"visible"}]}}]}}\n\n'
+            raise httpx.ReadError("dropped after visible text", request=self.request)
+
+    posts, dispatched = [], []
+
+    def handler(request):
+        posts.append(json.loads(request.read()))
+        if len(posts) == 1:
+            return httpx.Response(200, stream=PartialStream(request))
+        if len(posts) == 2:
+            return httpx.Response(
+                200,
+                content=b'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}]}}\n\n',
+            )
+        raise AssertionError("partial-text continuation made an unexpected model request")
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = CodeAssistClient(api_key="ya29.TEST", base_url=CODE_ASSIST_BASE_URL, http_client=http_client, project="proj-test")
+    agent.provider = "google-antigravity"
+    agent.api_mode = "chat_completions"
+    agent.model = "gemini-3.1-pro-high"
+    agent.client = client
+    agent._persist_session = lambda *args, **kwargs: None
+    agent._save_trajectory = lambda *args, **kwargs: None
+    agent.stream_delta_callback = MagicMock()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kwargs: client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *args, **kwargs: None)
+    monkeypatch.setattr("run_agent.handle_function_call", lambda *args, **kwargs: dispatched.append(args))
+
+    try:
+        result = agent.run_conversation("say something")
+    finally:
+        http_client.close()
+
+    assert len(posts) == 2
+    assert posts[1]["request"]["contents"] != posts[0]["request"]["contents"]
+    assert "visible" in json.dumps(posts[1]["request"]["contents"])
+    assert dispatched == []
+    assert result["final_response"] == "visible\ndone"
+    assert result["final_response"].count("visible") == 1
+    assert result["completed"] is True
+
+
+def test_antigravity_unresolved_project_fails_full_conversation_before_model_request(agent, monkeypatch):
+    """The real client, classifier, and loop make one discovery call then stop."""
+    import httpx
+
+    from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+
+    urls = []
+
+    def handler(request):
+        urls.append(str(request.url))
+        if str(request.url).endswith(":loadCodeAssist"):
+            return httpx.Response(200, json={})
+        raise AssertionError("generate/stream request must not be sent")
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = CodeAssistClient(api_key="ya29.TEST", base_url=CODE_ASSIST_BASE_URL, http_client=http_client)
+    agent.provider = "google-antigravity"
+    agent.api_mode = "chat_completions"
+    agent.model = "gemini-3.1-pro-high"
+    agent._persist_session = lambda *args, **kwargs: None
+    agent._save_trajectory = lambda *args, **kwargs: None
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kwargs: client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *args, **kwargs: None)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    try:
+        result = agent.run_conversation("hello")
+    finally:
+        http_client.close()
+
+    assert urls == [f"{CODE_ASSIST_BASE_URL}:loadCodeAssist"]
+    assert result["completed"] is False and result["failed"] is True
+    assert result["failure_reason"] == "format_error"
+    assert result["failure_retryable"] is False
+    assert "project" in result["error"].lower()
+
+
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 

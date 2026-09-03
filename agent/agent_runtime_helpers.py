@@ -5201,6 +5201,19 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 pass
 
+    details = getattr(error, "details", None)
+    if isinstance(details, dict):
+        reason = details.get("reason") or details.get("code") or details.get("status")
+        if isinstance(reason, str) and reason.strip() and "reason" not in context:
+            context["reason"] = reason.strip()
+        if "reset_at" not in context:
+            retry_after = details.get("retry_after")
+            if retry_after not in {None, ""}:
+                try:
+                    context["reset_at"] = time.time() + float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", None)
     if headers:
