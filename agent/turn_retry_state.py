@@ -53,6 +53,7 @@ class TurnRetryState:
     # re-exchange + client rebuild for that case, separate from the 401 guard
     # so both can fire within one attempt if needed.
     copilot_stale_cred_retry_attempted: bool = False
+    antigravity_auth_retry_attempted: bool = False
     vertex_auth_retry_attempted: bool = False
 
     # ── Format / payload recovery guards ─────────────────────────────────

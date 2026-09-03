@@ -431,6 +431,28 @@ class TestRefreshAndRuntime:
         state = self._state(expires_at=time.time() + 9999, access_token="ya29.LIVE")
         assert ag.ensure_fresh_access_token(state)["access_token"] == "ya29.LIVE"
 
+    def test_force_refresh_bypasses_future_expires_at(self, monkeypatch):
+        from hermes_cli import antigravity_auth as ag
+
+        monkeypatch.setattr(
+            ag, "resolve_client_identity",
+            lambda: {"client_id": "cid", "client_secret": "sec", "source": "env"},
+        )
+        calls = []
+
+        def fake_exchange(*, refresh_token, client_id, client_secret, timeout=30.0):
+            calls.append(refresh_token)
+            return {"access_token": "ya29.FORCED", "expires_in": 3600}
+
+        monkeypatch.setattr(ag, "_refresh_access_token", fake_exchange)
+        state = self._state(expires_at=time.time() + 9999, access_token="ya29.LIVE")
+
+        fresh = ag.ensure_fresh_access_token(state, force_refresh=True)
+
+        assert fresh["access_token"] == "ya29.FORCED"
+        assert fresh["refresh_token"] == "1//KEEPME"
+        assert calls == ["1//KEEPME"]
+
     def test_missing_refresh_token_fails_clearly(self, monkeypatch):
         from hermes_cli import antigravity_auth as ag
 
@@ -448,6 +470,29 @@ class TestRefreshAndRuntime:
         assert creds["api_key"] == "ya29.OLD"
         assert creds["base_url"] == "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
         assert creds["project_id"] == "proj-1"
+
+    def test_runtime_credentials_forward_force_refresh_and_persist(self, monkeypatch):
+        from hermes_cli import antigravity_auth as ag
+
+        state = self._state(expires_at=time.time() + 9999, access_token="ya29.LIVE")
+        saved = []
+
+        def fake_ensure(in_state, *, force_refresh=False):
+            assert force_refresh is True
+            fresh = dict(in_state)
+            fresh["access_token"] = "ya29.FORCED"
+            fresh["project_id"] = "proj-forced"
+            return fresh
+
+        monkeypatch.setattr(ag, "load_state_with_source", lambda: (state, "auth-source"))
+        monkeypatch.setattr(ag, "ensure_fresh_access_token", fake_ensure)
+        monkeypatch.setattr(ag, "save_state_to_source", lambda fresh, source: saved.append((fresh, source)))
+
+        creds = ag.resolve_antigravity_runtime_credentials(force_refresh=True)
+
+        assert creds["api_key"] == "ya29.FORCED"
+        assert creds["project_id"] == "proj-forced"
+        assert saved == [(dict(state, access_token="ya29.FORCED", project_id="proj-forced"), "auth-source")]
 
     def test_runtime_credentials_require_login(self, monkeypatch):
         from hermes_cli import antigravity_auth as ag

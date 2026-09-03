@@ -363,8 +363,17 @@ def _refresh_access_token(
     return payload
 
 
-def ensure_fresh_access_token(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Return *state* with a non-expired access token, refreshing if needed."""
+def ensure_fresh_access_token(
+    state: Dict[str, Any],
+    *,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Return *state* with a non-expired access token, refreshing if needed.
+
+    ``force_refresh`` deliberately bypasses a future ``expires_at`` when a
+    live request has proven the bearer is already rejected (mid-session HTTP
+    401).  The caller still gets the same redacted/error-safe refresh path.
+    """
     state = dict(state or {})
     expires_at = state.get("expires_at") or 0
     try:
@@ -372,7 +381,7 @@ def ensure_fresh_access_token(state: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         expires_at = 0.0
 
-    if state.get("access_token") and expires_at > (
+    if not force_refresh and state.get("access_token") and expires_at > (
         time.time() + ACCESS_TOKEN_REFRESH_SKEW_SECONDS
     ):
         return state
@@ -456,7 +465,10 @@ def save_state_to_source(state: Dict[str, Any], source_path: Any) -> None:
         )
 
 
-def resolve_antigravity_runtime_credentials() -> Dict[str, Any]:
+def resolve_antigravity_runtime_credentials(
+    *,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
     """Return per-request credentials for the agent, refreshing if needed."""
     state, source_path = load_state_with_source()
     if not isinstance(state, dict) or not state.get("refresh_token"):
@@ -466,7 +478,10 @@ def resolve_antigravity_runtime_credentials() -> Dict[str, Any]:
             code="antigravity_auth_missing",
         )
 
-    fresh = ensure_fresh_access_token(state)
+    if force_refresh:
+        fresh = ensure_fresh_access_token(state, force_refresh=True)
+    else:
+        fresh = ensure_fresh_access_token(state)
     if fresh != state:
         try:
             save_state_to_source(fresh, source_path)

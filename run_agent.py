@@ -6488,6 +6488,57 @@ class AIAgent:
         logger.info("Vertex AI OAuth token refreshed")
         return True
 
+    def _try_refresh_antigravity_client_credentials(self) -> bool:
+        """Force-refresh Google Antigravity OAuth credentials and rebuild client.
+
+        Antigravity's Code Assist client captures a short-lived bearer token
+        and project at agent startup.  A mid-session 401 proves that token is
+        rejected even if the cached ``expires_at`` is still in the future, so
+        recovery must force the canonical runtime resolver to bypass the cache,
+        then update the live CodeAssist client kwargs (including project).
+        """
+        if self.api_mode != "chat_completions" or self.provider != "google-antigravity":
+            return False
+
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            creds = resolve_runtime_provider(
+                requested="google-antigravity",
+                force_refresh=True,
+            )
+        except Exception as exc:
+            logger.debug("Antigravity credential refresh failed: %s", type(exc).__name__)
+            return False
+
+        api_key = creds.get("api_key")
+        base_url = creds.get("base_url")
+        if not isinstance(api_key, str) or not api_key.strip():
+            return False
+        if not isinstance(base_url, str) or not base_url.strip():
+            return False
+
+        self.api_key = api_key.strip()
+        self.base_url = base_url.strip().rstrip("/")
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+
+        project_id = creds.get("project_id")
+        if isinstance(project_id, str) and project_id.strip():
+            self.provider_project_id = project_id.strip()
+            self._client_kwargs["project_id"] = self.provider_project_id
+            self._client_kwargs.pop("project", None)
+        else:
+            self.provider_project_id = None
+            self._client_kwargs.pop("project_id", None)
+            self._client_kwargs.pop("project", None)
+
+        if not self._replace_primary_openai_client(reason="antigravity_credential_refresh"):
+            return False
+
+        logger.info("Antigravity OAuth token refreshed after 401")
+        return True
+
     def _try_refresh_copilot_client_credentials(self) -> bool:
         """Refresh Copilot credentials and rebuild the shared OpenAI client.
 

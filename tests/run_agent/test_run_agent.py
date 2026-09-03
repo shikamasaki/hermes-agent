@@ -2028,6 +2028,139 @@ class TestRetryAfterCap:
         assert "Waiting 300.0s" in status
 
 
+class TestAntigravityAuthRefresh:
+    def test_refresh_rebuilds_code_assist_client_with_forced_runtime_credentials(self, agent, monkeypatch):
+        agent.provider = "google-antigravity"
+        agent.api_mode = "chat_completions"
+        agent.api_key = "ya29.OLD"
+        agent.base_url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
+        agent.provider_project_id = "proj-old"
+        agent._client_kwargs = {
+            "api_key": "ya29.OLD",
+            "base_url": agent.base_url,
+            "project_id": "proj-old",
+        }
+        old_client = agent.client = SimpleNamespace(
+            api_key="ya29.OLD",
+            _code_assist_project="proj-old",
+        )
+        calls = []
+
+        def fake_resolve_runtime_provider(**kwargs):
+            calls.append(kwargs)
+            return {
+                "provider": "google-antigravity",
+                "api_mode": "chat_completions",
+                "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+                "api_key": "ya29.NEW",
+                "project_id": "proj-new",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        new_client = SimpleNamespace(api_key="ya29.NEW", _code_assist_project="proj-new")
+        monkeypatch.setattr(agent, "_replace_primary_openai_client", lambda reason: setattr(agent, "client", new_client) or True)
+
+        assert agent._try_refresh_antigravity_client_credentials() is True
+
+        assert calls == [{"requested": "google-antigravity", "force_refresh": True}]
+        assert agent.api_key == "ya29.NEW"
+        assert agent.provider_project_id == "proj-new"
+        assert agent._client_kwargs["api_key"] == "ya29.NEW"
+        assert agent._client_kwargs["project_id"] == "proj-new"
+        assert agent.client is new_client
+        assert agent.client is not old_client
+
+    def test_mid_session_401_refreshes_and_retries_original_chat_request_once(self, agent, monkeypatch):
+        class _AuthError(Exception):
+            status_code = 401
+
+        agent.provider = "google-antigravity"
+        agent.api_mode = "chat_completions"
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        refresh_calls = []
+        monkeypatch.setattr(
+            agent,
+            "_try_refresh_antigravity_client_credentials",
+            lambda: refresh_calls.append(True) or True,
+        )
+        api_payloads = []
+
+        def fake_api_call(api_kwargs):
+            api_payloads.append(api_kwargs)
+            if len(api_payloads) == 1:
+                raise _AuthError("HTTP 401 Unauthorized")
+            return _mock_response(content="Recovered")
+
+        agent._interruptible_api_call = fake_api_call
+
+        result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert refresh_calls == [True]
+        assert len(api_payloads) == 2
+        assert api_payloads[0]["messages"] == api_payloads[1]["messages"]
+
+    def test_second_antigravity_401_does_not_refresh_loop(self, agent, monkeypatch):
+        class _AuthError(Exception):
+            status_code = 401
+
+        agent.provider = "google-antigravity"
+        agent.api_mode = "chat_completions"
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        refresh_calls = []
+        monkeypatch.setattr(
+            agent,
+            "_try_refresh_antigravity_client_credentials",
+            lambda: refresh_calls.append(True) or True,
+        )
+        api_calls = []
+
+        def fake_api_call(api_kwargs):
+            api_calls.append(api_kwargs)
+            raise _AuthError("HTTP 401 Unauthorized")
+
+        agent._interruptible_api_call = fake_api_call
+        result = agent.run_conversation("hello")
+
+        assert refresh_calls == [True]
+        assert len(api_calls) == 2
+        assert result["completed"] is False
+        assert result.get("failed") is True
+
+    def test_antigravity_refresh_failure_falls_through_without_refresh_loop(self, agent, monkeypatch):
+        class _AuthError(Exception):
+            status_code = 401
+
+        agent.provider = "google-antigravity"
+        agent.api_mode = "chat_completions"
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        refresh_calls = []
+        monkeypatch.setattr(
+            agent,
+            "_try_refresh_antigravity_client_credentials",
+            lambda: refresh_calls.append(True) and False,
+        )
+        api_calls = []
+
+        def fake_api_call(api_kwargs):
+            api_calls.append(api_kwargs)
+            raise _AuthError("HTTP 401 Unauthorized")
+
+        agent._interruptible_api_call = fake_api_call
+        result = agent.run_conversation("hello")
+
+        assert refresh_calls == [True]
+        assert len(api_calls) == 1
+        assert result["completed"] is False
+        assert result.get("failed") is True
+
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
