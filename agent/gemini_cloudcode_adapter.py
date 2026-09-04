@@ -654,6 +654,8 @@ class CodeAssistClient(GeminiNativeClient):
 
     def _create_chat_completion(self, *, model: str = "gemini-3-pro-preview", stream: bool = False, timeout: Any = None, **kwargs: Any) -> Any:
         """Build the Gemini request via the base class, then post it wrapped."""
+        import httpx as _httpx
+
         from agent.gemini_native_adapter import (
             GeminiAPIError,
             bare_gemini_model_id,
@@ -679,6 +681,11 @@ class CodeAssistClient(GeminiNativeClient):
         project = self._ensure_project()
         if not project:
             error = _code_assist_project_unresolved_error()
+            kwargs = {}
+            extra_body = None
+            thinking_config = None
+            request = None
+            project = None
             if stream:
                 def _raise_project_error():
                     raise error from None
@@ -694,11 +701,35 @@ class CodeAssistClient(GeminiNativeClient):
             return self._stream_completion(model=model, request=envelope, timeout=timeout)
 
         url = f"{self.base_url.rstrip('/')}:generateContent"
-        response = self._http.post(
-            url, json=envelope, headers=self._headers(), timeout=timeout
-        )
+        transport_error = None
+        response = None
+        try:
+            response = self._http.post(
+                url, json=envelope, headers=self._headers(), timeout=timeout
+            )
+        except _httpx.HTTPError:
+            transport_error = GeminiAPIError(
+                "Code Assist request failed.",
+                code="antigravity_transport_error",
+            )
+            kwargs = {}
+            extra_body = None
+            thinking_config = None
+            request = None
+            envelope = None
+            project = None
+        if transport_error is not None:
+            raise transport_error from None
         if response.status_code != 200:
-            raise _safe_code_assist_http_error(response)
+            http_error = _safe_code_assist_http_error(response)
+            kwargs = {}
+            extra_body = None
+            thinking_config = None
+            response = None
+            envelope = None
+            request = None
+            project = None
+            raise http_error from None
         invalid_json_error = None
         payload: Any = None
         try:
@@ -710,7 +741,13 @@ class CodeAssistClient(GeminiNativeClient):
                 status_code=response.status_code,
                 response=None,
             )
+            kwargs = {}
+            extra_body = None
+            thinking_config = None
             response = None
+            envelope = None
+            request = None
+            project = None
         if invalid_json_error is not None:
             raise invalid_json_error from None
         return translate_code_assist_response(payload, model)
@@ -730,25 +767,42 @@ class CodeAssistClient(GeminiNativeClient):
         stream_headers["Accept"] = "text/event-stream"
 
         def _generator():
+            nonlocal request, stream_headers
             transport_error = None
+            stream_error = None
+            response = None
+            body = None
+            event = None
+            chunk = None
+            tool_call_indices: Dict[str, Dict[str, Any]] = {}
             try:
                 with self._http.stream(
                     "POST", url, json=request, headers=stream_headers, timeout=timeout
                 ) as response:
                     if response.status_code != 200:
                         body = read_streaming_error_body(response)
-                        raise _safe_code_assist_http_error(response, body=body)
-                    tool_call_indices: Dict[str, Dict[str, Any]] = {}
-                    for event in _iter_sse_events(response):
-                        for chunk in translate_code_assist_stream_event(
-                            event, model, tool_call_indices
-                        ):
-                            yield chunk
+                        stream_error = _safe_code_assist_http_error(response, body=body)
+                    else:
+                        for event in _iter_sse_events(response):
+                            for chunk in translate_code_assist_stream_event(
+                                event, model, tool_call_indices
+                            ):
+                                yield chunk
+                                chunk = None
             except _httpx.HTTPError:
                 transport_error = GeminiAPIError(
                     "Code Assist streaming request failed.",
                     code="antigravity_stream_error",
                 )
+            response = None
+            body = None
+            event = None
+            chunk = None
+            tool_call_indices = {}
+            request = {}
+            stream_headers = {}
+            if stream_error is not None:
+                raise stream_error from None
             if transport_error is not None:
                 # Raise after leaving the handler so neither __cause__ nor
                 # __context__ retains an httpx.Request with bearer headers.

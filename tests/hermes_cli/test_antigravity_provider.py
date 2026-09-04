@@ -1865,7 +1865,266 @@ class TestQuotaSummaryFetch:
 # ── Regression: fail-closed project resolution and bounded errors ────────
 
 
+def _traceback_local_values(error):
+    """Collect exact adapter traceback values allowed by Issue #40."""
+    values = [error, error.__cause__, error.__context__, error.response, error.details]
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename
+        if filename.endswith("/agent/gemini_cloudcode_adapter.py"):
+            values.extend(traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    return values
+
+
+def _walk_safe_containers(values):
+    """Walk dict/list containers from traceback locals without dereferencing clients."""
+    seen = set()
+    stack = list(values)
+    while stack:
+        value = stack.pop()
+        marker = id(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        yield value
+        if isinstance(value, dict):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            stack.extend(value)
+
+
+def _assert_antigravity_error_traceback_sanitized(error, forbidden):
+    import httpx
+
+    reachable = list(_walk_safe_containers(_traceback_local_values(error)))
+    assert not any(isinstance(value, (httpx.Request, httpx.Response)) for value in reachable)
+    rendered = "\n".join(repr(value) for value in reachable)
+    for needle in forbidden:
+        assert needle not in rendered
+
+
 class TestCodeAssistFailClosedRegression:
+    def test_nonstream_transport_error_traceback_drops_request_envelope_and_kwargs(self):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        auth_value = "Bearer ya29.ISSUE40NONSTREAMTRANSPORT"
+        project = "proj-issue40-nonstream-transport"
+        envelope_marker = "ENVELOPE-MARKER-ISSUE40-NONSTREAM-TRANSPORT"
+
+        def handler(request):
+            assert request.headers.get("authorization") == auth_value
+            raise httpx.ReadError("transport failed after building request", request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodeAssistClient(
+                api_key="ya29.ISSUE40NONSTREAMTRANSPORT",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=http_client,
+                project=project,
+            )
+            with pytest.raises(GeminiAPIError) as raised:
+                client._create_chat_completion(
+                    model="gemini-3.1-pro-high",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": envelope_marker,
+                                }
+                            ],
+                        }
+                    ],
+                    extra_body={"nested": ["kwargs", envelope_marker]},
+                )
+
+        error = raised.value
+        assert error.code == "antigravity_transport_error"
+        assert error.status_code is None
+        assert error.response is None
+        assert error.__cause__ is None and error.__context__ is None
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {
+                auth_value,
+                "ya29.ISSUE40NONSTREAMTRANSPORT",
+                project,
+                envelope_marker,
+            },
+        )
+
+    def test_midstream_transport_error_traceback_drops_response_request_event_and_envelope(self):
+        import json
+
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        auth_value = "Bearer ya29.ISSUE40MIDSTREAMTRANSPORT"
+        project = "proj-issue40-midstream"
+        event_marker = "EVENT-MARKER-ISSUE40-MIDSTREAM"
+        envelope_marker = "ENVELOPE-MARKER-ISSUE40-MIDSTREAM"
+
+        class _FailingStream(httpx.SyncByteStream):
+            def __init__(self, request):
+                self._request = request
+
+            def __iter__(self):
+                event = {"response": {"candidates": [{"content": {"parts": [{"text": event_marker}]}}]}}
+                yield f"data: {json.dumps(event)}\n\n".encode()
+                raise httpx.ReadError("midstream read failed", request=self._request)
+
+            def close(self):
+                pass
+
+        def handler(request):
+            assert request.headers.get("authorization") == auth_value
+            return httpx.Response(200, stream=_FailingStream(request), request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodeAssistClient(
+                api_key="ya29.ISSUE40MIDSTREAMTRANSPORT",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=http_client,
+                project=project,
+            )
+            stream = iter(
+                client._create_chat_completion(
+                    model="gemini-3.1-pro-high",
+                    stream=True,
+                    messages=[{"role": "user", "content": envelope_marker}],
+                )
+            )
+            first_chunk = next(stream)
+            with pytest.raises(GeminiAPIError) as raised:
+                next(stream)
+
+        assert first_chunk.choices[0].delta.content == event_marker
+        error = raised.value
+        assert error.code == "antigravity_stream_error"
+        assert error.status_code is None
+        assert error.response is None
+        assert error.__cause__ is None and error.__context__ is None
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {
+                auth_value,
+                "ya29.ISSUE40MIDSTREAMTRANSPORT",
+                project,
+                envelope_marker,
+                event_marker,
+            },
+        )
+
+    def test_nonstream_http_error_traceback_drops_response_request_and_body(self):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        body_marker = "BODY-MARKER-ISSUE40-NONSTREAM"
+        auth_value = "Bearer ya29.ISSUE40CLIENTSECRET"
+        project = "proj-issue40-nonstream"
+
+        def handler(request):
+            assert request.headers.get("authorization") == auth_value
+            return httpx.Response(
+                500,
+                content=f"raw provider body {body_marker}".encode(),
+                request=request,
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodeAssistClient(
+                api_key="ya29.ISSUE40CLIENTSECRET",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=http_client,
+                project=project,
+            )
+            with pytest.raises(GeminiAPIError) as raised:
+                client._create_chat_completion(
+                    model="gemini-3.1-pro-high",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        error = raised.value
+        assert error.code == "antigravity_http_500"
+        assert error.status_code == 500
+        assert error.response is None
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {
+                body_marker,
+                auth_value,
+                "ya29.ISSUE40CLIENTSECRET",
+                project,
+            },
+        )
+
+    def test_streaming_http_error_traceback_drops_response_request_and_body(self):
+        import httpx
+
+        from agent.gemini_cloudcode_adapter import CODE_ASSIST_BASE_URL, CodeAssistClient
+        from agent.gemini_native_adapter import GeminiAPIError
+
+        body_marker = "BODY-MARKER-ISSUE40-STREAM"
+        auth_value = "Bearer ya29.ISSUE40STREAMSECRET"
+        project = "proj-issue40-stream"
+        payload = (
+            b'{"error":{"status":"RESOURCE_EXHAUSTED","details":['
+            b'{"@type":"type.googleapis.com/google.rpc.RetryInfo",'
+            b'"retryDelay":"13s"}],"message":"'
+            + body_marker.encode()
+            + b'"}}'
+        )
+
+        class _UnreadBody(httpx.SyncByteStream):
+            def __iter__(self):
+                yield payload
+
+            def close(self):
+                pass
+
+        def handler(request):
+            assert request.headers.get("authorization") == auth_value
+            return httpx.Response(429, stream=_UnreadBody(), request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+            client = CodeAssistClient(
+                api_key="ya29.ISSUE40STREAMSECRET",
+                base_url=CODE_ASSIST_BASE_URL,
+                http_client=http_client,
+                project=project,
+            )
+            stream = client._create_chat_completion(
+                model="gemini-3.1-pro-high",
+                stream=True,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            with pytest.raises(GeminiAPIError) as raised:
+                list(stream)
+
+        error = raised.value
+        assert error.code == "antigravity_rate_limited"
+        assert error.retry_after == 13.0
+        assert error.response is None
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {
+                body_marker,
+                auth_value,
+                "ya29.ISSUE40STREAMSECRET",
+                project,
+            },
+        )
+
     @pytest.mark.parametrize("stream", [False, True])
     def test_unresolved_project_never_sends_generate_request(self, stream):
         import httpx
@@ -1874,6 +2133,7 @@ class TestCodeAssistFailClosedRegression:
         from agent.gemini_native_adapter import GeminiAPIError
 
         urls = []
+        message_marker = f"ENVELOPE-MARKER-ISSUE40-UNRESOLVED-{stream}"
 
         def handler(request):
             urls.append(str(request.url))
@@ -1884,7 +2144,7 @@ class TestCodeAssistFailClosedRegression:
         with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
             client = CodeAssistClient(api_key="ya29.CLIENTSECRET", base_url=CODE_ASSIST_BASE_URL, http_client=http_client)
             with pytest.raises(GeminiAPIError) as raised:
-                result = client._create_chat_completion(model="gemini-3.1-pro-high", stream=stream, messages=[{"role": "user", "content": "hello"}])
+                result = client._create_chat_completion(model="gemini-3.1-pro-high", stream=stream, messages=[{"role": "user", "content": message_marker}])
                 if stream:
                     list(result)
 
@@ -1894,6 +2154,10 @@ class TestCodeAssistFailClosedRegression:
         assert error.response is None
         assert "SECRET" not in repr(error)
         assert error.__cause__ is None and error.__context__ is None
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {"ya29.CLIENTSECRET", "ya29.DISCOVERYSECRET", message_marker},
+        )
 
     def test_nonstream_invalid_json_does_not_retain_raw_body(self):
         import httpx
@@ -1902,6 +2166,7 @@ class TestCodeAssistFailClosedRegression:
         from agent.gemini_native_adapter import GeminiAPIError
 
         secret = "ya29.INVALIDJSONBODYSECRET"
+        project = "proj-invalid-json-issue40"
         with httpx.Client(
             transport=httpx.MockTransport(
                 lambda request: httpx.Response(200, content=f"credential={secret} <<not json>>")
@@ -1911,7 +2176,7 @@ class TestCodeAssistFailClosedRegression:
                 api_key="ya29.CLIENTSECRET",
                 base_url=CODE_ASSIST_BASE_URL,
                 http_client=http_client,
-                project="p",
+                project=project,
             )
             with pytest.raises(GeminiAPIError) as raised:
                 client._create_chat_completion(
@@ -1937,6 +2202,10 @@ class TestCodeAssistFailClosedRegression:
             isinstance(value, (httpx.Response, ValueError))
             for frame in frames
             for value in frame.f_locals.values()
+        )
+        _assert_antigravity_error_traceback_sanitized(
+            error,
+            {secret, "ya29.CLIENTSECRET", project},
         )
 
     def test_nonstream_429_keeps_only_allowlisted_error_details(self, monkeypatch):
