@@ -40,8 +40,10 @@ jobs:
         run: |
           set -euo pipefail
           SYNC_BRANCH="sync-upstream-main"
-          git checkout main
-          git checkout -B "$SYNC_BRANCH"
+          git fetch origin refs/heads/main:refs/remotes/origin/main
+          BASE_SHA="$(git rev-parse origin/main)"
+          git checkout -B "$SYNC_BRANCH" "$BASE_SHA"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
           # If this exact upstream head is already in our history, there is
           # nothing to sync. This remains correct when fork/main has custom
@@ -178,6 +180,7 @@ jobs:
         if: steps.merge.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
           PR_TITLE: 'chore: sync with upstream main'
           PR_BODY: 'Automated PR to sync this fork with `NousResearch/hermes-agent:main`. Conflicts fail the workflow and never modify the default branch.'
         shell: bash
@@ -282,8 +285,20 @@ jobs:
           PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER")"
           jq -e \
             --arg sha "$SYNC_SHA" \
-            '.state == "open" and .base.ref == "main" and .head.ref == "sync-upstream-main" and .head.sha == $sha' \
+            --arg base_sha "$BASE_SHA" \
+            '.state == "open" and .base.ref == "main" and .base.sha == $base_sha and .head.ref == "sync-upstream-main" and .head.sha == $sha' \
             <<<"$PR_JSON" >/dev/null
+
+          # GitHub's pull-request merge endpoint accepts an expected head SHA,
+          # but no expected base SHA. Recheck the remote base immediately before
+          # the request so a main advance fails closed instead of merging a sync
+          # branch that CI tested against an older base.
+          git fetch origin refs/heads/main:refs/remotes/origin/main
+          CURRENT_BASE_SHA="$(git rev-parse origin/main)"
+          [[ "$CURRENT_BASE_SHA" == "$BASE_SHA" ]] || {
+            echo "Main advanced after CI: expected $BASE_SHA, got $CURRENT_BASE_SHA"
+            exit 1
+          }
 
           # Use a real merge commit. Squashing would discard upstream ancestry
           # and make the same upstream commits appear unsynced on the next day.
