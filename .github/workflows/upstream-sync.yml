@@ -9,6 +9,7 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
+  issues: write
 
 concurrency:
   group: upstream-sync-main
@@ -61,6 +62,10 @@ jobs:
               echo "has_conflict=false"
             } >> "$GITHUB_OUTPUT"
           else
+            if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              echo "Upstream merge failed without MERGE_HEAD; not treating it as a conflict." >&2
+              exit 1
+            fi
             echo "Merge conflict detected; leaving main unchanged."
             {
               echo "has_changes=false"
@@ -68,11 +73,60 @@ jobs:
               echo "upstream_sha=$(git rev-parse upstream/main)"
               echo "conflict_files=$(git diff --name-only --diff-filter=U | paste -sd, -)"
             } >> "$GITHUB_OUTPUT"
-            git merge --abort
+            git merge --abort || {
+              echo "git merge --abort failed after confirmed conflict." >&2
+              exit 1
+            }
+          fi
+
+      - name: Create or update upstream sync recovery issue
+        if: ${{ !cancelled() && steps.merge.outputs.has_conflict == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+          FORK_MAIN_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISSUE_TITLE="upstream-sync-conflict:$UPSTREAM_SHA"
+          ISSUE_BODY="$(
+            printf 'upstream_sha: %s\nfork_main_sha: %s\nconflict_files:\n--- begin conflict filenames ---\n%s\n--- end conflict filenames ---\nrun_url: %s\n' \
+              "$UPSTREAM_SHA" "$FORK_MAIN_SHA" "$CONFLICT_FILES" "$RUN_URL"
+          )"
+          MATCHING_ISSUES="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=100" |
+              jq -sc --arg title "$ISSUE_TITLE" '
+                add
+                | [ .[] | select(.pull_request == null and .title == $title) ]
+                | sort_by(.number)
+              '
+          )"
+          ISSUE_NUMBER="$(jq -r '.[0].number // empty' <<<"$MATCHING_ISSUES")"
+          if [[ -n "$ISSUE_NUMBER" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER" \
+              -f state=open \
+              -f body="$ISSUE_BODY" >/dev/null
+            jq -r --argjson canonical "$ISSUE_NUMBER" \
+              '.[] | select(.number != $canonical and .state == "open") | .number' \
+              <<<"$MATCHING_ISSUES" |
+              while read -r DUPLICATE_NUMBER; do
+                gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/$DUPLICATE_NUMBER" -f state=closed >/dev/null
+                echo "Closed duplicate recovery issue #$DUPLICATE_NUMBER for $UPSTREAM_SHA."
+              done
+            echo "Reopened or updated canonical recovery issue #$ISSUE_NUMBER for $UPSTREAM_SHA."
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues" \
+              -f title="$ISSUE_TITLE" \
+              -f body="$ISSUE_BODY" \
+              --jq '.number' >/dev/null
+            echo "Created recovery issue for $UPSTREAM_SHA."
           fi
 
       - name: Notify Hermes Gateway to resolve conflict
-        if: steps.merge.outputs.has_conflict == 'true'
+        if: ${{ !cancelled() && steps.merge.outputs.has_conflict == 'true' }}
+        continue-on-error: true
         env:
           WEBHOOK_URL: ${{ secrets.UPSTREAM_SYNC_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.UPSTREAM_SYNC_WEBHOOK_SECRET }}
@@ -83,6 +137,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ -n "$WEBHOOK_URL" && -n "$WEBHOOK_SECRET" ]] || exit 0
           PAYLOAD="$(
             jq -nc \
               --arg event upstream_sync_conflict \
@@ -112,8 +167,12 @@ jobs:
             --header "X-Webhook-Signature-V2: $SIGNATURE" \
             --data-binary "$PAYLOAD" \
             "$WEBHOOK_URL"
-          echo "Hermes Gateway accepted the conflict event; failing this run visibly."
-          exit 1
+          echo "Hermes Gateway accepted the conflict event."
+
+      - name: Fail closed after upstream sync conflict
+        if: ${{ !cancelled() && steps.merge.outputs.has_conflict == 'true' }}
+        shell: bash
+        run: exit 1
 
       - name: Validate and merge sync PR
         if: steps.merge.outputs.has_changes == 'true'
@@ -163,9 +222,11 @@ jobs:
                 --branch sync-upstream-main \
                 --event workflow_dispatch \
                 --limit 20 \
-                --json databaseId,displayTitle,headSha \
-                --jq ".[] | select(.headSha == \"$SYNC_SHA\" and .displayTitle == \"CI upstream-sync $SYNC_TOKEN\") | .databaseId" \
-                | head -n 1
+                --json databaseId,displayTitle,headSha |
+              jq -r \
+                --arg sha "$SYNC_SHA" \
+                --arg title "CI upstream-sync $SYNC_TOKEN" \
+                '[.[] | select(.headSha == $sha and .displayTitle == $title) | .databaseId][0] // empty'
             )"
             [[ -n "$RUN_ID" ]] && break
             sleep 5
@@ -236,3 +297,26 @@ jobs:
 
           git fetch origin main
           git merge-base --is-ancestor "$SYNC_SHA" origin/main
+
+      - name: Close resolved upstream sync recovery issues
+        if: steps.merge.outputs.has_conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" |
+            jq -rs -r '
+              .[].[]
+              | select(.pull_request == null)
+              | . as $issue
+              | try (.title | capture("^upstream-sync-conflict:(?<sha>[0-9a-f]{40})$").sha) catch empty
+              | "\($issue.number) \(.)"
+            ' |
+            while read -r ISSUE_NUMBER TRACKED_SHA; do
+              if git merge-base --is-ancestor "$TRACKED_SHA" origin/main; then
+                gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/$ISSUE_NUMBER" -f state=closed >/dev/null
+                echo "Closed resolved recovery issue #$ISSUE_NUMBER for $TRACKED_SHA."
+              fi
+            done
