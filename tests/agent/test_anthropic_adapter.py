@@ -1922,10 +1922,8 @@ class TestOAuthSanitizerUrlPreservation:
     review on #48868).
     """
 
-    def _sanitized_system_text(self, prompt: str) -> str:
-        """Run the prompt through the real OAuth path and return the
-        sanitized text block (excluding the prepended Claude Code identity
-        block, which is unrelated to this sanitizer)."""
+    def _system_text(self, prompt: str, *, is_oauth: bool = True) -> str:
+        """Run the prompt through the real Anthropic kwargs path."""
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
             messages=[
@@ -1935,9 +1933,12 @@ class TestOAuthSanitizerUrlPreservation:
             tools=None,
             max_tokens=4096,
             reasoning_config=None,
-            is_oauth=True,
+            is_oauth=is_oauth,
         )
         system = kwargs["system"]
+        if not is_oauth:
+            assert isinstance(system, str)
+            return system
         assert isinstance(system, list), (
             "OAuth system prompt should be a list of content blocks"
         )
@@ -1945,6 +1946,10 @@ class TestOAuthSanitizerUrlPreservation:
         # original (sanitized) prompt is the block after it.
         assert len(system) >= 2
         return system[-1]["text"]
+
+    def _sanitized_system_text(self, prompt: str) -> str:
+        """Return the sanitized OAuth system prompt block from the real path."""
+        return self._system_text(prompt, is_oauth=True)
 
     def test_docs_url_host_is_preserved(self):
         """hermes-agent.nousresearch.com must survive sanitization intact."""
@@ -1968,12 +1973,33 @@ class TestOAuthSanitizerUrlPreservation:
         assert "Nous Research" not in result
 
     def test_url_host_preserved_and_name_replaced_together(self):
-        """Both rules must hold when the prompt contains the URL and the product name."""
-        prompt = (
-            "Hermes Agent help: https://hermes-agent.nousresearch.com/docs"
-        )
+        """Both rules must hold when the prompt contains the URL and product name."""
+        prompt = "Hermes Agent help: https://hermes-agent.nousresearch.com/docs"
         result = self._sanitized_system_text(prompt)
         assert "Claude Code" in result
         assert "hermes-agent.nousresearch.com" in result
         assert "claude-code.nousresearch.com" not in result
 
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            "/Users/shikama/.hermes/hermes-agent/pyproject.toml",
+            "https://hermes-agent.nousresearch.com/docs",
+            "https://github.com/NousResearch/hermes-agent",
+            "skill_view(name='hermes-agent')",
+            "`hermes-agent`",
+            "'NousResearch/hermes-agent'",
+        ],
+    )
+    def test_oauth_preserves_literal_contexts_byte_for_byte(self, literal):
+        result = self._sanitized_system_text(f"Use {literal} exactly.")
+        assert literal in result
+
+    def test_oauth_still_rewrites_standalone_slug_in_prose(self):
+        result = self._sanitized_system_text("running under hermes-agent right now")
+        assert result == "running under claude-code right now"
+
+    def test_api_key_path_preserves_absolute_literal_byte_for_byte(self):
+        path = "/Users/shikama/.hermes/hermes-agent/pyproject.toml"
+        result = self._system_text(f"Open {path} exactly.", is_oauth=False)
+        assert result == f"Open {path} exactly."
