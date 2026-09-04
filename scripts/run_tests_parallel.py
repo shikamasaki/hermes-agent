@@ -399,6 +399,10 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
+    # This runner consumes the outer slice before launching per-file pytest.
+    # A test may invoke the runner again, so forwarding it would recursively
+    # re-slice that nested run. Keep all other HERMES_TEST_* settings intact.
+    env.pop("HERMES_TEST_SLICE", None)
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
