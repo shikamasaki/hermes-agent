@@ -615,12 +615,14 @@ _OAUTH_PROSE_ALIAS_PATTERNS = tuple(
 
 # OAuth requests still need Claude Code identity compatibility in ordinary
 # prose, but the sanitizer must not rewrite literal strings the parent supplied
-# as paths, URLs, repository names, or quoted/code values. Keep the rewrite to
-# the bare product slug only: ``running under hermes-agent`` rewrites, while
-# ``/.../hermes-agent/...``, ``https://.../hermes-agent``, and
-# ``name='hermes-agent'`` remain byte-identical.
+# as paths, URLs, repository names, packages, handles, or quoted/code values.
+# Keep the rewrite to the bare product slug only: ``running under hermes-agent``
+# rewrites, while ``/.../hermes-agent/...``, ``hermes-agent-core``,
+# ``hermes-agent.py``, ``@hermes-agent``, and ``name='hermes-agent'`` remain
+# byte-identical. A final period is conservatively treated as a possible file
+# suffix delimiter, so ambiguous ``hermes-agent.`` text is preserved.
 _OAUTH_HERMES_AGENT_PROSE_PATTERN = re.compile(
-    r"(?<![:/\w'\"`=])hermes-agent(?!\.nousresearch\.com)"
+    r"(?<![:/\\\w'\"`=@.-])hermes-agent(?![./\\\w:=\[\]-])"
 )
 
 

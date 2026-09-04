@@ -1995,9 +1995,44 @@ class TestOAuthSanitizerUrlPreservation:
         result = self._sanitized_system_text(f"Use {literal} exactly.")
         assert literal in result
 
-    def test_oauth_still_rewrites_standalone_slug_in_prose(self):
-        result = self._sanitized_system_text("running under hermes-agent right now")
-        assert result == "running under claude-code right now"
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            ("pip install hermes-agent-core", "pip install hermes-agent-core"),
+            ("use foo-hermes-agent exactly", "use foo-hermes-agent exactly"),
+            ("python hermes-agent.py", "python hermes-agent.py"),
+            ("contact @hermes-agent", "contact @hermes-agent"),
+            (
+                r"open C:\Users\u\hermes-agent\pyproject.toml",
+                r"open C:\Users\u\hermes-agent\pyproject.toml",
+            ),
+            ("install hermes-agent==1.2", "install hermes-agent==1.2"),
+            ("install hermes-agent[extra]", "install hermes-agent[extra]"),
+            ("pull hermes-agent:tag", "pull hermes-agent:tag"),
+        ],
+    )
+    def test_oauth_preserves_identifier_path_and_package_forms(
+        self, prompt, expected
+    ):
+        result = self._sanitized_system_text(prompt)
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            (
+                "running under hermes-agent right now",
+                "running under claude-code right now",
+            ),
+            ("(hermes-agent) is running", "(claude-code) is running"),
+            ("use hermes-agent, then continue", "use claude-code, then continue"),
+        ],
+    )
+    def test_oauth_still_rewrites_standalone_slug_in_prose(
+        self, prompt, expected
+    ):
+        result = self._sanitized_system_text(prompt)
+        assert result == expected
 
     def test_api_key_path_preserves_absolute_literal_byte_for_byte(self):
         path = "/Users/shikama/.hermes/hermes-agent/pyproject.toml"
