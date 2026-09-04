@@ -417,6 +417,48 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
     assert "1 tests passed" in proc.stdout
 
 
+def test_child_pytest_removes_slice_environment_but_keeps_other_test_settings(
+    tmp_path: Path,
+) -> None:
+    """A sliced parent must not recursively slice its per-file pytest child."""
+    probe = tmp_path / "test_child_environment.py"
+    probe.write_text(
+        "import os\n\n"
+        "def test_child_environment():\n"
+        "    assert 'HERMES_TEST_SLICE' not in os.environ\n"
+        "    assert os.environ['HERMES_TEST_WORKERS'] == '13'\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    env = os.environ.copy()
+    env["HERMES_TEST_SLICE"] = "1/4"
+    env["HERMES_TEST_WORKERS"] = "13"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--files",
+            str(probe),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
+
 def test_multiple_absolute_paths_split_on_pathsep(tmp_path: Path) -> None:
     """``--paths`` accepts ``os.pathsep``-joined absolute paths.
 
