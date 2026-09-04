@@ -204,6 +204,33 @@ def test_merge_is_exact_sha_guarded_and_preserves_upstream_ancestry():
     assert "head.sha" in scripts
 
 
+def test_clean_sync_pins_the_remote_main_sha_used_for_merge_and_rechecks_it_before_pr_merge():
+    workflow = _workflow(SYNC_WORKFLOW)
+    steps = workflow["jobs"]["sync"]["steps"]
+    merge_step = next(
+        step for step in steps if step["name"] == "Merge upstream into sync branch"
+    )
+    validate_step = next(
+        step for step in steps if step["name"] == "Validate and merge sync PR"
+    )
+
+    fetch_main = 'git fetch origin refs/heads/main:refs/remotes/origin/main'
+    assert fetch_main in merge_step["run"]
+    assert 'BASE_SHA="$(git rev-parse origin/main)"' in merge_step["run"]
+    assert 'git checkout -B "$SYNC_BRANCH" "$BASE_SHA"' in merge_step["run"]
+    assert 'echo "base_sha=$BASE_SHA"' in merge_step["run"]
+    assert validate_step["env"]["BASE_SHA"] == "${{ steps.merge.outputs.base_sha }}"
+
+    script = validate_step["run"]
+    recheck = 'CURRENT_BASE_SHA="$(git rev-parse origin/main)"'
+    assert script.index(fetch_main) < script.index(recheck) < script.index(
+        'gh api --method PUT "repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER/merge"'
+    )
+    assert '[[ "$CURRENT_BASE_SHA" == "$BASE_SHA" ]]' in script
+    assert '--arg base_sha "$BASE_SHA"' in script
+    assert ".base.sha == $base_sha" in script
+
+
 RECOVERY_MATCH_FILTER = """add
 | [ .[] | select(.pull_request == null and .title == $title) ]
 | sort_by(.number)"""
