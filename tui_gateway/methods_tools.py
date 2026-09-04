@@ -2272,6 +2272,10 @@ def _(rid, params: dict) -> dict:
             tools = _probe_single_server(name, cfg, details=details)
             token_present = _oauth_tokens_present(name, cfg) if needs_oauth_token else True
         except Exception as exc:
+            try:
+                oauth_tokens_present = _oauth_tokens_present(name, cfg) if needs_oauth_token else None
+            except ValueError:
+                oauth_tokens_present = None
             return _ok(
                 rid,
                 {
@@ -2279,9 +2283,7 @@ def _(rid, params: dict) -> dict:
                     "error": str(exc),
                     "tools": [],
                     "oauth_needed": needs_oauth_token,
-                    "oauth_tokens_present": _oauth_tokens_present(name, cfg)
-                    if needs_oauth_token
-                    else None,
+                    "oauth_tokens_present": oauth_tokens_present,
                 },
             )
         if not token_present:
@@ -2338,7 +2340,10 @@ def _(rid, params: dict) -> dict:
             oauth_config = server_config.get("oauth")
             if not isinstance(oauth_config, dict):
                 oauth_config = None
-            get_manager().remove(name, oauth_config=oauth_config)
+            try:
+                get_manager().remove(name, oauth_config=oauth_config)
+            except ValueError:
+                pass
         return _ok(rid, {"ok": True, "removed": True})
     except Exception as e:
         return _err(rid, 5024, str(e))

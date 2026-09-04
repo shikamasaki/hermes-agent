@@ -57,6 +57,18 @@ def test_token_presence_rejects_missing_credential_profile(monkeypatch) -> None:
         _oauth_tokens_present("tracery", cfg)
 
 
+def test_resolve_credential_home_canonicalizes_symlinked_profile(monkeypatch, tmp_path) -> None:
+    real_owner = tmp_path / "real-owner"
+    real_owner.mkdir()
+    linked_owner = tmp_path / "linked-owner"
+    linked_owner.symlink_to(real_owner, target_is_directory=True)
+    _install_profile(monkeypatch, linked_owner)
+
+    resolved = resolve_credential_home("tracery", {"credential_profile": "welby"})
+
+    assert resolved == real_owner.resolve(strict=False)
+
+
 def test_storage_round_trip_stays_in_credential_profile(monkeypatch, tmp_path) -> None:
     caller_home = tmp_path / "caller"
     owner_home = tmp_path / "owner"
@@ -100,6 +112,141 @@ def test_storage_rollback_replaces_partial_new_state(tmp_path) -> None:
     assert storage._tokens_path().read_bytes() == b"old-token"
     assert storage._client_info_path().read_bytes() == b"old-client"
     assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_rollback_preserves_later_token_writer_with_absent_guard(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._tokens_path().write_bytes(b'{"access_token":"new-concurrent-token","token_type":"Bearer"}')
+    storage.restore(backup, only_if_absent=True)
+
+    assert storage._tokens_path().read_bytes() == b'{"access_token":"new-concurrent-token","token_type":"Bearer"}'
+    assert storage._client_info_path().read_bytes() == b"old-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_rollback_replaces_partial_new_state_with_absent_guard(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._client_info_path().write_bytes(b"partial-new-client")
+    failed_flow = storage.snapshot()
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert storage._tokens_path().read_bytes() == b"old-token"
+    assert storage._client_info_path().read_bytes() == b"old-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_content_rollback_restores_own_partial_client_before_token(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._client_info_path().write_bytes(b"failed-client")
+    failed_flow = storage.snapshot()
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert storage._tokens_path().read_bytes() == b"old-token"
+    assert storage._client_info_path().read_bytes() == b"old-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_content_rollback_preserves_later_client_without_token(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._client_info_path().write_bytes(b"failed-client")
+    failed_flow = storage.snapshot()
+    storage._client_info_path().write_bytes(b"later-client")
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert storage._tokens_path().read_bytes() == b"old-token"
+    assert storage._client_info_path().read_bytes() == b"later-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_content_rollback_preserves_later_token(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._client_info_path().write_bytes(b"failed-client")
+    failed_flow = storage.snapshot()
+    storage._tokens_path().write_bytes(b"later-token")
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert storage._tokens_path().read_bytes() == b"later-token"
+    assert storage._client_info_path().read_bytes() == b"old-client"
+    assert storage._meta_path().read_bytes() == b"old-meta"
+
+
+def test_storage_content_rollback_handles_per_file_mixed_state(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    storage._tokens_path().write_bytes(b"old-token")
+    storage._client_info_path().write_bytes(b"old-client")
+    storage._meta_path().write_bytes(b"old-meta")
+    backup = storage.snapshot()
+
+    storage.remove()
+    storage._tokens_path().write_bytes(b"failed-token")
+    storage._client_info_path().write_bytes(b"failed-client")
+    storage._meta_path().write_bytes(b"failed-meta")
+    failed_flow = storage.snapshot()
+    storage._client_info_path().write_bytes(b"later-client")
+    storage._meta_path().unlink()
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert storage._tokens_path().read_bytes() == b"old-token"
+    assert storage._client_info_path().read_bytes() == b"later-client"
+    assert not storage._meta_path().exists()
+
+
+def test_storage_content_rollback_cleans_up_empty_snapshot(tmp_path) -> None:
+    storage = HermesTokenStorage("tracery", hermes_home=tmp_path)
+    backup = storage.snapshot()
+
+    storage._tokens_path().parent.mkdir(parents=True)
+    storage._client_info_path().write_bytes(b"failed-client")
+    storage._meta_path().write_bytes(b"failed-meta")
+    failed_flow = storage.snapshot()
+    storage.restore(backup, only_if_absent=True, expected_current=failed_flow)
+
+    assert not storage._tokens_path().exists()
+    assert not storage._client_info_path().exists()
+    assert not storage._meta_path().exists()
+
 
 
 def test_web_transaction_lock_is_keyed_by_credential_owner() -> None:
@@ -174,7 +321,7 @@ def test_manager_rebuilds_provider_when_credential_profile_changes(monkeypatch) 
     ]
 
 
-def test_manager_remove_deletes_owner_only(monkeypatch, tmp_path) -> None:
+def test_manager_remove_borrower_skips_shared_owner_tokens(monkeypatch, tmp_path) -> None:
     caller_home = tmp_path / "caller"
     owner_home = tmp_path / "owner"
     _install_profile(monkeypatch, owner_home)
@@ -193,7 +340,7 @@ def test_manager_remove_deletes_owner_only(monkeypatch, tmp_path) -> None:
     )
 
     assert caller_token.exists()
-    assert not owner_token.exists()
+    assert owner_token.exists()
 
 
 def test_manager_remove_prefers_explicit_config_over_stale_cache(
@@ -222,7 +369,70 @@ def test_manager_remove_prefers_explicit_config_over_stale_cache(
     )
 
     assert caller_token.exists()
-    assert not owner_token.exists()
+    assert owner_token.exists()
+
+
+def test_manager_remove_owner_evicts_all_borrower_caches_for_same_token_home(monkeypatch, tmp_path) -> None:
+    owner_home = tmp_path / "owner"
+    borrower_a = tmp_path / "borrower-a"
+    borrower_b = tmp_path / "borrower-b"
+    _install_profile(monkeypatch, owner_home)
+    token_path = owner_home / "mcp-tokens" / "tracery.json"
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text("{}")
+
+    manager = MCPOAuthManager()
+    manager._entries[manager._key("tracery", borrower_a)] = _ProviderEntry(
+        "https://beproud.tracery.jp/mcp",
+        {"credential_profile": "welby"},
+        provider=SimpleNamespace(name="a"),
+    )
+    manager._entries[manager._key("tracery", borrower_b)] = _ProviderEntry(
+        "https://beproud.tracery.jp/mcp",
+        {"credential_profile": "welby"},
+        provider=SimpleNamespace(name="b"),
+    )
+
+    manager.remove("tracery", hermes_home=owner_home, oauth_config=None)
+
+    assert not token_path.exists()
+    assert manager._key("tracery", borrower_a) not in manager._entries
+    assert manager._key("tracery", borrower_b) not in manager._entries
+
+
+def test_manager_remove_owner_skips_invalid_cached_profile_and_continues(monkeypatch, tmp_path) -> None:
+    owner_home = tmp_path / "owner"
+    borrower_good = tmp_path / "borrower-good"
+    borrower_bad = tmp_path / "borrower-bad"
+    unrelated = tmp_path / "unrelated"
+    _install_profile(monkeypatch, owner_home)
+    token_path = owner_home / "mcp-tokens" / "tracery.json"
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text("{}")
+
+    manager = MCPOAuthManager()
+    manager._entries[manager._key("tracery", borrower_bad)] = _ProviderEntry(
+        "https://beproud.tracery.jp/mcp",
+        {"credential_profile": "missing"},
+        provider=SimpleNamespace(name="bad"),
+    )
+    manager._entries[manager._key("tracery", borrower_good)] = _ProviderEntry(
+        "https://beproud.tracery.jp/mcp",
+        {"credential_profile": "welby"},
+        provider=SimpleNamespace(name="good"),
+    )
+    manager._entries[manager._key("other", unrelated)] = _ProviderEntry(
+        "https://example.invalid/mcp",
+        {},
+        provider=SimpleNamespace(name="unrelated"),
+    )
+
+    manager.remove("tracery", hermes_home=owner_home, oauth_config=None)
+
+    assert not token_path.exists()
+    assert manager._key("tracery", borrower_good) not in manager._entries
+    assert manager._key("tracery", borrower_bad) not in manager._entries
+    assert manager._key("other", unrelated) in manager._entries
 
 
 def test_disk_watch_observes_owner_profile(monkeypatch, tmp_path) -> None:

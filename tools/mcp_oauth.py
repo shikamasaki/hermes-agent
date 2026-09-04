@@ -227,7 +227,7 @@ def resolve_credential_home(server_name: str, oauth_config: dict | None) -> Path
             f"MCP OAuth for '{server_name}': credential profile "
             f"{canonical!r} does not exist"
         )
-    return get_profile_dir(canonical)
+    return get_profile_dir(canonical).expanduser().resolve(strict=False)
 
 
 def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
@@ -695,25 +695,39 @@ class HermesTokenStorage:
                 pass
         return snap
 
-    def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
-        """Revert to a snapshot without overwriting a concurrent successful write."""
-        if only_if_absent and any(
-            path.exists()
-            for path in (self._tokens_path(), self._client_info_path(), self._meta_path())
-        ):
-            logger.info(
-                "Skipping OAuth rollback for %s because newer state exists",
-                self._server_name,
-            )
-            return
-        self.remove()
-        if not snapshot:
-            return
+    def restore(
+        self,
+        snapshot: dict[str, bytes],
+        *,
+        only_if_absent: bool = False,
+        expected_current: dict[str, bytes] | None = None,
+    ) -> None:
+        """Revert to a snapshot without clobbering a later writer.
+
+        ``only_if_absent`` is used after failed dashboard/TUI re-auth.  Callers
+        that might race another in-process writer must pass ``expected_current``:
+        the failed flow's on-disk state captured immediately before rollback.
+        Each managed file is restored/deleted only if its current bytes still
+        match that expected failed-flow state.  If bytes differ, or a file
+        appears after that capture, that later writer's state is preserved.
+
+        This compare/write is serialized by the canonical in-process
+        credential-home transaction lock used by dashboard/TUI login flows. It
+        is still only best-effort across separate Hermes processes: without a
+        cross-process lock a writer can modify a file between our compare and
+        overwrite, so we keep the per-file byte check but do not claim full
+        inter-process atomicity.
+        """
         token_dir = _get_token_dir(self._hermes_home)
-        token_dir.mkdir(parents=True, exist_ok=True)
-        for fname, data in snapshot.items():
-            path = token_dir / fname
+        paths = {
+            self._tokens_path().name: self._tokens_path(),
+            self._client_info_path().name: self._client_info_path(),
+            self._meta_path().name: self._meta_path(),
+        }
+
+        def _write_bytes(path: Path, fname: str, data: bytes) -> None:
             try:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 fd = os.open(
                     str(path),
                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
@@ -723,6 +737,44 @@ class HermesTokenStorage:
                     fh.write(data)
             except OSError as exc:
                 logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
+
+        def _matches_expected(
+            path: Path,
+            fname: str,
+            expected: dict[str, bytes],
+        ) -> bool:
+            try:
+                current = path.read_bytes()
+            except OSError:
+                return fname not in expected
+            expected_bytes = expected.get(fname)
+            return expected_bytes is not None and current == expected_bytes
+
+        if only_if_absent and expected_current is not None:
+            for fname, path in paths.items():
+                if not _matches_expected(path, fname, expected_current):
+                    continue
+                if fname in snapshot:
+                    _write_bytes(path, fname, snapshot[fname])
+                else:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning("Failed to remove OAuth state %s: %s", fname, exc)
+            return
+
+        preserve_existing = only_if_absent and self._tokens_path().exists()
+        if not preserve_existing:
+            for path in paths.values():
+                path.unlink(missing_ok=True)
+        if not snapshot:
+            return
+        token_dir.mkdir(parents=True, exist_ok=True)
+        for fname, data in snapshot.items():
+            path = paths.get(fname, token_dir / fname)
+            if preserve_existing and path.exists():
+                continue
+            _write_bytes(path, fname, data)
 
     def poison_client_registration(self) -> bool:
         """Discard a dead dynamically-registered client so it gets re-created.

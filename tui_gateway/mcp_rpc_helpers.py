@@ -59,8 +59,13 @@ def summarize_server(name: str, cfg: dict) -> Dict[str, Any]:
         str(key).lower() == "authorization" for key in headers
     ):
         auth = "header"
-    tokens_present = _oauth_tokens_present(name, cfg) if auth == "oauth" else None
-    return {
+    try:
+        tokens_present = _oauth_tokens_present(name, cfg) if auth == "oauth" else None
+        oauth_error = None
+    except ValueError as exc:
+        tokens_present = None
+        oauth_error = str(exc)
+    result = {
         "name": name,
         "transport": transport,
         "url": cfg.get("url"),
@@ -72,3 +77,6 @@ def summarize_server(name: str, cfg: dict) -> Dict[str, Any]:
         "enabled": cfg.get("enabled", True) is not False,
         "tools": cfg.get("tools"),
     }
+    if oauth_error is not None:
+        result["oauth_error"] = oauth_error
+    return result

@@ -233,7 +233,12 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
 
                         reconnect_mcp_server(server_name)
                 except Exception:
-                    storage.restore(backup)
+                    failed_flow = storage.snapshot()
+                    storage.restore(
+                        backup,
+                        only_if_absent=True,
+                        expected_current=failed_flow,
+                    )
                     manager.restore_entry(server_name, previous_entry, hermes_home=hermes_home)
                     raise
         finally:

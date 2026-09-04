@@ -14028,7 +14028,12 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
 
                         reconnect_mcp_server(flow.server_name)
                 except Exception:
-                    storage.restore(backup)
+                    failed_flow = storage.snapshot()
+                    storage.restore(
+                        backup,
+                        only_if_absent=True,
+                        expected_current=failed_flow,
+                    )
                     manager.restore_entry(
                         flow.server_name,
                         previous_entry,

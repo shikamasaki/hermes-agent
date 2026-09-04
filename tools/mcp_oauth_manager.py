@@ -844,9 +844,50 @@ class MCPOAuthManager:
             else (entry.oauth_config if entry is not None else None)
         )
         credential_home = resolve_credential_home(server_name, config)
+        caller_home = self._key(server_name, hermes_home)[0]
+        token_home = (
+            credential_home.expanduser().resolve(strict=False)
+            if credential_home is not None
+            else Path(caller_home)
+        )
+        token_home_key = str(token_home)
+        if credential_home is not None and token_home_key != caller_home:
+            logger.info(
+                "MCP OAuth '%s': evicted borrower cache; shared owner tokens preserved",
+                server_name,
+            )
+            return entry
+
+        with self._entries_lock:
+            for cached_key, cached_entry in list(self._entries.items()):
+                if cached_key[1] != server_name:
+                    continue
+                try:
+                    cached_credential_home = resolve_credential_home(
+                        server_name,
+                        cached_entry.oauth_config,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "MCP OAuth '%s': evicting stale cached credential_profile "
+                        "entry for %s: %s",
+                        server_name,
+                        cached_key[0],
+                        exc,
+                    )
+                    self._entries.pop(cached_key, None)
+                    continue
+                cached_token_home = (
+                    cached_credential_home.expanduser().resolve(strict=False)
+                    if cached_credential_home is not None
+                    else Path(cached_key[0])
+                )
+                if str(cached_token_home) == token_home_key:
+                    self._entries.pop(cached_key, None)
+
         remove_oauth_tokens(
             server_name,
-            hermes_home=credential_home if credential_home is not None else hermes_home,
+            hermes_home=token_home,
         )
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
