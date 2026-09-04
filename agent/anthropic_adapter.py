@@ -613,6 +613,18 @@ _OAUTH_PROSE_ALIAS_PATTERNS = tuple(
     for name in sorted(_OAUTH_PROSE_ALIAS_NAMES)
 )
 
+# OAuth requests still need Claude Code identity compatibility in ordinary
+# prose, but the sanitizer must not rewrite literal strings the parent supplied
+# as paths, URLs, repository names, packages, handles, or quoted/code values.
+# Keep the rewrite to the bare product slug only: ``running under hermes-agent``
+# rewrites, while ``/.../hermes-agent/...``, ``hermes-agent-core``,
+# ``hermes-agent.py``, ``@hermes-agent``, and ``name='hermes-agent'`` remain
+# byte-identical. A final period is conservatively treated as a possible file
+# suffix delimiter, so ambiguous ``hermes-agent.`` text is preserved.
+_OAUTH_HERMES_AGENT_PROSE_PATTERN = re.compile(
+    r"(?<![:/\\\w'\"`=@.-])hermes-agent(?![./\\\w:=\[\]-])"
+)
+
 
 def _apply_oauth_prose_aliases(text: str) -> str:
     """Rewrite prose-safe tool-name tokens to their OAuth wire aliases."""
@@ -1038,7 +1050,7 @@ def build_anthropic_kwargs(
                 text = block.get("text", "")
                 text = text.replace("Hermes Agent", "Claude Code")
                 text = text.replace("Hermes agent", "Claude Code")
-                text = text.replace("hermes-agent", "claude-code")
+                text = _OAUTH_HERMES_AGENT_PROSE_PATTERN.sub("claude-code", text)
                 text = text.replace("Nous Research", "Anthropic")
                 text = _apply_oauth_prose_aliases(text)
                 block["text"] = text
