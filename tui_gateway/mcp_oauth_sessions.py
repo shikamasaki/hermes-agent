@@ -186,7 +186,7 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
             set_secret_scope,
         )
         from tools.mcp_dashboard_oauth import dashboard_oauth_flow
-        from tools.mcp_oauth import force_interactive_oauth
+        from tools.mcp_oauth import force_interactive_oauth, resolve_credential_home
         from tools.mcp_oauth_manager import get_manager
 
         home_token = set_hermes_home_override(hermes_home)
@@ -196,17 +196,30 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
                 from tools.mcp_oauth import HermesTokenStorage
 
                 manager = get_manager()
-                storage = HermesTokenStorage(server_name)
+                oauth_config = cfg.get("oauth")
+                if not isinstance(oauth_config, dict):
+                    oauth_config = None
+                credential_home = resolve_credential_home(server_name, oauth_config)
+                storage = HermesTokenStorage(
+                    server_name,
+                    hermes_home=(
+                        credential_home if credential_home is not None else hermes_home
+                    ),
+                )
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
-                    previous_entry = manager.remove(server_name, hermes_home=hermes_home)
+                    previous_entry = manager.remove(
+                        server_name,
+                        hermes_home=hermes_home,
+                        oauth_config=oauth_config,
+                    )
                     tools = _probe_single_server(
                         server_name,
                         cfg,
                         connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
                     )
-                    if not _oauth_tokens_present(server_name):
+                    if not _oauth_tokens_present(server_name, cfg):
                         raise RuntimeError(
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."
@@ -220,7 +233,12 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
 
                         reconnect_mcp_server(server_name)
                 except Exception:
-                    storage.restore(backup, only_if_absent=True)
+                    failed_flow = storage.snapshot()
+                    storage.restore(
+                        backup,
+                        only_if_absent=True,
+                        expected_current=failed_flow,
+                    )
                     manager.restore_entry(server_name, previous_entry, hermes_home=hermes_home)
                     raise
         finally:
@@ -270,11 +288,18 @@ def start_flow(
     ``deliver_callback_flow``. Invalid values raise ``ValueError``.
     """
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+    from tools.mcp_oauth import resolve_credential_home
 
     if client_redirect_uri is not None:
         client_redirect_uri = _validate_client_redirect_uri(client_redirect_uri)
 
     _gc_sessions()
+
+    oauth_config = cfg.get("oauth")
+    if not isinstance(oauth_config, dict):
+        oauth_config = None
+    resolved_credential_home = resolve_credential_home(server_name, oauth_config)
+    credential_home = str(resolved_credential_home or Path(hermes_home))
 
     with _sessions_lock:
         pending = sum(
@@ -286,7 +311,7 @@ def start_flow(
             raise RuntimeError("Too many MCP OAuth flows are already in progress")
         if any(
             r["server_name"] == server_name
-            and r["hermes_home"] == hermes_home
+            and r["credential_home"] == credential_home
             and not r["flow"].worker_done
             for r in _sessions.values()
         ):
@@ -298,6 +323,7 @@ def start_flow(
         server_name=server_name,
         profile=None,
         hermes_home=hermes_home,
+        credential_home=credential_home,
         redirect_uri="",  # set below once the loopback port is known
         reconnect_live=reconnect_live,
     )
@@ -317,6 +343,7 @@ def start_flow(
         "session_id": session_id,
         "server_name": server_name,
         "hermes_home": hermes_home,
+        "credential_home": credential_home,
         "flow": flow,
         "httpd": httpd,
         "created_at": time.time(),

@@ -150,7 +150,11 @@ class TestProfileScopedMcp:
             "_probe_single_server",
             lambda name, config, connect_timeout=30, details=None: [("tool-a", "desc")],
         )
-        monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: False)
+        monkeypatch.setattr(
+            mcp_config,
+            "_oauth_tokens_present",
+            lambda name, server_config=None: False,
+        )
 
         resp = client.post(
             "/api/mcp/servers/oauth-srv/test", params={"profile": "worker_beta"}
@@ -161,7 +165,11 @@ class TestProfileScopedMcp:
         assert "oauth" in body["error"].lower()
 
         # With a token present, the same probe is genuinely authenticated.
-        monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: True)
+        monkeypatch.setattr(
+            mcp_config,
+            "_oauth_tokens_present",
+            lambda name, server_config=None: True,
+        )
         resp = client.post(
             "/api/mcp/servers/oauth-srv/test", params={"profile": "worker_beta"}
         )
@@ -220,6 +228,72 @@ class TestProfileScopedMcp:
         )
         assert resp.status_code == 200
         assert resp.json()["tools"] == [{"name": "tool-a", "description": "desc"}]
+
+    def test_mcp_auth_invalid_credential_profile_returns_400(
+        self,
+        client,
+        isolated_profiles,
+    ):
+        worker_home = isolated_profiles["worker_beta"]
+        worker_home.joinpath("config.yaml").write_text(
+            "mcp_servers:\n"
+            "  reports:\n"
+            "    url: https://example.test/mcp\n"
+            "    auth: oauth\n"
+            "    oauth:\n"
+            "      credential_profile: missing\n",
+            encoding="utf-8",
+        )
+
+        response = client.post(
+            "/api/mcp/servers/reports/auth",
+            params={"profile": "worker_beta"},
+        )
+
+        assert response.status_code == 400
+        assert "credential profile 'missing' does not exist" in response.json()["detail"]
+
+    def test_mcp_replace_cleans_removed_owner_profile_state(
+        self,
+        client,
+        isolated_profiles,
+        monkeypatch,
+    ):
+        import tools.mcp_oauth_manager as oauth_manager
+
+        worker_home = isolated_profiles["worker_beta"]
+        worker_home.joinpath("config.yaml").write_text(
+            "mcp_servers:\n"
+            "  keep:\n"
+            "    command: keep-bin\n"
+            "  tracery:\n"
+            "    url: https://beproud.tracery.jp/mcp\n"
+            "    auth: oauth\n"
+            "    oauth:\n"
+            "      credential_profile: welby\n",
+            encoding="utf-8",
+        )
+        removed = []
+
+        class _Manager:
+            def remove(self, name, **kwargs):
+                removed.append((name, kwargs))
+
+        monkeypatch.setattr(oauth_manager, "get_manager", lambda: _Manager())
+
+        response = client.put(
+            "/api/mcp/servers",
+            params={"profile": "worker_beta"},
+            json={"servers": {"keep": {"command": "keep-bin"}}},
+        )
+
+        assert response.status_code == 200
+        assert removed == [
+            (
+                "tracery",
+                {"oauth_config": {"credential_profile": "welby"}},
+            )
+        ]
 
 
 class TestProfileScopedModel:

@@ -199,6 +199,35 @@ def test_remove_scoped_to_profile(hermes_root):
     assert "temp" in _read_yaml(root / "profiles" / "other" / "config.yaml").get("mcp_servers", {})
 
 
+def test_remove_borrower_keeps_shared_owner_oauth_state(hermes_root):
+    root = hermes_root
+    _result(
+        _call(
+            "mcp.servers.add",
+            {
+                "profile": "work",
+                "name": "tracery",
+                "config": {
+                    "url": "https://beproud.tracery.jp/mcp",
+                    "auth": "oauth",
+                    "oauth": {"credential_profile": "other"},
+                },
+            },
+        )
+    )
+    owner_token = root / "profiles" / "other" / "mcp-tokens" / "tracery.json"
+    owner_token.parent.mkdir(parents=True)
+    owner_token.write_text("{}", encoding="utf-8")
+
+    resp = _result(
+        _call("mcp.servers.remove", {"profile": "work", "name": "tracery"})
+    )
+
+    assert resp["removed"] is True
+    assert owner_token.exists()
+    assert not (root / "profiles" / "work" / "mcp-tokens" / "tracery.json").exists()
+
+
 def test_add_duplicate_and_missing_errors(hermes_root):
     _result(
         _call(
@@ -223,6 +252,93 @@ def test_add_duplicate_and_missing_errors(hermes_root):
     )
     assert "error" in bad_profile
     assert bad_profile["error"]["code"] == 4064
+
+
+def test_bad_credential_profile_does_not_break_list_for_other_servers(hermes_root):
+    root = hermes_root
+    _result(
+        _call(
+            "mcp.servers.add",
+            {"profile": "work", "name": "good", "config": {"command": "good-bin"}},
+        )
+    )
+    _result(
+        _call(
+            "mcp.servers.add",
+            {
+                "profile": "work",
+                "name": "bad-oauth",
+                "config": {
+                    "url": "https://mcp.example.com/bad",
+                    "auth": "oauth",
+                    "oauth": {"credential_profile": "missing"},
+                },
+            },
+        )
+    )
+    assert not (root / "profiles" / "missing").exists()
+
+    servers = _result(_call("mcp.servers.list", {"profile": "work"}))["servers"]
+
+    by_name = {server["name"]: server for server in servers}
+    assert by_name["good"]["transport"] == "stdio"
+    assert by_name["bad-oauth"]["oauth_tokens_present"] is None
+    assert by_name["bad-oauth"]["oauth_error"]
+
+
+def test_remove_reports_success_when_bad_credential_cleanup_fails(hermes_root):
+    root = hermes_root
+    _result(
+        _call(
+            "mcp.servers.add",
+            {
+                "profile": "work",
+                "name": "bad-oauth",
+                "config": {
+                    "url": "https://mcp.example.com/bad",
+                    "auth": "oauth",
+                    "oauth": {"credential_profile": "missing"},
+                },
+            },
+        )
+    )
+
+    resp = _result(_call("mcp.servers.remove", {"profile": "work", "name": "bad-oauth"}))
+
+    assert resp == {"ok": True, "removed": True}
+    assert "bad-oauth" not in _read_yaml(root / "profiles" / "work" / "config.yaml").get(
+        "mcp_servers", {}
+    )
+
+
+def test_probe_failure_with_bad_credential_profile_returns_structured_result(monkeypatch, hermes_root):
+    _result(
+        _call(
+            "mcp.servers.add",
+            {
+                "profile": "work",
+                "name": "bad-oauth",
+                "config": {
+                    "url": "https://mcp.example.com/bad",
+                    "auth": "oauth",
+                    "oauth": {"credential_profile": "missing"},
+                },
+            },
+        )
+    )
+
+    def _raise_probe(name, cfg, details=None):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", _raise_probe)
+
+    result = _result(_call("mcp.servers.test", {"profile": "work", "name": "bad-oauth"}))
+
+    assert result["ok"] is False
+    assert result["tools"] == []
+    assert result["oauth_needed"] is True
+    assert result["oauth_tokens_present"] is None
+    assert "probe failed" in result["error"]
 
 
 def test_add_requires_transport(hermes_root):

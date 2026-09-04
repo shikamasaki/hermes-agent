@@ -127,12 +127,31 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
     endpoint sets the whole map so removals actually persist.  Storage stays
     the config.yaml ``mcp_servers`` key the CLI/TUI already read.
     """
-    from hermes_cli.mcp_config import _replace_mcp_servers
+    from hermes_cli.mcp_config import _get_mcp_servers, _replace_mcp_servers
 
     def _run():
         with _profile_scope(body.profile or profile):
             with _CONFIG_MUTATION_LOCK:
-                return _replace_mcp_servers(body.servers)
+                previous = _get_mcp_servers()
+                ok, issues = _replace_mcp_servers(body.servers)
+                if not ok:
+                    return ok, issues
+
+                removed_names = set(previous) - set(body.servers)
+                if removed_names:
+                    try:
+                        from tools.mcp_oauth_manager import get_manager
+
+                        manager = get_manager()
+                        for name in removed_names:
+                            server_config = previous[name]
+                            oauth_config = server_config.get("oauth")
+                            if not isinstance(oauth_config, dict):
+                                oauth_config = None
+                            manager.remove(name, oauth_config=oauth_config)
+                    except Exception:
+                        pass
+                return ok, issues
 
     ok, issues = await asyncio.to_thread(_run)
     if not ok:
@@ -142,12 +161,25 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
 
 @router.delete("/api/mcp/servers/{name}")
 async def remove_mcp_server(name: str, profile: Optional[str] = None):
-    from hermes_cli.mcp_config import _remove_mcp_server
+    from hermes_cli.mcp_config import _get_mcp_servers, _remove_mcp_server
 
     def _run():
         with _profile_scope(profile):
             with _CONFIG_MUTATION_LOCK:
-                return _remove_mcp_server(name)
+                server_config = _get_mcp_servers().get(name)
+                removed = _remove_mcp_server(name)
+                if not removed or not isinstance(server_config, dict):
+                    return removed
+                try:
+                    from tools.mcp_oauth_manager import get_manager
+
+                    oauth_config = server_config.get("oauth")
+                    if not isinstance(oauth_config, dict):
+                        oauth_config = None
+                    get_manager().remove(name, oauth_config=oauth_config)
+                except Exception:
+                    pass
+                return removed
 
     removed = await asyncio.to_thread(_run)
     if not removed:
@@ -191,7 +223,11 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
         # _run_on_mcp_loop re-wraps it onto the MCP event-loop thread).
         with _config_profile_scope(profile):
             tools = _probe_single_server(name, servers[name], details=details)
-            token_present = _oauth_tokens_present(name) if needs_oauth_token else True
+            token_present = (
+                _oauth_tokens_present(name, servers[name])
+                if needs_oauth_token
+                else True
+            )
             return tools, token_present
 
     try:
@@ -259,12 +295,28 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         raise HTTPException(status_code=400, detail="This server uses header/API-key auth, not OAuth")
     cfg["auth"] = "oauth"
 
+    from tools.mcp_oauth import resolve_credential_home
+
+    oauth_config = cfg.get("oauth")
+    if not isinstance(oauth_config, dict):
+        oauth_config = None
+    try:
+        resolved_credential_home = resolve_credential_home(name, oauth_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    credential_home = (
+        str(resolved_credential_home)
+        if resolved_credential_home is not None
+        else flow_home
+    )
+
     flow_id = secrets.token_urlsafe(24)
     flow = DashboardOAuthFlow(
         flow_id=flow_id,
         server_name=name,
         profile=profile,
         hermes_home=flow_home,
+        credential_home=credential_home,
         redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri")
         or _mcp_oauth_callback_url(request, name),
         reconnect_live=flow_home == process_home,
@@ -281,7 +333,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
             )
         if any(
             flow.server_name == name
-            and flow.hermes_home == flow_home
+            and (flow.credential_home or flow.hermes_home) == credential_home
             and not flow.worker_done
             for flow in _mcp_oauth_flows.values()
         ):

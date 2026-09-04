@@ -689,10 +689,19 @@ class MCPOAuthManager:
         key = self._key(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)
+            config_changed = entry is not None and dict(entry.oauth_config or {}) != dict(
+                oauth_config or {}
+            )
             if entry is not None and entry.server_url != server_url:
                 logger.info(
                     "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
                     server_name, entry.server_url, server_url,
+                )
+                entry = None
+            elif config_changed:
+                logger.info(
+                    "MCP OAuth '%s': OAuth config changed, discarding cache",
+                    server_name,
                 )
                 entry = None
 
@@ -759,12 +768,18 @@ class MCPOAuthManager:
             return None
 
         cfg = dict(entry.oauth_config or {})
-        from tools.mcp_oauth import apply_oauth_provider_defaults
+        from tools.mcp_oauth import (
+            apply_oauth_provider_defaults,
+            resolve_credential_home,
+        )
 
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(
+            server_name,
+            hermes_home=resolve_credential_home(server_name, cfg),
+        )
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -811,6 +826,7 @@ class MCPOAuthManager:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        oauth_config: dict | None = None,
     ) -> _ProviderEntry | None:
         """Evict the provider from cache AND delete tokens from disk.
 
@@ -820,8 +836,59 @@ class MCPOAuthManager:
         with self._entries_lock:
             entry = self._entries.pop(self._key(server_name, hermes_home), None)
 
-        from tools.mcp_oauth import remove_oauth_tokens
-        remove_oauth_tokens(server_name, hermes_home=hermes_home)
+        from tools.mcp_oauth import remove_oauth_tokens, resolve_credential_home
+
+        config = (
+            oauth_config
+            if oauth_config is not None
+            else (entry.oauth_config if entry is not None else None)
+        )
+        credential_home = resolve_credential_home(server_name, config)
+        caller_home = self._key(server_name, hermes_home)[0]
+        token_home = (
+            credential_home.expanduser().resolve(strict=False)
+            if credential_home is not None
+            else Path(caller_home)
+        )
+        token_home_key = str(token_home)
+        if credential_home is not None and token_home_key != caller_home:
+            logger.info(
+                "MCP OAuth '%s': evicted borrower cache; shared owner tokens preserved",
+                server_name,
+            )
+            return entry
+
+        with self._entries_lock:
+            for cached_key, cached_entry in list(self._entries.items()):
+                if cached_key[1] != server_name:
+                    continue
+                try:
+                    cached_credential_home = resolve_credential_home(
+                        server_name,
+                        cached_entry.oauth_config,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "MCP OAuth '%s': evicting stale cached credential_profile "
+                        "entry for %s: %s",
+                        server_name,
+                        cached_key[0],
+                        exc,
+                    )
+                    self._entries.pop(cached_key, None)
+                    continue
+                cached_token_home = (
+                    cached_credential_home.expanduser().resolve(strict=False)
+                    if cached_credential_home is not None
+                    else Path(cached_key[0])
+                )
+                if str(cached_token_home) == token_home_key:
+                    self._entries.pop(cached_key, None)
+
+        remove_oauth_tokens(
+            server_name,
+            hermes_home=token_home,
+        )
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
             server_name,
@@ -867,14 +934,23 @@ class MCPOAuthManager:
         fresh tokens to disk, and on the next tool call the running MCP
         session picks them up without a restart.
         """
-        from tools.mcp_oauth import _get_token_dir, _safe_filename
+        from tools.mcp_oauth import (
+            _get_token_dir,
+            _safe_filename,
+            resolve_credential_home,
+        )
 
         entry = self._entries.get(self._key(server_name, hermes_home))
         if entry is None or entry.provider is None:
             return False
 
         async with entry.lock:
-            tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            credential_home = resolve_credential_home(
+                server_name,
+                entry.oauth_config,
+            )
+            token_home = credential_home if credential_home is not None else hermes_home
+            tokens_path = _get_token_dir(token_home) / f"{_safe_filename(server_name)}.json"
             try:
                 mtime_ns = tokens_path.stat().st_mtime_ns
             except (FileNotFoundError, OSError):

@@ -13954,7 +13954,7 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
 
 
 def _mcp_oauth_transaction(flow) -> threading.Lock:
-    key = (flow.hermes_home, flow.server_name)
+    key = (flow.credential_home or flow.hermes_home, flow.server_name)
     with _mcp_oauth_transactions_lock:
         return _mcp_oauth_transactions.setdefault(key, threading.Lock())
 
@@ -13974,7 +13974,11 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         )
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from tools.mcp_dashboard_oauth import dashboard_oauth_flow
-        from tools.mcp_oauth import HermesTokenStorage, force_interactive_oauth
+        from tools.mcp_oauth import (
+            HermesTokenStorage,
+            force_interactive_oauth,
+            resolve_credential_home,
+        )
         from tools.mcp_oauth_manager import get_manager
 
         home_token = set_hermes_home_override(flow.hermes_home)
@@ -13983,20 +13987,35 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
             transaction = _mcp_oauth_transaction(flow)
             with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):
                 manager = get_manager()
-                storage = HermesTokenStorage(flow.server_name)
+                oauth_config = cfg.get("oauth")
+                if not isinstance(oauth_config, dict):
+                    oauth_config = None
+                credential_home = resolve_credential_home(
+                    flow.server_name,
+                    oauth_config,
+                )
+                storage = HermesTokenStorage(
+                    flow.server_name,
+                    hermes_home=(
+                        credential_home
+                        if credential_home is not None
+                        else flow.hermes_home
+                    ),
+                )
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
                     previous_entry = manager.remove(
                         flow.server_name,
                         hermes_home=flow.hermes_home,
+                        oauth_config=oauth_config,
                     )
                     tools = _probe_single_server(
                         flow.server_name,
                         cfg,
                         connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
                     )
-                    if not _oauth_tokens_present(flow.server_name):
+                    if not _oauth_tokens_present(flow.server_name, cfg):
                         raise RuntimeError(
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."
@@ -14009,7 +14028,12 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
 
                         reconnect_mcp_server(flow.server_name)
                 except Exception:
-                    storage.restore(backup, only_if_absent=True)
+                    failed_flow = storage.snapshot()
+                    storage.restore(
+                        backup,
+                        only_if_absent=True,
+                        expected_current=failed_flow,
+                    )
                     manager.restore_entry(
                         flow.server_name,
                         previous_entry,

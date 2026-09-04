@@ -401,7 +401,7 @@ def _probe_single_server(
     return tools_found
 
 
-def _oauth_tokens_present(name: str) -> bool:
+def _oauth_tokens_present(name: str, server_config: dict | None = None) -> bool:
     """Return True if an OAuth token file exists on disk for ``name``.
 
     Used after ``hermes mcp login`` to distinguish a genuine authentication
@@ -409,8 +409,19 @@ def _oauth_tokens_present(name: str) -> bool:
     initialize/tools-list without auth (so no token was ever acquired).
     """
     try:
-        from tools.mcp_oauth import HermesTokenStorage
-        return HermesTokenStorage(name).has_cached_tokens()
+        from tools.mcp_oauth import HermesTokenStorage, resolve_credential_home
+
+        oauth_config = None
+        if isinstance(server_config, dict) and isinstance(server_config.get("oauth"), dict):
+            oauth_config = server_config["oauth"]
+        return HermesTokenStorage(
+            name,
+            hermes_home=resolve_credential_home(name, oauth_config),
+        ).has_cached_tokens()
+    except ValueError:
+        # Invalid or missing credential_profile is a configuration error, not
+        # evidence that OAuth succeeded. Surface it to the caller fail-closed.
+        raise
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
         # Be permissive on unexpected errors: don't block a real success.
@@ -658,6 +669,7 @@ def cmd_mcp_remove(args):
         _info("Cancelled.")
         return
 
+    server_config = existing[name]
     _remove_mcp_server(name)
     _success(f"Removed '{name}' from config")
 
@@ -666,7 +678,11 @@ def cmd_mcp_remove(args):
     # earlier `hermes mcp test` in the same session) is evicted too.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+
+        oauth_config = server_config.get("oauth")
+        if not isinstance(oauth_config, dict):
+            oauth_config = None
+        get_manager().remove(name, oauth_config=oauth_config)
         _success("Cleaned up OAuth tokens")
     except Exception:
         pass
@@ -828,7 +844,11 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     # OAuth flow.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+
+        oauth_config = server_config.get("oauth")
+        if not isinstance(oauth_config, dict):
+            oauth_config = None
+        get_manager().remove(name, oauth_config=oauth_config)
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
@@ -867,7 +887,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # "Authenticated — N tools" in that case is a false success: every
         # real tool call later hangs until timeout because there's no token.
         # Verify a token actually landed on disk before claiming success.
-        if not _oauth_tokens_present(name):
+        if not _oauth_tokens_present(name, server_config):
             _warning(
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
