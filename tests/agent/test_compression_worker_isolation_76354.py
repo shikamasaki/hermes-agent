@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from hermes_state import SessionDB
+from tests.deterministic_timeout_executor import DelayedStartExecutor
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str, **compressor_kwargs):
@@ -175,14 +176,20 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
         return msgs
 
     agent.context_compressor.compress.side_effect = _compress_with_protected_provider
+    delayed_executor = DelayedStartExecutor(
+        synchronize_result_start=True,
+        started_event=provider_started,
+    )
+    monkeypatch.setattr(cc, "_get_compress_timeout_executor", lambda: delayed_executor)
     live = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     try:
         returned, _sp = agent._compress_context(
             live, "sys", approx_tokens=120_000
         )
+        assert delayed_executor.submitted.is_set()
         assert returned is live
-        assert provider_started.wait(timeout=1)
+        assert provider_started.is_set()
         assert not release_provider.is_set()
 
         deadline = time.time() + 1
@@ -257,13 +264,19 @@ def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
         )
 
     # Step 2: host-owned progress wait times out while summary is blocked.
+    timeout_causes = []
     result_msgs, _prompt = run_compress_context_with_progress_timeout(
         worker=_worker,
         messages=messages,
         system_prompt_fallback="fallback",
         idle_timeout_seconds=0.6,
         total_ceiling_seconds=1.2,
+        on_timeout_cause=lambda total_exhausted, progress_observed: timeout_causes.append(
+            (total_exhausted, progress_observed)
+        ),
+        stall_fallback=False,
     )
+    assert timeout_causes == [(False, False)]
     assert summary_started.wait(timeout=5)
     assert not release_summary.is_set()  # old worker STILL blocked
     assert result_msgs is messages

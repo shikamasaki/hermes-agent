@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 
+from tests.deterministic_timeout_executor import DelayedStartExecutor
 
 
 def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
@@ -454,7 +455,11 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _run_single_child,
+            _set_subagent_approval_cb,
+        )
 
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
@@ -504,6 +509,23 @@ class TestDelegationCleanup:
                 child_finished.set()
 
         child.run_conversation.side_effect = run_conversation
+        delayed_executor = DelayedStartExecutor(
+            synchronize_result_start=True,
+            started_event=child_started,
+            initializer=_set_subagent_approval_cb,
+            initargs=(_get_subagent_approval_callback(),),
+        )
+        from tools.daemon_pool import DaemonThreadPoolExecutor as RealDaemonThreadPoolExecutor
+
+        def executor_factory(*args, **kwargs):
+            if kwargs.get("initializer") is _set_subagent_approval_cb:
+                return delayed_executor
+            return RealDaemonThreadPoolExecutor(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "tools.daemon_pool.DaemonThreadPoolExecutor",
+            executor_factory,
+        )
         try:
             result = _run_single_child(
                 task_index=0,
@@ -512,6 +534,7 @@ class TestDelegationCleanup:
                 parent_agent=parent,
             )
 
+            assert delayed_executor.submitted.is_set()
             assert child_started.is_set()
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
