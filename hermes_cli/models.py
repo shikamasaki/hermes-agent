@@ -7361,12 +7361,18 @@ def validate_requested_model(
         # a different model than the user thinks (#92797 review).
         if normalized == "openai-codex":
             from agent.model_metadata import (
+                CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX,
                 CODEX_CONTEXT_VARIANT_SUFFIX,
                 is_codex_context_variant,
             )
             _req_lower = requested_for_lookup.strip().lower()
+            _variant_suffix = None
+            if _req_lower.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+                _variant_suffix = CODEX_CONTEXT_VARIANT_SUFFIX
+            elif _req_lower.endswith(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX):
+                _variant_suffix = CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX
             if (
-                _req_lower.endswith(CODEX_CONTEXT_VARIANT_SUFFIX)
+                _variant_suffix
                 and requested_for_lookup not in set(catalog_models)
             ):
                 if is_codex_context_variant(requested_for_lookup):
@@ -7380,7 +7386,7 @@ def validate_requested_model(
                         "recognized": True,
                         "message": None,
                     }
-                _base_guess = requested_for_lookup[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+                _base_guess = requested_for_lookup[: -len(_variant_suffix)]
                 return {
                     "accepted": False,
                     "persist": False,
@@ -7388,9 +7394,10 @@ def validate_requested_model(
                     "message": (
                         f"`{requested}` is not a valid large-context variant — "
                         f"`{_base_guess}` enforces the standard 272K window on "
-                        f"Codex, so no `-900k` option exists for it. Pick the "
-                        f"base model, or a verified variant from the `/model` "
-                        f"picker (e.g. `gpt-5.6-sol-900k`)."
+                        f"Codex, so no `{_variant_suffix}` option exists for it. "
+                        f"Pick the base model, or a verified variant from the "
+                        f"`/model` picker (e.g. `gpt-5.6-sol-900k`, "
+                        f"`gpt-6-astra-872k`)."
                     ),
                 }
         if catalog_models:

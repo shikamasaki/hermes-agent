@@ -64,6 +64,31 @@ def test_picker_never_synthesizes_900k_for_pro_or_unknown_slugs():
     assert "gpt-5.6-nova-900k" not in out
 
 
+def test_picker_synthesizes_872k_variant_for_astra_only():
+    """GPT-6 Astra gets an explicit ``-872k`` picker entry directly after
+    its base slug; the ``-900k`` family is unaffected, and no other base
+    gains an ``-872k`` variant."""
+    model_ids = get_codex_model_ids()  # offline curated path
+
+    assert "gpt-6-astra" in model_ids
+    assert "gpt-6-astra-872k" in model_ids
+    assert model_ids.index("gpt-6-astra-872k") == model_ids.index("gpt-6-astra") + 1
+    assert "gpt-5.5-872k" not in model_ids
+    assert "gpt-5.6-sol-872k" not in model_ids
+
+    for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4"):
+        assert f"{base}-900k" in model_ids
+
+
+def test_picker_never_synthesizes_872k_for_unknown_slugs():
+    """Only the exact ``gpt-6-astra`` base is eligible for ``-872k``."""
+    from hermes_cli.codex_models import _finalize_codex_models
+
+    out = _finalize_codex_models(["gpt-6-astra-mini", "gpt-5.6-sol"])
+    assert "gpt-6-astra-mini-872k" not in out
+    assert "gpt-5.6-sol-872k" not in out
+
+
 
 
 def test_setup_wizard_codex_import_resolves():
