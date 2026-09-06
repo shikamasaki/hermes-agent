@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from agent.delegation_context import (
+    delegated_child_context,
+    non_dispatcher_owned_context,
+)
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
@@ -84,6 +88,39 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
+
+
+def test_no_nudge_for_delegated_child_sharing_dispatcher_env(clear_kanban_env):
+    """A delegate_task child running inside the dispatcher worker's own
+    process must never be nudged toward kanban_complete/kanban_block: it
+    inherits HERMES_KANBAN_TASK from the parent's os.environ but does not
+    own the parent's card."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent_owns_this")
+    with delegated_child_context(session_id="child-session"):
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_no_nudge_for_in_process_cron_sharing_dispatcher_env(clear_kanban_env):
+    """cronjob(action="run") executes run_job() in-process inside a kanban
+    worker; that cron agent must not be nudged to close the worker's card."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent_owns_this")
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_nudge_still_fires_for_real_dispatcher_worker(clear_kanban_env):
+    """Baseline: outside any delegated/non-owner context, the real
+    dispatcher-owned worker still gets nudged as before."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_real_worker")
+    assert kanban_stop_nudge_enabled() is True
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+    ]
+    nudge = build_kanban_stop_nudge(messages=messages, attempts=0)
+    assert nudge is not None
+    assert "t_real_worker" in nudge
 
 
 

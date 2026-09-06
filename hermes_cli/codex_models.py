@@ -19,6 +19,12 @@ DEFAULT_CODEX_MODELS: List[str] = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    # GPT-6 Astra: same-account Codex catalog (2026-09-05) advertises
+    # context_window=272000 but reports max_context_window=872000 (see
+    # agent/model_metadata.py CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX for the
+    # exact-match opt-in mechanism and the "not separately verified for
+    # real long-prompt acceptance" caveat).
+    "gpt-6-astra",
     "gpt-5.5",
     "gpt-5.4-mini",
     "gpt-5.4",
@@ -90,17 +96,21 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
 
 
 def _add_context_variants(model_ids: List[str]) -> List[str]:
-    """Insert ``-900k`` large-context picker variants after eligible base slugs.
+    """Insert ``-900k``/``-872k`` large-context picker variants after eligible base slugs.
 
     The ChatGPT Codex backend advertises 272K for the gpt-5.4 / gpt-5.6
     families but accepts ~911K (live-verified Aug 2026). The base slugs keep
     the cheaper advertised 272K limit by default; each verified slug gets an
     explicit ``<slug>-900k`` picker entry that opts into the large window.
-    The suffix is Hermes-side only — it is stripped before the model id hits
-    the wire (agent/transports/codex.py, agent/auxiliary_client.py).
+    GPT-6 Astra gets its own exact ``-872k`` entry (its verified cap differs
+    from the ``-900k`` family). The suffix is Hermes-side only — it is
+    stripped before the model id hits the wire (agent/transports/codex.py,
+    agent/auxiliary_client.py).
     """
     from agent.model_metadata import (
+        CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX,
         CODEX_CONTEXT_VARIANT_SUFFIX,
+        has_codex_astra_context_variant,
         has_codex_context_variant,
     )
 
@@ -109,10 +119,15 @@ def _add_context_variants(model_ids: List[str]) -> List[str]:
     for model_id in model_ids:
         out.append(model_id)
         variant = model_id + CODEX_CONTEXT_VARIANT_SUFFIX
-        if variant in present or variant in out:
-            continue
-        if has_codex_context_variant(model_id):
+        if variant not in present and variant not in out and has_codex_context_variant(model_id):
             out.append(variant)
+        astra_variant = model_id + CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX
+        if (
+            astra_variant not in present
+            and astra_variant not in out
+            and has_codex_astra_context_variant(model_id)
+        ):
+            out.append(astra_variant)
     return out
 
 

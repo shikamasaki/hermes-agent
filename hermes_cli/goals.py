@@ -38,7 +38,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -576,6 +576,10 @@ class GoalState:
     # 401 every call — track them separately so the loop auto-pauses instead
     # of burning every turn budget slot on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    # Optional routing dict (platform, chat_id, thread_id, user_id) for gateway sessions.
+    # When present, background watchers can wake up parked goals by injecting messages
+    # into the specific chat queue.
+    route: Optional[Dict[str, Any]] = None
     # User-added criteria appended mid-loop via the /subgoal command.
     # When non-empty the judge prompt and continuation prompt both
     # include them so the agent works toward them and the judge factors
@@ -606,6 +610,9 @@ class GoalState:
     waiting_until: float = 0.0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Durable request to resume after a wait barrier has cleared. Delivery
+    # surfaces clear this only after accepting the synthetic prompt.
+    wakeup_pending: bool = False
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -639,12 +646,14 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
+            route=data.get("route"),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
+            wakeup_pending=bool(data.get("wakeup_pending", False)),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -842,6 +851,34 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
+def list_active_goals() -> List[Tuple[str, GoalState]]:
+    """Return ``[(session_id, GoalState), ...]`` for every ACTIVE goal.
+
+    Used by the gateway's idle wakeup watcher to scan for parked goals that
+    should wake up. Best-effort: any DB error yields ``[]``.
+    """
+    db = _get_session_db()
+    if db is None:
+        return []
+    try:
+        rows = db.list_meta_prefix("goal:")
+    except Exception as exc:
+        logger.debug("GoalManager: list_meta_prefix failed: %s", exc)
+        return []
+    out: List[Tuple[str, GoalState]] = []
+    for key, raw in rows:
+        session_id = key[5:]
+        if not session_id or not raw:
+            continue
+        try:
+            state = GoalState.from_json(raw)
+        except Exception:
+            continue
+        if state.status == "active":
+            out.append((session_id, state))
+    return out
+
+
 def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
@@ -875,6 +912,40 @@ def save_goal(session_id: str, state: GoalState) -> None:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+
+
+def _compare_and_save_goal(session_id: str, expected: GoalState, updated: GoalState) -> bool:
+    """Persist a goal only if the stored row still equals *expected*."""
+    if not session_id:
+        return False
+    db = _get_session_db()
+    if db is None:
+        _warn_dropped_write("GoalManager", "goal", session_id)
+        return False
+    expected_raw = expected.to_json()
+    updated_raw = updated.to_json()
+    try:
+        compare_and_set = getattr(db, "compare_and_set_meta", None)
+        if callable(compare_and_set):
+            return bool(compare_and_set(_meta_key(session_id), expected_raw, updated_raw))
+        # Test doubles from older call sites may only provide the historical
+        # meta API. Use the same one-transaction compare/update contract when
+        # the real SessionDB private writer is available, otherwise fail closed.
+        execute_write = getattr(db, "_execute_write", None)
+        if not callable(execute_write):
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (updated_raw, _meta_key(session_id), expected_raw),
+            )
+            return cursor.rowcount == 1
+
+        return bool(execute_write(_do))
+    except Exception as exc:
+        logger.debug("GoalManager: compare-and-save failed: %s", exc)
+        return False
 
 
 def clear_goal(session_id: str) -> None:
@@ -1488,7 +1559,7 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None, route: Optional[Dict[str, Any]] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1500,6 +1571,8 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
+            route=route,
+            wakeup_pending=False,
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -1527,6 +1600,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
+        self._state.wakeup_pending = False
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1541,6 +1615,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
+        self._state.wakeup_pending = False
         if reset_budget:
             self._state.turns_used = 0
         save_goal(self.session_id, self._state)
@@ -1549,6 +1624,7 @@ class GoalManager:
     def clear(self) -> None:
         if self._state is None:
             return
+        self._state.wakeup_pending = False
         self._state.status = "cleared"
         save_goal(self.session_id, self._state)
         self._state = None
@@ -1557,6 +1633,7 @@ class GoalManager:
         if not self._state:
             return
         self._state.status = "done"
+        self._state.wakeup_pending = False
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
@@ -1779,6 +1856,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
+        self._state.wakeup_pending = False
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1801,6 +1879,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
+        self._state.wakeup_pending = False
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1822,27 +1901,69 @@ class GoalManager:
         self._state.waiting_until = time.time() + seconds
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
+        self._state.wakeup_pending = False
         save_goal(self.session_id, self._state)
         return self._state
+
+    def _clear_wait_barrier(self, *, wakeup_pending: bool) -> bool:
+        if self._state is None:
+            return False
+        had_barrier = (
+            self._state.waiting_on_pid is not None
+            or self._state.waiting_on_session is not None
+            or bool(self._state.waiting_until)
+        )
+        if not had_barrier and self._state.wakeup_pending == wakeup_pending:
+            return False
+
+        expected = replace(self._state)
+        updated = replace(
+            self._state,
+            waiting_on_pid=None,
+            waiting_on_session=None,
+            waiting_until=0.0,
+            waiting_reason=None,
+            waiting_since=0.0,
+            wakeup_pending=bool(wakeup_pending),
+        )
+
+        if _compare_and_save_goal(self.session_id, expected, updated):
+            self._state = updated
+            return had_barrier
+        return False
 
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True
         if one was cleared."""
         if self._state is None:
             return False
-        if (
-            self._state.waiting_on_pid is None
-            and self._state.waiting_on_session is None
-            and not self._state.waiting_until
-        ):
-            return False
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
-        return True
+        return self._clear_wait_barrier(wakeup_pending=False)
+
+    def check_wakeup(self) -> Optional[str]:
+        """Return a pending resume prompt after a wait barrier clears.
+
+        Observing the cleared barrier records a durable pending request.
+        Delivery surfaces must call ack_wakeup() only after accepting the
+        synthetic prompt; busy or failed delivery keeps the request pending.
+        """
+        state = self._state
+        if state is None or state.status != "active":
+            return None
+        if state.wakeup_pending:
+            return "[Automated continuation] The wait barrier has cleared. Please evaluate the current state and take the next step."
+        self.is_waiting()
+        if self._state is not None and self._state.wakeup_pending:
+            return "[Automated continuation] The wait barrier has cleared. Please evaluate the current state and take the next step."
+        return None
+
+    def ack_wakeup(self) -> None:
+        """Acknowledge a delivered goal wakeup so it is not sent twice."""
+        if self._state is None or not self._state.wakeup_pending:
+            return
+        expected = replace(self._state)
+        updated = replace(self._state, wakeup_pending=False)
+        if _compare_and_save_goal(self.session_id, expected, updated):
+            self._state = updated
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied.
@@ -1859,17 +1980,17 @@ class GoalManager:
         if s.waiting_on_session is not None:
             if _session_waiting(s.waiting_on_session):
                 return True
-            self.stop_waiting()  # session exited or trigger fired
+            self._clear_wait_barrier(wakeup_pending=True)  # session exited or trigger fired
             return False
         if s.waiting_on_pid is not None:
             if _pid_alive(s.waiting_on_pid):
                 return True
-            self.stop_waiting()  # process gone
+            self._clear_wait_barrier(wakeup_pending=True)  # process gone
             return False
         if s.waiting_until:
             if time.time() < s.waiting_until:
                 return True
-            self.stop_waiting()  # deadline passed
+            self._clear_wait_barrier(wakeup_pending=True)  # deadline passed
             return False
         return False
 

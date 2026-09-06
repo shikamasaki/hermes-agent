@@ -8,12 +8,21 @@ import pytest
 import hermes_cli.update_inventory as ui
 
 
-def _write_state(home: Path, pid: int, sha: str | None = None, version: str | None = None):
-    record = {"pid": pid}
+def _write_state(
+    home: Path,
+    pid: int,
+    sha: str | None = None,
+    version: str | None = None,
+    content_sha: str | None = None,
+):
+    record: dict[str, object] = {"pid": pid}
     if sha:
         record["code_sha"] = sha
     if version:
         record["code_version"] = version
+    if content_sha:
+        record["code_content_sha"] = content_sha
+        record["code_content_short_sha"] = content_sha[:8]
     (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")
 
 
@@ -23,7 +32,7 @@ def fleet(monkeypatch, tmp_path):
     default_home = tmp_path / "home"
     work_home = tmp_path / "home" / "profiles" / "work"
     work_home.mkdir(parents=True)
-    _write_state(default_home, 100, sha="a" * 40, version="1.0")
+    _write_state(default_home, 100, sha="a" * 40, version="1.0", content_sha="c" * 64)
     _write_state(work_home, 200)  # pre-stamp gateway: no code identity
 
     import re
@@ -36,7 +45,14 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
-        lambda refresh=False: {"sha": "a" * 40, "short_sha": "a" * 8, "version": "1.0", "source": "git"},
+        lambda refresh=False: {
+            "sha": "a" * 40,
+            "short_sha": "a" * 8,
+            "version": "1.0",
+            "source": "git",
+            "content_sha": "c" * 64,
+            "content_short_sha": "c" * 8,
+        },
     )
     monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **k: "git")
     monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: None)
@@ -49,12 +65,14 @@ class TestCollectInventory:
         assert plan.install_method == "git"
         assert plan.updatable_in_place is True
         assert plan.expected_sha == "a" * 40
+        assert plan.expected_content_sha == "c" * 64
         assert plan.profiles == ["default", "work"]
         assert len(plan.runtimes) == 2
         by_profile = {r.profile: r for r in plan.runtimes}
         assert by_profile["default"].pid == 100
         assert by_profile["default"].supervisor == "systemd"
         assert by_profile["default"].code_sha == "a" * 40
+        assert by_profile["default"].code_content_sha == "c" * 64
         assert by_profile["work"].pid == 200
         assert by_profile["work"].supervisor == "manual"
         assert by_profile["work"].code_sha is None  # pre-stamp gateway

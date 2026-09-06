@@ -20,7 +20,11 @@ def _setup(monkeypatch, tmp_path, record: dict):
     home.mkdir(exist_ok=True)
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
-        lambda refresh=False: {"sha": "HEADSHA", "version": "1.0"},
+        lambda refresh=False: {
+            "sha": "HEADSHA",
+            "content_sha": "CONTENTSHA",
+            "version": "1.0",
+        },
     )
     monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
     monkeypatch.setattr(
@@ -108,6 +112,8 @@ def test_matching_start_time_is_still_live(monkeypatch, tmp_path):
             "start_time": _get_process_start_time(pid),
             "gateway_state": "running",
             "code_sha": "HEADSHA",
+            "content_sha": "CONTENTSHA",
+            "code_content_sha": "CONTENTSHA",
             "kind": "hermes-gateway",
         },
     )
@@ -122,6 +128,7 @@ def test_live_gateway_rows_unchanged(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         {"pid": os.getpid(), "gateway_state": "running", "code_sha": "HEADSHA",
+         "content_sha": "CONTENTSHA", "code_content_sha": "CONTENTSHA",
          "kind": "hermes-gateway"},
     )
     fleet = ur.collect_fleet_versions(pre_restart_pids=[os.getpid()])

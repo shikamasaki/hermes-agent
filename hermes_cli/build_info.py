@@ -25,15 +25,152 @@ Behaviour:
 
 from __future__ import annotations
 
+import hashlib
+import os
+import stat
+import subprocess
 from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 # Path is resolved relative to this module so it works regardless of cwd —
 # matches the pattern used by ``banner._resolve_repo_dir``.
-_BUILD_SHA_FILE = Path(__file__).parent.parent / ".hermes_build_sha"
+_PROJECT_ROOT = Path(__file__).parent.parent
+_BUILD_SHA_FILE = _PROJECT_ROOT / ".hermes_build_sha"
+_GIT_LS_FILES_TIMEOUT_SECONDS = 5
 
 
 _code_identity_cache: Optional[dict] = None
+_startup_code_identity_cache: Optional[dict] = None
+_startup_code_identity_pid: Optional[int] = None
+_startup_code_identity_attempted_pid: Optional[int] = None
+_startup_code_identity_lock = RLock()
+
+
+def _iter_repo_content_paths(project_root: Path) -> Optional[list[Path]]:
+    """Return git-reported paths that should participate in content identity.
+
+    The identity must see tracked files, untracked files, and binary files.
+    If git cannot enumerate the tree cleanly, or if the repo is unreadable,
+    return ``None`` rather than pretending two unknown trees are equivalent.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=_GIT_LS_FILES_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    paths: list[Path] = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = os.fsdecode(raw)
+        path = project_root / rel
+        try:
+            st = path.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        paths.append(path)
+
+    return paths
+
+
+def _safe_read_repo_file_bytes(project_root: Path, rel_path: Path) -> Optional[bytes]:
+    """Read a tracked file without following symlinks in any path component."""
+    opened_dir_fds: list[int] = []
+    directory_flags = getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_RDONLY", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow_flag:
+        return None
+
+    try:
+        current_fd = os.open(os.fspath(project_root), directory_flags | nofollow_flag)
+        opened_dir_fds.append(current_fd)
+
+        parts = rel_path.parts
+        if not parts:
+            return None
+
+        for part in parts[:-1]:
+            current_fd = os.open(part, directory_flags | nofollow_flag, dir_fd=current_fd)
+            opened_dir_fds.append(current_fd)
+
+        file_fd: Optional[int] = None
+        file_fd = os.open(
+            parts[-1],
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow_flag,
+            dir_fd=current_fd,
+        )
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            digest = hashlib.sha256()
+            with os.fdopen(file_fd, "rb", closefd=False) as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.digest()
+        finally:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    finally:
+        for fd in reversed(opened_dir_fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _resolve_repo_content_sha(project_root: Path) -> Optional[str]:
+    """Hash the current checkout contents in a stable, path-aware way."""
+    paths = _iter_repo_content_paths(project_root)
+    if paths is None:
+        return None
+
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(paths, key=lambda p: p.as_posix()):
+            rel = path.relative_to(project_root)
+            rel_bytes = rel.as_posix().encode("utf-8", errors="surrogateescape")
+            content = _safe_read_repo_file_bytes(project_root, rel)
+            if content is None:
+                return None
+            content_digest = hashlib.sha256(content).digest()
+            digest.update(len(rel_bytes).to_bytes(8, "big"))
+            digest.update(rel_bytes)
+            digest.update(content_digest)
+    except Exception:
+        return None
+    return digest.hexdigest()
 
 
 def _resolve_git_head_sha(project_root: Path) -> Optional[str]:
@@ -103,7 +240,8 @@ def get_code_identity(refresh: bool = False) -> dict:
 
     Shape: ``{"sha": full-or-short sha | None, "short_sha": str | None,
     "version": pyproject version | None, "source": "git" | "build-file" |
-    "unknown"}``.
+    "unknown", "content_sha": content digest | None, "content_short_sha":
+    first 8 chars of content digest | None}``.
 
     Resolution order mirrors the banner/dump callsites: live ``git
     rev-parse`` for source installs, the baked ``.hermes_build_sha`` for
@@ -120,7 +258,7 @@ def get_code_identity(refresh: bool = False) -> dict:
 
     sha: Optional[str] = None
     source = "unknown"
-    project_root = Path(__file__).parent.parent
+    project_root = _PROJECT_ROOT
     resolved = _resolve_git_head_sha(project_root)
     if resolved:
         sha = resolved
@@ -130,6 +268,8 @@ def get_code_identity(refresh: bool = False) -> dict:
         if baked:
             sha = baked
             source = "build-file"
+
+    content_sha = _resolve_repo_content_sha(project_root)
 
     version: Optional[str] = None
     try:
@@ -146,8 +286,51 @@ def get_code_identity(refresh: bool = False) -> dict:
         "short_sha": sha[:8] if sha else None,
         "version": version,
         "source": source,
+        "content_sha": content_sha,
+        "content_short_sha": content_sha[:8] if content_sha else None,
     }
     return dict(_code_identity_cache)
+
+
+def record_startup_code_identity(identity: Optional[dict] = None) -> Optional[dict]:
+    """Capture the first code identity seen by this process.
+
+    The startup snapshot is intentionally separate from ``get_code_identity``'s
+    refreshable cache: callers can refresh the live checkout view without
+    rewriting the boot-time snapshot used by startup comparisons.
+    """
+    global _startup_code_identity_cache, _startup_code_identity_pid, _startup_code_identity_attempted_pid
+    current_pid = os.getpid()
+    with _startup_code_identity_lock:
+        if (
+            _startup_code_identity_cache is not None
+            and _startup_code_identity_pid == current_pid
+        ):
+            return dict(_startup_code_identity_cache)
+        if _startup_code_identity_attempted_pid == current_pid:
+            return None
+        if identity is None:
+            try:
+                identity = get_code_identity(refresh=True)
+            except Exception:
+                _startup_code_identity_attempted_pid = current_pid
+                return None
+            _startup_code_identity_attempted_pid = current_pid
+        _startup_code_identity_cache = dict(identity)
+        _startup_code_identity_pid = current_pid
+        return dict(_startup_code_identity_cache)
+
+
+def get_startup_code_identity() -> Optional[dict]:
+    """Return the captured startup code identity for this process, if any."""
+    current_pid = os.getpid()
+    with _startup_code_identity_lock:
+        if (
+            _startup_code_identity_cache is None
+            or _startup_code_identity_pid != current_pid
+        ):
+            return None
+        return dict(_startup_code_identity_cache)
 
 
 def get_build_sha(short: int = 8) -> Optional[str]:

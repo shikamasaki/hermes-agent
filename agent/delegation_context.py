@@ -16,10 +16,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping
+import uuid
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
     default=False,
+)
+_DELEGATED_CHILD_SNAPSHOT_SCOPE: ContextVar[str | None] = ContextVar(
+    "hermes_delegated_child_snapshot_scope",
+    default=None,
 )
 
 # Set for any in-process execution that is NOT the dispatcher-owned worker even
@@ -54,6 +59,9 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     execution passes its explicit id and receives it only for this scope.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    scope_token = _DELEGATED_CHILD_SNAPSHOT_SCOPE.set(
+        str(session_id) if session_id else f"anon-{uuid.uuid4().hex}"
+    )
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -62,12 +70,18 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_CHILD_SNAPSHOT_SCOPE.reset(scope_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def get_delegated_child_snapshot_scope() -> str | None:
+    """Return the current delegated child's terminal snapshot scope, if any."""
+    return _DELEGATED_CHILD_SNAPSHOT_SCOPE.get()
 
 
 @contextmanager

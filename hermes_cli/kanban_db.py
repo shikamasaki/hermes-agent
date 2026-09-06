@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import quote
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -160,6 +161,41 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+_REQUIRED_READONLY_SCHEMA: Mapping[str, frozenset[str]] = {
+    "tasks": frozenset({
+        "id", "title", "body", "assignee", "status", "priority",
+        "created_by", "created_at", "started_at", "completed_at",
+        "workspace_kind", "workspace_path", "branch_name", "project_id",
+        "claim_lock", "claim_expires", "tenant", "result",
+        "idempotency_key", "consecutive_failures", "worker_pid",
+        "last_failure_error", "max_runtime_seconds", "last_heartbeat_at",
+        "current_run_id", "workflow_template_id", "current_step_key",
+        "skills", "model_override", "provider_override", "reasoning_effort",
+        "max_retries", "goal_mode", "goal_max_turns", "session_id",
+        "block_kind", "block_recurrences", "no_rerun", "no_rerun_reason",
+        "successor_task_id",
+    }),
+    "task_links": frozenset({"parent_id", "child_id"}),
+    "task_comments": frozenset({"id", "task_id", "author", "body", "created_at"}),
+    "task_events": frozenset({"id", "task_id", "run_id", "kind", "payload", "created_at"}),
+    "task_runs": frozenset({
+        "id", "task_id", "profile", "step_key", "status", "claim_lock",
+        "claim_expires", "worker_pid", "max_runtime_seconds",
+        "last_heartbeat_at", "started_at", "ended_at", "outcome",
+        "summary", "metadata", "error",
+    }),
+    "task_attachments": frozenset({
+        "id", "task_id", "filename", "stored_path", "content_type", "size",
+        "uploaded_by", "created_at",
+    }),
+    "kanban_notify_subs": frozenset({
+        "task_id", "platform", "chat_id", "thread_id", "user_id",
+        "user_id_alt", "chat_type", "notifier_profile", "delivery_mode",
+        "delivery_metadata", "created_at", "last_event_id",
+    }),
+}
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -1141,6 +1177,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Opt-out marker for reruns. ``1`` means this task should not be
+    # re-dispatched after it stops.
+    no_rerun: int = 0
+    # Human-facing reason for the no-rerun marker. NULL when not set.
+    no_rerun_reason: Optional[str] = None
+    # Optional successor task in the same board. Independent of no_rerun.
+    successor_task_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1277,21 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            no_rerun=(
+                int(row["no_rerun"])
+                if "no_rerun" in keys and row["no_rerun"] is not None
+                else 0
+            ),
+            no_rerun_reason=(
+                row["no_rerun_reason"]
+                if "no_rerun_reason" in keys and row["no_rerun_reason"]
+                else None
+            ),
+            successor_task_id=(
+                row["successor_task_id"]
+                if "successor_task_id" in keys and row["successor_task_id"]
+                else None
             ),
         )
 
@@ -1422,7 +1480,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Rerun opt-out flag. ``1`` means the task should not be re-dispatched
+    -- after it stops. This is stored independently from ``successor_task_id``.
+    no_rerun             INTEGER NOT NULL DEFAULT 0,
+    -- Human-facing explanation for why the task should not be rerun.
+    no_rerun_reason      TEXT,
+    -- Optional successor task in the same board. Independent of no_rerun.
+    successor_task_id    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2335,6 +2400,83 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _validate_readonly_schema(conn: sqlite3.Connection, path: Path) -> None:
+    missing: list[str] = []
+    for table, required_cols in _REQUIRED_READONLY_SCHEMA.items():
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        if not rows:
+            missing.append(table)
+            continue
+        existing_cols = {row["name"] for row in rows}
+        for col in sorted(required_cols - existing_cols):
+            missing.append(f"{table}.{col}")
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise RuntimeError(
+            f"kanban DB schema is not current at {path}: missing {preview}{suffix}; "
+            "run a parent kanban command to initialize or migrate it"
+        )
+
+
+def _readonly_uri(path: Path) -> str:
+    return f"file:{quote(str(path), safe='/')}?mode=ro"
+
+
+def connect_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing kanban DB in SQLite read-only mode without init/migration.
+
+    This is for dispatcher-spawned worker read paths. It deliberately does not
+    create parent directories, run schema DDL, migrate legacy DBs, enable WAL, or
+    set persistent PRAGMAs. SQLite ``mode=ro`` is the trust boundary: any write
+    attempt through the returned connection is refused by the driver/OS.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"kanban DB does not exist: {path}") from exc
+    except OSError as exc:
+        raise FileNotFoundError(f"kanban DB is not accessible: {path}: {exc}") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"kanban DB does not exist: {resolved}")
+    if resolved.stat().st_size == 0:
+        raise FileNotFoundError(f"kanban DB is empty: {resolved}")
+    _validate_sqlite_header(resolved)
+    conn = sqlite3.connect(
+        _readonly_uri(resolved),
+        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+        uri=True,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _validate_readonly_schema(conn, resolved)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    conn = connect_readonly(db_path, board=board)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2688,6 +2830,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "no_rerun" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "no_rerun", "no_rerun INTEGER NOT NULL DEFAULT 0"
+        )
+    if "no_rerun_reason" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "no_rerun_reason", "no_rerun_reason TEXT"
+        )
+    if "successor_task_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "successor_task_id", "successor_task_id TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -3833,6 +3988,134 @@ def set_reasoning_effort(
     return True
 
 
+def set_no_rerun(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled: bool,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Set or clear the rerun opt-out flag for a task.
+
+    Enabling no_rerun requires a non-empty reason and is restricted to tasks
+    that are already stopped (blocked, done, or archived). Clearing the flag
+    also requires a non-empty reason and leaves task status unchanged.
+    """
+    reason = (reason or "").strip() or None
+    enabled = bool(enabled)
+    if not reason:
+        action = "enabling" if enabled else "clearing"
+        raise ValueError(f"no_rerun_reason is required when {action} no_rerun")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, no_rerun_reason FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if enabled:
+            if row["status"] not in {"blocked", "done", "archived"}:
+                raise RuntimeError(
+                    f"cannot set no_rerun on {task_id}: status must be blocked, done, or archived"
+                )
+            conn.execute(
+                "UPDATE tasks SET no_rerun = 1, no_rerun_reason = ? WHERE id = ?",
+                (reason, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "no_rerun_set",
+                {"no_rerun": True, "reason": reason},
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET no_rerun = 0, no_rerun_reason = NULL WHERE id = ?",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "no_rerun_cleared",
+                {
+                    "no_rerun": False,
+                    "reason": reason,
+                    "previous_reason": row["no_rerun_reason"],
+                },
+            )
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("no_rerun", "no_rerun_reason"))
+    return True
+
+
+def _would_follow_successor_cycle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    successor_task_id: str,
+) -> bool:
+    """Return True if setting a successor would create a successor cycle."""
+    seen: set[str] = set()
+    current = successor_task_id
+    while current:
+        if current == task_id:
+            return True
+        if current in seen:
+            return True
+        seen.add(current)
+        row = conn.execute(
+            "SELECT successor_task_id FROM tasks WHERE id = ?", (current,)
+        ).fetchone()
+        if row is None:
+            break
+        current = (row["successor_task_id"] or "").strip() or None
+    return False
+
+
+def set_successor_task_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    successor_task_id: Optional[str],
+) -> bool:
+    """Set or clear the successor task reference for a task."""
+    successor_task_id = (successor_task_id or "").strip() or None
+    with write_txn(conn):
+        row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return False
+        if successor_task_id is not None:
+            missing = _find_missing_parents(conn, [task_id, successor_task_id])
+            if missing:
+                raise ValueError(f"unknown task(s): {', '.join(missing)}")
+            if successor_task_id == task_id:
+                raise ValueError("a task cannot be its own successor")
+            if _would_follow_successor_cycle(conn, task_id, successor_task_id):
+                raise ValueError(
+                    f"setting successor {task_id} -> {successor_task_id} would create a cycle"
+                )
+            conn.execute(
+                "UPDATE tasks SET successor_task_id = ? WHERE id = ?",
+                (successor_task_id, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "successor_task_set",
+                {"successor_task_id": successor_task_id},
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET successor_task_id = NULL WHERE id = ?",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "successor_task_cleared",
+                {"successor_task_id": None},
+            )
+    notify_task_updated(conn, task_id, ("successor_task_id",))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
@@ -3941,6 +4224,18 @@ def task_graph_contexts(
         return contexts
 
     placeholders = ",".join("?" for _ in ordered_ids)
+    task_successors = {
+        row["id"]: (
+            str(row["successor_task_id"]).strip() or None
+            if row["successor_task_id"]
+            else None
+        )
+        for row in conn.execute(
+            "SELECT id, successor_task_id FROM tasks "
+            f"WHERE id IN ({placeholders})",
+            tuple(ordered_ids),
+        ).fetchall()
+    }
     for row in conn.execute(
         "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
         "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
@@ -3963,6 +4258,33 @@ def task_graph_contexts(
             "title": row["title"],
             "status": row["status"],
         })
+    for task_id, successor_id in task_successors.items():
+        if not successor_id:
+            contexts[task_id]["successor"] = None
+            continue
+        try:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?",
+                (successor_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            contexts[task_id]["successor"] = {
+                "id": successor_id,
+                "status": None,
+                "error": "unavailable",
+            }
+            continue
+        if row is None:
+            contexts[task_id]["successor"] = {
+                "id": successor_id,
+                "status": None,
+                "error": "not_found",
+            }
+            continue
+        contexts[task_id]["successor"] = {
+            "id": row["id"],
+            "status": row["status"],
+        }
     return contexts
 
 
@@ -4555,12 +4877,14 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, no_rerun "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if int(row["no_rerun"] or 0):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4641,6 +4965,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT no_rerun FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or int(task_row["no_rerun"] or 0):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4769,6 +5099,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT no_rerun FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or int(task_row["no_rerun"] or 0):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -6798,43 +7134,50 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
+    def _validate_promotable() -> tuple[bool, Optional[str]]:
+        row = conn.execute(
+            "SELECT status, no_rerun FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
 
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
-
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
-        if unsatisfied:
+        cur_status = row["status"]
+        if int(row["no_rerun"] or 0):
+            return False, f"task {task_id} is marked no_rerun"
+        if cur_status not in ("todo", "blocked"):
             return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                f"'todo' or 'blocked'"
             )
 
-    if dry_run:
+        if not force:
+            parents = conn.execute(
+                "SELECT t.id, t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            unsatisfied = [
+                p["id"] for p in parents
+                if p["status"] not in ("done", "archived")
+            ]
+            if unsatisfied:
+                return False, (
+                    f"unsatisfied parent dependencies: "
+                    f"{', '.join(unsatisfied)} (use --force to override)"
+                )
         return True, None
 
+    if dry_run:
+        return _validate_promotable()
+
     with write_txn(conn):
+        ok, err = _validate_promotable()
+        if not ok:
+            return False, err
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked') AND no_rerun = 0",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -6911,9 +7254,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, no_rerun FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if current is None or int(current["no_rerun"] or 0):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -6975,6 +7320,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT no_rerun FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None or int(current["no_rerun"] or 0):
+            return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -10045,7 +10396,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, no_rerun FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10054,7 +10405,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, no_rerun FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10077,9 +10428,13 @@ def _dispatch_once_locked(
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
+            return any(
+                row["assignee"] and not int(row["no_rerun"] or 0)
+                for row in review_rows
+            )
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"] and not int(row["no_rerun"] or 0) and _rpe(row["assignee"])
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -10125,6 +10480,8 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if int(row["no_rerun"] or 0):
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10330,6 +10687,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if int(row["no_rerun"] or 0):
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

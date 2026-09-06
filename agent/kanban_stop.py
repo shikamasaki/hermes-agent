@@ -22,17 +22,50 @@ _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 _DEFAULT_MAX_ATTEMPTS = 2
 
 
+def _current_execution_owns_dispatcher_task() -> bool:
+    """Return True only when this execution is the real dispatcher-owned worker.
+
+    ``HERMES_KANBAN_TASK`` is a process-global env var: a ``delegate_task``
+    child, an in-process cron run, or a child-marked subprocess spawned by
+    either can all observe it set even though none of them owns the
+    dispatcher's task. Consult the same ContextVar-based predicate used
+    elsewhere (:mod:`agent.delegation_context`) so this guard cannot nudge a
+    subagent or cron job into calling ``kanban_complete``/``kanban_block`` on
+    a card it does not own. Any failure to import/resolve fails closed (no
+    nudge) rather than risking a false-positive nudge to a non-owner.
+    """
+    try:
+        from agent.delegation_context import (
+            is_delegated_child_process_context,
+            is_dispatcher_owned_worker_context,
+        )
+    except Exception:
+        return False
+    try:
+        if is_delegated_child_process_context():
+            return False
+        return bool(is_dispatcher_owned_worker_context())
+    except Exception:
+        return False
+
+
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
     On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it. Additionally requires
+    that this execution actually owns the dispatcher's task: delegate_task
+    children, in-process cron runs, and child-marked subprocesses inherit the
+    env var without owning the card, and must never be nudged to call
+    kanban_complete/kanban_block on it.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    return _current_execution_owns_dispatcher_task()
 
 
 def _tool_call_name(tc: Any) -> str:

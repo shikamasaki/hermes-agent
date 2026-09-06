@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -39,13 +41,214 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _kanban_cli(
+    home: Path,
+    *args: str,
+    child_task: str | None = None,
+    delegated_child: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    if child_task is not None:
+        env["HERMES_KANBAN_TASK"] = child_task
+    else:
+        env.pop("HERMES_KANBAN_TASK", None)
+    if delegated_child:
+        env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def _db_table_counts(db_path: Path) -> dict[str, int]:
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        counts: dict[str, int] = {}
+        for table in tables:
+            counts[table] = conn.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0]
+        return counts
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
 
 
+def test_child_cli_list_missing_db_is_read_only(tmp_path):
+    """A worker read must not create a kanban.db just to list tasks."""
+    home = tmp_path / ".hermes"
+    db_path = home / "kanban.db"
+
+    proc = _kanban_cli(home, "list", "--json", child_task="t_missing")
+
+    assert proc.returncode == 1
+    assert "kanban DB does not exist" in proc.stderr
+    assert not db_path.exists()
 
 
+def test_delegated_child_cli_list_missing_db_is_read_only(tmp_path):
+    """A delegate_task child read must not initialize a scrubbed kanban env."""
+    home = tmp_path / ".hermes"
+    db_path = home / "kanban.db"
+
+    proc = _kanban_cli(home, "list", "--json", delegated_child=True)
+
+    assert proc.returncode == 1
+    assert "kanban DB does not exist" in proc.stderr
+    assert not db_path.exists()
+
+
+def test_delegated_child_cli_show_existing_db_read_without_board_escape(tmp_path):
+    home = tmp_path / ".hermes"
+    created = _kanban_cli(home, "create", "delegated readonly", "--json")
+    assert created.returncode == 0, created.stderr
+    tid = json.loads(created.stdout)["id"]
+
+    show = _kanban_cli(home, "show", tid, "--json", delegated_child=True)
+    wrong_board = _kanban_cli(
+        home,
+        "--board",
+        "not_a_board",
+        "show",
+        tid,
+        "--json",
+        delegated_child=True,
+    )
+
+    assert show.returncode == 0, show.stderr
+    assert json.loads(show.stdout)["task"]["title"] == "delegated readonly"
+    assert wrong_board.returncode == 1
+    assert "does not exist" in wrong_board.stderr
+
+
+def test_connect_readonly_observes_parent_writes_after_open(tmp_path):
+    """Read-only connections must not use immutable snapshots of mutable DBs."""
+    home = tmp_path / ".hermes"
+    created = _kanban_cli(home, "create", "before parent write", "--json")
+    assert created.returncode == 0, created.stderr
+    tid = json.loads(created.stdout)["id"]
+    db_path = home / "kanban.db"
+
+    reader = kb.connect_readonly(db_path)
+    try:
+        task = kb.get_task(reader, tid)
+        assert task is not None
+        assert task.title == "before parent write"
+        writer = sqlite3.connect(str(db_path))
+        try:
+            writer.execute(
+                "UPDATE tasks SET title = 'after parent write' WHERE id = ?",
+                (tid,),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+        task = kb.get_task(reader, tid)
+        assert task is not None
+        assert task.title == "after parent write"
+    finally:
+        reader.close()
+
+
+def test_child_cli_show_list_runs_existing_db_read_without_side_effects(tmp_path):
+    home = tmp_path / ".hermes"
+    db_path = home / "kanban.db"
+
+    created = _kanban_cli(home, "create", "readonly smoke", "--json")
+    assert created.returncode == 0, created.stderr
+    tid = json.loads(created.stdout)["id"]
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, summary) "
+            "VALUES (?, 'worker', 'done', 1, 'ok')",
+            (tid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    counts_before = _db_table_counts(db_path)
+
+    show = _kanban_cli(home, "show", tid, "--json", child_task=tid)
+    listing = _kanban_cli(home, "list", "--json", child_task=tid)
+    runs = _kanban_cli(home, "runs", tid, "--json", child_task=tid)
+
+    assert show.returncode == 0, show.stderr
+    assert json.loads(show.stdout)["task"]["title"] == "readonly smoke"
+    assert listing.returncode == 0, listing.stderr
+    assert any(row["id"] == tid for row in json.loads(listing.stdout))
+    assert runs.returncode == 0, runs.stderr
+    assert json.loads(runs.stdout)[0]["summary"] == "ok"
+    assert _db_table_counts(db_path) == counts_before
+
+    # Existing mutation behavior is unchanged for worker-scoped CLI calls.
+    comment = _kanban_cli(home, "comment", tid, "worker comment still allowed", child_task=tid)
+    assert comment.returncode == 0, comment.stderr
+    parent_comment = _kanban_cli(home, "comment", tid, "parent write after child read")
+    assert parent_comment.returncode == 0, parent_comment.stderr
+
+
+def test_child_cli_legacy_schema_read_refuses_migration_without_changing_bytes(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    db_path = home / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, "
+            "priority INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) "
+            "VALUES ('t_legacy', 'legacy task', 'ready', 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    proc = _kanban_cli(home, "show", "t_legacy", "--json", child_task="t_legacy")
+
+    assert proc.returncode == 1
+    assert "kanban DB schema is not current" in proc.stderr
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_concurrent_child_cli_readonly_reads_succeed(tmp_path):
+    home = tmp_path / ".hermes"
+    created = _kanban_cli(home, "create", "parallel readonly", "--json")
+    assert created.returncode == 0, created.stderr
+    tid = json.loads(created.stdout)["id"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(_kanban_cli, home, "show", tid, "--json", child_task=tid),
+            pool.submit(_kanban_cli, home, "list", "--json", child_task=tid),
+        ]
+        results = [future.result(timeout=45) for future in futures]
+
+    assert all(proc.returncode == 0 for proc in results), [proc.stderr for proc in results]
 
 
 
@@ -485,6 +688,74 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def test_task_graph_contexts_reports_successor_status_and_missing(kanban_home):
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="owner")
+        successor = kb.create_task(conn, title="successor")
+        missing = kb.create_task(conn, title="missing successor")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (successor,))
+        conn.execute(
+            "UPDATE tasks SET successor_task_id = ? WHERE id = ?",
+            (successor, owner),
+        )
+        conn.execute(
+            "UPDATE tasks SET successor_task_id = ? WHERE id = ?",
+            ("t_missing_successor", missing),
+        )
+        conn.commit()
+
+        contexts = kb.task_graph_contexts(conn, [owner, successor, missing])
+
+        assert contexts[owner]["successor"] == {
+            "id": successor,
+            "status": "done",
+        }
+        assert contexts[successor]["successor"] is None
+        assert contexts[missing]["successor"] == {
+            "id": "t_missing_successor",
+            "status": None,
+            "error": "not_found",
+        }
+        assert kb.task_graph_context(conn, owner)["successor"] == {
+            "id": successor,
+            "status": "done",
+        }
+
+
+class _SuccessorLookupErrorConnection:
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        if "SELECT id, status FROM tasks WHERE id = ?" in sql:
+            raise sqlite3.OperationalError("forced successor lookup failure")
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_task_graph_context_marks_successor_unavailable_on_lookup_error(kanban_home):
+    conn = kb.connect()
+    try:
+        owner = kb.create_task(conn, title="owner unavailable")
+        successor = kb.create_task(conn, title="successor unavailable")
+        conn.execute(
+            "UPDATE tasks SET successor_task_id = ? WHERE id = ?",
+            (successor, owner),
+        )
+        conn.commit()
+
+        proxy = _SuccessorLookupErrorConnection(conn)
+        context = kb.task_graph_context(proxy, owner)
+
+        assert context["successor"] == {
+            "id": successor,
+            "status": None,
+            "error": "unavailable",
+        }
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

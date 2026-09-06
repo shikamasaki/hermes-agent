@@ -13,9 +13,15 @@ ONLY, zero code/prompt text copied (proprietary).
 """
 
 import json
+import shlex
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from agent.delegation_context import (
+    get_delegated_child_snapshot_scope,
+    is_delegated_child_context,
+)
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _run_single_child,
@@ -159,6 +165,7 @@ class _StubChild:
     _parent_subagent_id = None
     _delegate_output_schema: dict | None = None
     model = "test-model"
+    session_id = "stub-child-session"
     session_prompt_tokens = 0
     session_completion_tokens = 0
     session_estimated_cost_usd = 0.0
@@ -324,6 +331,251 @@ def _make_mock_parent():
 
 
 class TestDelegateTaskDispatch:
+    def test_schema_retry_preserves_child_context_scope_and_restores_parent(self):
+        records = []
+
+        child = _StubChild(["not json", '{"city": "Kyoto"}'])
+        child.session_id = "schema-retry-child-session"
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        original = child.run_conversation
+
+        def recording_run(user_message, task_id=None, **kw):
+            records.append(
+                {
+                    "is_child": is_delegated_child_context(),
+                    "scope": get_delegated_child_snapshot_scope(),
+                }
+            )
+            return original(user_message, task_id=task_id, **kw)
+
+        child.run_conversation = recording_run
+
+        def fake_build(**_kwargs):
+            return child
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value={
+                    "provider": None,
+                    "model": None,
+                    "base_url": None,
+                    "api_key": None,
+                    "api_mode": None,
+                },
+            ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                side_effect=fake_build,
+            ),
+        ):
+            out = delegate_task(
+                goal="produce the address",
+                output_schema=ADDRESS_SCHEMA,
+                parent_agent=_make_mock_parent(),
+            )
+
+        payload = json.loads(out)
+        assert payload["results"][0]["schema_valid"] is True
+        assert [record["is_child"] for record in records] == [True, True]
+        assert records[0]["scope"] == "schema-retry-child-session"
+        assert records[1]["scope"] == records[0]["scope"]
+        assert is_delegated_child_context() is False
+        assert get_delegated_child_snapshot_scope() is None
+
+    def test_schema_retry_kanban_complete_is_rejected_as_child_mutation(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from tests.tools.test_delegate_kanban_isolation import _make_running_kanban_task
+        from tools import kanban_tools
+
+        kb, tid, workspace, _attachments_root = _make_running_kanban_task(
+            monkeypatch,
+            tmp_path,
+        )
+        attempted = []
+
+        child = _StubChild(["not json", '{"city": "Kyoto"}'])
+        child.session_id = "schema-retry-kanban-child-session"
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        original = child.run_conversation
+
+        def retry_attempts_kanban_complete(user_message, task_id=None, **kw):
+            if child.calls:
+                attempted.append(
+                    kanban_tools._handle_complete({"summary": "retry child completion leak"})
+                )
+            return original(user_message, task_id=task_id, **kw)
+
+        child.run_conversation = retry_attempts_kanban_complete
+
+        class Parent:
+            _current_task_id = tid
+            _delegate_depth = 0
+
+            def _touch_activity(self, _desc):
+                return None
+
+        entry = _run_single_child(0, "produce the address", child, Parent())
+
+        assert entry["schema_valid"] is True
+        assert attempted
+        assert "delegate_task child" in attempted[0]
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+        finally:
+            conn.close()
+
+        assert task.status == "running"
+        assert run.status == "running"
+        assert workspace.is_dir()
+
+    def test_schema_retry_uses_same_real_local_environment_child_snapshot(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from tools.environments.local import LocalEnvironment
+
+        parent_home = tmp_path / "parent_home"
+        child_home = tmp_path / "child_home"
+        parent_cwd = tmp_path / "parent_cwd"
+        child_cwd = tmp_path / "child_cwd"
+        terminal_tmp = tmp_path / "terminal_tmp"
+        for directory in (parent_home, child_home, parent_cwd, child_cwd, terminal_tmp):
+            directory.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(parent_home))
+        monkeypatch.setenv("TERMINAL_TEMP_DIR", str(terminal_tmp))
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+        env = LocalEnvironment(cwd=str(parent_cwd), timeout=10)
+        child = _StubChild([])
+        child.session_id = "schema-retry-localenv-child"
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        seen = []
+
+        def run_with_terminal_state(user_message, task_id=None, **_kw):
+            seen.append(
+                {
+                    "is_child": is_delegated_child_context(),
+                    "scope": get_delegated_child_snapshot_scope(),
+                }
+            )
+            if len(seen) == 1:
+                result = env.execute(
+                    f"export HERMES_HOME={shlex.quote(str(child_home))}; "
+                    f"cd {shlex.quote(str(child_cwd))}; "
+                    'printf "%s:%s" "$HERMES_HOME" "$(pwd -P)"',
+                    timeout=10,
+                )
+                assert result["returncode"] == 0, result["output"]
+                home_text, cwd_text = result["output"].strip().split(":", 1)
+                assert home_text == str(child_home)
+                assert Path(cwd_text).resolve() == child_cwd.resolve()
+                return {
+                    "final_response": "not json",
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            result = env.execute('printf "%s:%s" "$HERMES_HOME" "$(pwd -P)"', timeout=10)
+            assert result["returncode"] == 0, result["output"]
+            retry_state = result["output"].strip()
+            home_text, cwd_text = retry_state.split(":", 1)
+            assert home_text == str(child_home)
+            assert Path(cwd_text).resolve() == child_cwd.resolve()
+            return {
+                "final_response": '{"city": "Kyoto"}',
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation = run_with_terminal_state
+
+        try:
+            entry = _run_single_child(0, "produce the address", child, _StubParent())
+            assert entry["schema_valid"] is True
+            assert [record["is_child"] for record in seen] == [True, True]
+            assert seen[0]["scope"] == "schema-retry-localenv-child"
+            assert seen[1]["scope"] == seen[0]["scope"]
+            parent_state = env.execute('printf "%s:%s" "$HERMES_HOME" "$(pwd -P)"', timeout=10)
+            assert parent_state["returncode"] == 0, parent_state["output"]
+            home_text, cwd_text = parent_state["output"].strip().split(":", 1)
+            assert home_text == str(parent_home)
+            assert Path(cwd_text).resolve() == parent_cwd.resolve()
+            assert is_delegated_child_context() is False
+            assert get_delegated_child_snapshot_scope() is None
+        finally:
+            env.cleanup()
+
+    def test_schema_retry_exception_restores_parent_context(self, monkeypatch, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        parent_home = tmp_path / "exception_parent_home"
+        retry_home = tmp_path / "exception_retry_home"
+        parent_cwd = tmp_path / "exception_parent_cwd"
+        retry_cwd = tmp_path / "exception_retry_cwd"
+        terminal_tmp = tmp_path / "exception_terminal_tmp"
+        for directory in (parent_home, retry_home, parent_cwd, retry_cwd, terminal_tmp):
+            directory.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(parent_home))
+        monkeypatch.setenv("TERMINAL_TEMP_DIR", str(terminal_tmp))
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+        env = LocalEnvironment(cwd=str(parent_cwd), timeout=10)
+        child = _StubChild(["not json"])
+        child.session_id = "schema-retry-exception-child"
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        original = child.run_conversation
+        seen = []
+
+        def retry_raises(user_message, task_id=None, **kw):
+            seen.append(
+                {
+                    "is_child": is_delegated_child_context(),
+                    "scope": get_delegated_child_snapshot_scope(),
+                }
+            )
+            if len(seen) == 2:
+                result = env.execute(
+                    f"export HERMES_HOME={shlex.quote(str(retry_home))}; "
+                    f"cd {shlex.quote(str(retry_cwd))}; "
+                    'printf "%s:%s" "$HERMES_HOME" "$(pwd -P)"',
+                    timeout=10,
+                )
+                assert result["returncode"] == 0, result["output"]
+                home_text, cwd_text = result["output"].strip().split(":", 1)
+                assert home_text == str(retry_home)
+                assert Path(cwd_text).resolve() == retry_cwd.resolve()
+                raise RuntimeError("intentional retry failure")
+            return original(user_message, task_id=task_id, **kw)
+
+        child.run_conversation = retry_raises
+
+        try:
+            entry = _run_single_child(0, "produce the address", child, _StubParent())
+            assert entry["schema_valid"] is False
+            assert [record["is_child"] for record in seen] == [True, True]
+            assert seen[1]["scope"] == "schema-retry-exception-child"
+            parent_state = env.execute('printf "%s:%s" "$HERMES_HOME" "$(pwd -P)"', timeout=10)
+            assert parent_state["returncode"] == 0, parent_state["output"]
+            home_text, cwd_text = parent_state["output"].strip().split(":", 1)
+            assert home_text == str(parent_home)
+            assert Path(cwd_text).resolve() == parent_cwd.resolve()
+            assert is_delegated_child_context() is False
+            assert get_delegated_child_snapshot_scope() is None
+        finally:
+            env.cleanup()
+
     def test_non_dict_output_schema_rejected(self):
         with (
             patch("tools.delegate_tool._load_config", return_value={}),

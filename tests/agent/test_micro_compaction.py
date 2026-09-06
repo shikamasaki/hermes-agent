@@ -57,6 +57,31 @@ def _summary_markers(messages: list) -> list:
     return [m for m in messages if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]
 
 
+class _ToggleArchiveSessionDB:
+    def __init__(self, *, raise_on_archive: bool = True):
+        self.raise_on_archive = raise_on_archive
+        self.calls = []
+
+    def archive_and_compact(self, session_id, compacted_messages, *, tail_count):
+        self.calls.append((session_id, compacted_messages, tail_count))
+        if self.raise_on_archive:
+            raise OSError("read-only test database")
+
+
+def _seed_real_session_db(db, session_id: str, messages: list) -> None:
+    db.create_session(session_id=session_id, source="test", model="test-model")
+    for message in messages:
+        db.append_message(
+            session_id=session_id,
+            role=message["role"],
+            content=message["content"],
+        )
+
+
+def _role_content(messages: list) -> list:
+    return [(m.get("role"), m.get("content")) for m in messages]
+
+
 class TestMicroCompaction:
     def test_absorbs_one_exchange_and_leaves_a_summary_marker(self):
         cc = _compressor()
@@ -732,6 +757,325 @@ class TestMicroCompaction:
             "micro-compaction gate must check agent._persist_disabled"
         )
 
+    def test_sync_micro_compact_to_db_reports_archive_failure(self):
+        cc = _compressor()
+        cc._session_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_id = "persist-failure-session"
+
+        assert cc._sync_micro_compact_to_db(_conversation(exchanges=2)) is False
+
+    def test_sync_micro_compact_to_db_no_db_is_successful_no_op(self):
+        cc = _compressor()
+
+        assert cc._sync_micro_compact_to_db(_conversation(exchanges=2)) is True
+
+    def test_micro_compact_persist_failure_leaves_state_and_messages_unchanged(self):
+        cc = _compressor()
+        cc._session_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_id = "persist-failure-session"
+        messages = _conversation(exchanges=8)
+        cursor_before = cc._micro_compact_cursor
+        summary_before = cc._micro_compact_rolling_summary
+
+        result = cc._micro_compact(list(messages))
+
+        assert result == messages
+        assert any("answer 0" in str(m.get("content")) for m in result)
+        assert _summary_markers(result) == []
+        assert cc._micro_compact_cursor == cursor_before
+        assert cc._micro_compact_rolling_summary == summary_before
+
+    def test_micro_compact_retries_same_exchange_after_persist_failure(self):
+        cc = _compressor()
+        fake_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_db = fake_db
+        cc._session_id = "persist-failure-session"
+        messages = _conversation(exchanges=8)
+
+        first = cc._micro_compact(list(messages))
+        second = cc._micro_compact(list(messages))
+
+        assert first == messages
+        assert second == messages
+        assert _summary_markers(first) == []
+        assert _summary_markers(second) == []
+        assert any("answer 0" in str(m.get("content")) for m in second)
+        assert cc._micro_compact_cursor == 0
+        assert cc._micro_compact_rolling_summary == ""
+        assert len(fake_db.calls) == 2
+
+    def test_micro_compact_recovers_after_persist_failure_stops_raising(self):
+        cc = _compressor()
+        fake_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_db = fake_db
+        cc._session_id = "persist-recovery-session"
+        messages = _conversation(exchanges=8)
+
+        failed = cc._micro_compact(list(messages))
+        fake_db.raise_on_archive = False
+        recovered = cc._micro_compact(list(messages))
+
+        assert failed == messages
+        assert recovered != messages
+        assert not any("answer 0" in str(m.get("content")) for m in recovered)
+        assert len(_summary_markers(recovered)) == 1
+        assert cc._micro_compact_cursor > 0
+        assert cc._micro_compact_rolling_summary == "ROLLING SUMMARY"
+
+    def test_micro_compact_real_db_failed_write_preserves_db_then_recovers(self, tmp_path):
+        from hermes_state import SessionDB
+
+        sid = "persist-real-recovery-session"
+        messages = _conversation(exchanges=8)
+        db_path = tmp_path / "micro-real.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            _seed_real_session_db(db, sid, messages)
+            cc = _compressor()
+            cc._session_db = db
+            cc._session_id = sid
+
+            assert db._conn is not None
+            db._conn.execute(
+                """
+                CREATE TRIGGER fail_micro_compaction_insert
+                BEFORE INSERT ON messages
+                WHEN NEW.session_id = 'persist-real-recovery-session'
+                 AND NEW.content LIKE '[CONTEXT COMPACTION%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated sqlite write failure');
+                END
+                """
+            )
+            failed = cc._micro_compact(list(messages))
+
+            reloaded_after_failure = db.get_messages_as_conversation(sid)
+            assert failed == messages
+            assert _role_content(reloaded_after_failure) == _role_content(messages)
+            assert any("answer 0" in str(m.get("content")) for m in reloaded_after_failure)
+            assert _summary_markers(reloaded_after_failure) == []
+            assert cc._micro_compact_cursor == 0
+            assert cc._micro_compact_rolling_summary == ""
+
+            db._conn.execute("DROP TRIGGER fail_micro_compaction_insert")
+            recovered = cc._micro_compact(list(messages))
+            db.close()
+            db = SessionDB(db_path=db_path)
+            reloaded_after_recovery = db.get_messages_as_conversation(sid)
+
+            assert len(_summary_markers(recovered)) == 1
+            assert sum(
+                "CONTEXT COMPACTION" in str(m.get("content"))
+                for m in reloaded_after_recovery
+            ) == 1
+            assert sum(
+                "ROLLING SUMMARY" in str(m.get("content"))
+                for m in reloaded_after_recovery
+            ) == 1
+            assert all("_compressed_summary" not in m for m in reloaded_after_recovery)
+            assert _role_content(reloaded_after_recovery) == _role_content(recovered)
+            assert not any("answer 0" in str(m.get("content")) for m in recovered)
+            assert cc._micro_compact_cursor > 0
+            assert cc._micro_compact_rolling_summary == "ROLLING SUMMARY"
+        finally:
+            db.close()
+
+    def test_micro_compact_defrag_persist_failure_restores_state_and_marker(self):
+        import copy
+
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+
+        cc = _compressor(summary="INITIAL MICRO SUMMARY")
+        fake_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        messages = cc._micro_compact(list(_conversation(exchanges=8)))
+        marker = _summary_markers(messages)[0]
+        marker[_DB_PERSISTED_MARKER] = "persisted-before-defrag"
+        cc._session_db = fake_db
+        cc._session_id = "defrag-persist-failure-session"
+        prior_summary = "x" * 40_000
+        cc._micro_compact_rolling_summary = prior_summary
+        cc._micro_summarize_one = lambda exchange_text: "FRESH DEFRAGGED SUMMARY"
+        messages_before = copy.deepcopy(messages)
+        marker_content_before = marker["content"]
+
+        result = cc._micro_compact(list(messages))
+
+        assert result == messages_before
+        assert marker["content"] == marker_content_before
+        assert marker[_DB_PERSISTED_MARKER] == "persisted-before-defrag"
+        assert cc._micro_compact_rolling_summary == prior_summary
+        assert cc._micro_compact_rolling_summary != ""
+        assert cc._micro_compact_rolling_summary != "FRESH DEFRAGGED SUMMARY"
+        assert len(fake_db.calls) == 1
+
+    def test_micro_compact_defrag_persist_failure_emits_telemetry(self, caplog):
+        import json
+        import logging
+
+        cc = _compressor(summary="INITIAL MICRO SUMMARY")
+        messages = cc._micro_compact(list(_conversation(exchanges=8)))
+        cc._session_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_id = "defrag-telemetry-failure-session"
+        cc._micro_compact_rolling_summary = "x" * 40_000
+        cc._micro_summarize_one = lambda exchange_text: "FRESH DEFRAGGED SUMMARY"
+
+        with caplog.at_level(logging.INFO, logger="agent.context_compressor"):
+            cc._micro_compact(list(messages))
+
+        line = next(
+            r.getMessage() for r in reversed(caplog.records)
+            if "micro compaction telemetry:" in r.getMessage()
+        )
+        payload = json.loads(line.split("micro compaction telemetry: ", 1)[1])
+        assert payload["outcome"] == "defrag_persist_failed"
+
+    def test_micro_compact_real_db_defrag_failed_write_preserves_db_then_recovers(self, tmp_path):
+        from hermes_state import SessionDB
+
+        sid = "defrag-real-recovery-session"
+        messages = _conversation(exchanges=8)
+        db_path = tmp_path / "micro-defrag-real.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            _seed_real_session_db(db, sid, messages)
+            cc = _compressor(summary="OLD REAL SUMMARY")
+            cc._session_db = db
+            cc._session_id = sid
+            compacted = cc._micro_compact(list(messages))
+            assert len(_summary_markers(compacted)) == 1
+
+            prior_summary = "OLD REAL SUMMARY " + "x" * 40_000
+            cc._micro_compact_rolling_summary = prior_summary
+            cc._micro_summarize_one = lambda exchange_text: "FRESH REAL DEFRAG SUMMARY"
+            assert db._conn is not None
+            db._conn.execute(
+                """
+                CREATE TRIGGER fail_micro_defrag_insert
+                BEFORE INSERT ON messages
+                WHEN NEW.session_id = 'defrag-real-recovery-session'
+                 AND NEW.content LIKE '%FRESH REAL DEFRAG SUMMARY%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated sqlite defrag write failure');
+                END
+                """
+            )
+            failed = cc._micro_compact(list(compacted))
+
+            reloaded_after_failure = db.get_messages_as_conversation(sid)
+            assert failed == compacted
+            assert cc._micro_compact_rolling_summary == prior_summary
+            assert any("OLD REAL SUMMARY" in str(m.get("content")) for m in reloaded_after_failure)
+            assert not any(
+                "FRESH REAL DEFRAG SUMMARY" in str(m.get("content"))
+                for m in reloaded_after_failure
+            )
+
+            db._conn.execute("DROP TRIGGER fail_micro_defrag_insert")
+            recovered = cc._micro_compact(list(compacted))
+            db.close()
+            db = SessionDB(db_path=db_path)
+            reloaded_after_recovery = db.get_messages_as_conversation(sid)
+
+            assert any(
+                "FRESH REAL DEFRAG SUMMARY" in str(m.get("content"))
+                for m in _summary_markers(recovered)
+            )
+            assert cc._micro_compact_rolling_summary == "FRESH REAL DEFRAG SUMMARY"
+            assert any(
+                "FRESH REAL DEFRAG SUMMARY" in str(m.get("content"))
+                for m in reloaded_after_recovery
+            )
+            assert not any(
+                "OLD REAL SUMMARY" in str(m.get("content"))
+                and m.get("role") == "assistant"
+                for m in reloaded_after_recovery
+            )
+        finally:
+            db.close()
+
+    def test_micro_compact_real_db_commit_survives_stamp_failure(self, tmp_path):
+        from hermes_state import SessionDB
+
+        sid = "persist-stamp-boundary-session"
+        messages = _conversation(exchanges=8)
+        db = SessionDB(db_path=tmp_path / "micro-stamp-boundary.db")
+        try:
+            _seed_real_session_db(db, sid, messages)
+            cc = _compressor()
+            cc._session_db = db
+            cc._session_id = sid
+
+            with patch(
+                "agent.context_compressor.stamp_db_persisted_markers",
+                side_effect=RuntimeError("stamp failed after commit"),
+            ):
+                result = cc._micro_compact(list(messages))
+
+            reloaded = db.get_messages_as_conversation(sid)
+            assert result != messages
+            assert len(_summary_markers(result)) == 1
+            assert sum(
+                "CONTEXT COMPACTION" in str(m.get("content"))
+                for m in reloaded
+            ) == 1
+            assert _role_content(reloaded) == _role_content(result)
+            assert not any("answer 0" in str(m.get("content")) for m in reloaded)
+            assert cc._micro_compact_cursor > 0
+            assert cc._micro_compact_rolling_summary == "ROLLING SUMMARY"
+        finally:
+            db.close()
+
+    def test_second_pass_persist_failure_never_mutates_original_user_turns(self):
+        """A second-pass persist failure must not corrupt earlier user text.
+
+        Pass 1 succeeds and leaves marker 1 plus the original user/assistant
+        dicts in place. Pass 2 supersedes marker 1 (cumulative summary), which
+        means ``_splice_micro_compact_result`` drops marker 1 and merges the
+        two now-adjacent user turns *before* the DB persist is attempted. That
+        merge mutates a live dict **in place** via ``_merge_adjacent_user_turns``
+        (``prev["content"] = ...``) — a dict that is the SAME object identity
+        as one of the messages the caller is holding from pass 1. When the
+        persist then fails and the code "rolls back" by returning the
+        original ``messages`` list unchanged, the mutation already happened
+        on a shared object: the caller's list still shows the merged/altered
+        content even though the function claims nothing changed.
+        """
+        cc = _compressor()
+        original = _conversation(exchanges=8)
+
+        # Pass 1: succeeds (no DB configured -> _sync_micro_compact_to_db is
+        # a no-op success). Creates marker 1 and advances the cursor.
+        after_pass1 = cc._micro_compact(list(original))
+        assert len(_summary_markers(after_pass1)) == 1
+
+        # Snapshot every real (non-marker) message's content by identity
+        # before attempting pass 2, so we can prove no live dict changed.
+        snapshot = {
+            id(m): m.get("content")
+            for m in after_pass1
+            if not m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        }
+
+        # Pass 2: force a DB persist failure. The rolling summary is already
+        # non-empty, so this pass is cumulative/supersedes marker 1.
+        cc._session_db = _ToggleArchiveSessionDB(raise_on_archive=True)
+        cc._session_id = "second-pass-persist-failure-session"
+
+        result = cc._micro_compact(list(after_pass1))
+
+        assert result == after_pass1, (
+            "a failed persist must return the untouched input list"
+        )
+
+        for m in after_pass1:
+            if m.get(COMPRESSED_SUMMARY_METADATA_KEY):
+                continue
+            before = snapshot.get(id(m))
+            assert m.get("content") == before, (
+                "a rolled-back persist failure mutated a live user/assistant "
+                f"message in place: {before!r} -> {m.get('content')!r}"
+            )
+
     def test_splice_preserves_db_persisted_stamps(self):
         """Surviving messages keep their _db_persisted stamps through a splice.
 
@@ -760,6 +1104,83 @@ class TestMicroCompaction:
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
         )
+
+    def test_second_pass_real_db_persist_failure_never_mutates_original_user_turns(self, tmp_path):
+        from copy import deepcopy
+
+        from hermes_state import SessionDB
+
+        sid = "second-pass-real-recovery-session"
+        messages = _conversation(exchanges=8)
+        db_path = tmp_path / "micro-stamp-boundary-real-2.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            _seed_real_session_db(db, sid, messages)
+            cc = _compressor()
+            cc._session_db = db
+            cc._session_id = sid
+
+            messages_after_pass1 = cc._micro_compact(list(messages))
+            assert len(_summary_markers(messages_after_pass1)) == 1
+
+            snapshot = deepcopy(messages_after_pass1)
+            cursor_before = cc._micro_compact_cursor
+            summary_before = cc._micro_compact_rolling_summary
+            db_state_before = db.get_messages_as_conversation(sid)
+
+            assert db._conn is not None
+            db._conn.execute(
+                f"""
+                CREATE TRIGGER fail_second_pass_insert
+                BEFORE INSERT ON messages
+                WHEN NEW.session_id = '{sid}'
+                 AND NEW.content LIKE '[CONTEXT COMPACTION%'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated sqlite write failure');
+                END
+                """
+            )
+
+            failed = cc._micro_compact(list(messages_after_pass1))
+
+            assert failed == snapshot
+            assert messages_after_pass1 == snapshot
+            assert cc._micro_compact_cursor == cursor_before
+            assert cc._micro_compact_rolling_summary == summary_before
+            reloaded_db = db.get_messages_as_conversation(sid)
+            assert _role_content(reloaded_db) == _role_content(db_state_before)
+
+            db._conn.execute("DROP TRIGGER fail_second_pass_insert")
+
+            recovered = cc._micro_compact(list(messages_after_pass1))
+            assert recovered != failed
+            # Cursor position is a shortened-list index, not a monotonic
+            # counter (see test_cursor_advances_across_successive_turns) — a
+            # successful second pass legitimately lands the cursor at the
+            # same slot as the failed attempt once the marker resettles.
+            # Recovery is proven by actual absorption instead: the
+            # transcript shrinks, and content that survived the failed
+            # attempt (never absorbed) is gone after the real recovery.
+            assert len(recovered) < len(failed)
+            absorbed_content = "answer 1"
+            assert any(
+                absorbed_content in str(m.get("content")) for m in failed
+            ), "fixture invariant: the content we check gets absorbed must still be present pre-recovery"
+            assert not any(
+                absorbed_content in str(m.get("content")) for m in recovered
+            ), "second pass must actually absorb the next exchange on success"
+
+            db.close()
+            db = SessionDB(db_path=db_path)
+            reloaded_after_recovery = db.get_messages_as_conversation(sid)
+
+            assert _role_content(reloaded_after_recovery) == _role_content(recovered)
+            assert sum(
+                "CONTEXT COMPACTION" in str(m.get("content"))
+                for m in reloaded_after_recovery
+            ) == 1
+        finally:
+            db.close()
 
 
 class TestDefragFlushCursorInvalidation:

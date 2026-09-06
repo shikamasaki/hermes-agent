@@ -713,21 +713,22 @@ def _build_pid_record() -> dict:
 def _get_code_identity_fields() -> dict[str, Any]:
     """Code identity of THIS gateway process, for fleet version checks.
 
-    Lazy import so ``gateway.status`` keeps no import-time dependency on
-    ``hermes_cli``; the helper itself is cached per process. A gateway
-    keeps serving the module versions it imported at startup, so stamping
-    the identity into ``gateway_state.json`` lets `hermes update` (and the
-    dashboard) prove whether a running gateway actually picked up new code
-    after the restart phase — instead of assuming it did (#88654, #69754).
-    Never raises; degrades to absent fields.
+    The gateway captures its code identity once at startup and reuses that
+    fixed snapshot for every status write. That lets `hermes update` prove
+    whether the running process is still the same booted code, without
+    re-reading disk on each heartbeat. The snapshot is only a provenance
+    hint: it does **not** prove every loaded module or plugin matches the
+    checkout content.
     """
     try:
-        from hermes_cli.build_info import get_code_identity
+        from hermes_cli.build_info import get_startup_code_identity
 
-        identity = get_code_identity()
+        identity = get_startup_code_identity() or {}
         return {
             "code_sha": identity.get("sha"),
             "code_version": identity.get("version"),
+            "code_content_sha": identity.get("content_sha"),
+            "code_content_short_sha": identity.get("content_short_sha"),
         }
     except Exception:
         return {}
@@ -1183,6 +1184,13 @@ def write_pid_file() -> None:
     invocations race: exactly one process wins and the rest get
     FileExistsError.
     """
+    try:
+        from hermes_cli.build_info import record_startup_code_identity
+
+        record_startup_code_identity()
+    except Exception:
+        logger.debug("startup code identity capture failed", exc_info=True)
+
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     record = json.dumps(_build_pid_record())
@@ -1243,9 +1251,11 @@ def write_runtime_status(
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
     payload["updated_at"] = _utc_now_iso()
-    # Re-stamp code identity on every write: the file can outlive the process
-    # that created it, and the top-level record must always describe the
-    # CURRENT writer's code (per-process cached, so this is a dict copy).
+    # Re-stamp the gateway's boot-time code identity on every write: the file
+    # can outlive the process that created it, and the top-level record must
+    # always describe the CURRENT writer's startup snapshot. This is a
+    # provenance hint only — it does not claim to prove every imported module
+    # or plugin matches the checkout content.
     payload.update(_get_code_identity_fields())
 
     if gateway_state is not _UNSET:

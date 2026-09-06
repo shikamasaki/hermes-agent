@@ -116,6 +116,56 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+def test_no_rerun_cli_sets_and_clears_with_required_reason_without_status_change(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="cli no rerun")
+        assert kb.block_task(conn, task_id, reason="waiting")
+
+    missing = kc.run_slash(f"no-rerun set {task_id}")
+    assert "--reason" in missing
+
+    out = kc.run_slash(f"no-rerun set {task_id} --reason 'superseded by followup'")
+    assert f"Set no-rerun on {task_id}" in out
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.no_rerun == 1
+        assert task.no_rerun_reason == "superseded by followup"
+
+    clear_missing = kc.run_slash(f"no-rerun clear {task_id}")
+    assert "--reason" in clear_missing
+
+    cleared = kc.run_slash(f"no-rerun clear {task_id} --reason 'operator retry allowed'")
+    assert f"Cleared no-rerun on {task_id}" in cleared
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.no_rerun == 0
+        assert task.no_rerun_reason is None
+
+
+def test_successor_cli_sets_and_deletes_saved_successor(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="cli predecessor")
+        successor_id = kb.create_task(conn, title="cli successor")
+
+    out = kc.run_slash(f"successor set {task_id} {successor_id}")
+    assert f"Set successor for {task_id} -> {successor_id}" in out
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.successor_task_id == successor_id
+
+    deleted = kc.run_slash(f"successor delete {task_id}")
+    assert f"Deleted successor for {task_id}" in deleted
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.successor_task_id is None
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------

@@ -212,7 +212,7 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _connect(board: Optional[str] = None):
+def _connect(board: Optional[str] = None, *, read_only: bool = False):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
 
@@ -224,7 +224,8 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
-    return kb, kb.connect(board=board)
+    connector = kb.connect_readonly if read_only else kb.connect
+    return kb, connector(board=board)
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
@@ -530,7 +531,10 @@ def _handle_show(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
+        kb, conn = _connect(
+            board=board,
+            read_only=bool(os.environ.get("HERMES_KANBAN_TASK")),
+        )
         try:
             task = kb.get_task(conn, tid)
             if task is None:

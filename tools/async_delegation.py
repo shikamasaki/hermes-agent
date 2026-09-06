@@ -531,6 +531,31 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def release_completion_admission_refusal(delegation_id: str, claim_id: str) -> bool:
+    """Release a claim when the target session never accepted the turn.
+
+    ``claim_completion_delivery`` increments attempts before the poller knows
+    whether ``_run_prompt_submit`` can admit the synthetic turn. A False return
+    means delivery did not start at all, so this release gives that attempt back
+    and keeps the row retryable instead of burning the failed-delivery budget.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claim=NULL,
+                      delivery_claimed_at=NULL,
+                      delivery_attempts=CASE
+                          WHEN delivery_attempts > 0 THEN delivery_attempts - 1
+                          ELSE 0
+                      END,
+                      updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Terminally drop a claimed completion that can never be delivered.
 
@@ -576,6 +601,11 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def release_event_admission_refusal(evt: Dict[str, Any], claim_id: str) -> None:
+    if claim_id and evt.get("type") == "async_delegation":
+        release_completion_admission_refusal(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

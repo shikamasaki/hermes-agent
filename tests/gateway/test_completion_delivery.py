@@ -884,3 +884,257 @@ def test_sibling_claimed_by_other_consumer_is_not_double_delivered(
     assert "Result for deleg_owned_1" not in delivered.text
     row = async_delegation.get_durable_delegation(events[1]["delegation_id"])
     assert row["delivery_state"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# TUI notification poller admission failures stay retryable
+# ---------------------------------------------------------------------------
+
+
+class _PollOnceQueue:
+    def __init__(self, events, stop_event):
+        self._events = list(events)
+        self._stop_event = stop_event
+
+    def put(self, event):
+        self._events.append(event)
+
+    def get(self, timeout=None):
+        if self._events:
+            return self._events.pop(0)
+        self._stop_event.set()
+        raise queue.Empty
+
+    def get_nowait(self):
+        if self._events:
+            return self._events.pop(0)
+        raise queue.Empty
+
+    def empty(self):
+        return not self._events
+
+
+def _tui_session_for_event(event, *, closing=False):
+    import threading
+
+    return {
+        "history_lock": threading.RLock(),
+        "running": False,
+        "_closing": closing,
+        "_finalized": False,
+        "session_key": event["session_key"],
+        # Keep _run_prompt_submit on the exact closing/refusal path under test;
+        # active-session admission itself is tested elsewhere and would touch
+        # shared liveness state that this durable fixture deliberately avoids.
+        "active_session_lease": object(),
+    }
+
+
+def _run_tui_notification_poller_once(
+    monkeypatch, isolated_registry, session, events, *, stop_before_loop=False
+):
+    import threading
+    import tui_gateway.server as server
+
+    stop_event = threading.Event()
+    if stop_before_loop:
+        stop_event.set()
+    isolated = _PollOnceQueue(events, stop_event)
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_maybe_wake_tui_parked_goal", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_collect_kanban_notifications_with_claims", lambda *_a, **_kw: [])
+
+    server._notification_poller_loop(stop_event, "sid-admission", session)
+    return isolated
+
+
+def test_tui_poller_releases_durable_completion_when_prompt_submit_refuses_closing_session(
+    monkeypatch, isolated_registry,
+):
+    """A False admission result is not an acceptance acknowledgement."""
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_admission_refused")
+    _persist_pending_completion(event)
+    session = _tui_session_for_event(event, closing=True)
+
+    isolated = _run_tui_notification_poller_once(
+        monkeypatch, isolated_registry, session, [dict(event)]
+    )
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "pending"
+    assert row["delivery_attempts"] == 0
+    assert isolated.empty()
+
+
+def test_tui_poller_marks_durable_completion_delivered_after_prompt_submit_accepts(
+    monkeypatch, isolated_registry,
+):
+    """Accepted notification turns keep the existing durable ack behavior."""
+    from tools import async_delegation
+    import tui_gateway.server as server
+
+    event = _distinct_async_event("deleg_admission_accepted")
+    _persist_pending_completion(event)
+    session = _tui_session_for_event(event)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_kw: True)
+
+    _run_tui_notification_poller_once(monkeypatch, isolated_registry, session, [dict(event)])
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1
+
+
+def test_tui_poller_retries_released_durable_completion_after_later_acceptance(
+    monkeypatch, isolated_registry,
+):
+    """A released False-admission row can be restored and delivered later."""
+    from tools import async_delegation
+    import tui_gateway.server as server
+
+    event = _distinct_async_event("deleg_admission_retry")
+    now = __import__("time").time()
+    event["dispatched_at"] = now
+    event["completed_at"] = now
+    _persist_pending_completion(event)
+    session = _tui_session_for_event(event)
+    submissions = iter([False, True])
+
+    def _submit_then_clear_running(_rid, _sid, submit_session, *_a, **_kw):
+        accepted = next(submissions)
+        if not accepted:
+            with submit_session["history_lock"]:
+                submit_session["running"] = False
+        return accepted
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit_then_clear_running)
+
+    _run_tui_notification_poller_once(monkeypatch, isolated_registry, session, [dict(event)])
+    first = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert first is not None
+    assert first["delivery_state"] == "pending"
+    assert first["delivery_attempts"] == 0
+
+    restored = _PollOnceQueue([], __import__("threading").Event())
+    assert async_delegation.restore_undelivered_completions(restored) == 1
+    _run_tui_notification_poller_once(
+        monkeypatch, isolated_registry, session, [restored.get_nowait()]
+    )
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1
+
+
+def test_tui_poller_keeps_repeated_admission_refusals_retryable_past_attempt_cap(
+    monkeypatch, isolated_registry,
+):
+    """Admission False is not a delivery attempt; later acceptance still acks."""
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_many_admission_refusals")
+    now = __import__("time").time()
+    event["dispatched_at"] = now
+    event["completed_at"] = now
+    _persist_pending_completion(event)
+    session = _tui_session_for_event(event, closing=True)
+
+    for _ in range(async_delegation._MAX_DELIVERY_ATTEMPTS + 1):
+        _run_tui_notification_poller_once(monkeypatch, isolated_registry, session, [dict(event)])
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        assert row["delivery_state"] == "pending"
+        assert row["delivery_attempts"] == 0
+
+    session["_closing"] = False
+    import tui_gateway.server as server
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_kw: True)
+    restored = _PollOnceQueue([], __import__("threading").Event())
+    assert async_delegation.restore_undelivered_completions(restored) == 1
+
+    _run_tui_notification_poller_once(
+        monkeypatch, isolated_registry, session, [restored.get_nowait()]
+    )
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1
+
+
+def test_tui_poller_shutdown_drain_release_paths_preserve_expected_retry_contracts(
+    monkeypatch, isolated_registry,
+):
+    """Drain admission False is retryable; drain exceptions still count attempts."""
+    from tools import async_delegation
+    import tui_gateway.server as server
+
+    refused = _distinct_async_event("deleg_drain_refused")
+    failed = _distinct_async_event("deleg_drain_exception")
+    now = __import__("time").time()
+    for event in (refused, failed):
+        event["dispatched_at"] = now
+        event["completed_at"] = now
+        _persist_pending_completion(event)
+
+    session = _tui_session_for_event(refused)
+    outcomes = iter([False, RuntimeError("temporary")])
+
+    def _submit_from_drain(_rid, _sid, submit_session, *_a, **_kw):
+        outcome = next(outcomes)
+        if outcome is False:
+            with submit_session["history_lock"]:
+                submit_session["running"] = False
+            return False
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit_from_drain)
+
+    _run_tui_notification_poller_once(
+        monkeypatch,
+        isolated_registry,
+        session,
+        [dict(refused), dict(failed)],
+        stop_before_loop=True,
+    )
+
+    refused_row = async_delegation.get_durable_delegation(refused["delegation_id"])
+    failed_row = async_delegation.get_durable_delegation(failed["delegation_id"])
+    assert refused_row is not None
+    assert failed_row is not None
+    assert refused_row["delivery_state"] == "pending"
+    assert refused_row["delivery_attempts"] == 0
+    assert failed_row["delivery_state"] == "pending"
+    assert failed_row["delivery_attempts"] == 1
+
+
+def test_release_completion_delivery_keeps_claim_contracts(isolated_registry):
+    """Wrong claims cannot release, and exhausted attempts become dropped."""
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_release_contract")
+    _persist_pending_completion(event)
+
+    assert async_delegation.claim_completion_delivery(event["delegation_id"], "claim-1")
+    assert not async_delegation.claim_completion_delivery(event["delegation_id"], "claim-2")
+    assert not async_delegation.release_completion_delivery(event["delegation_id"], "wrong")
+    assert async_delegation.release_completion_delivery(event["delegation_id"], "claim-1")
+
+    for attempt in range(2, async_delegation._MAX_DELIVERY_ATTEMPTS + 1):
+        claim = f"claim-{attempt}"
+        assert async_delegation.claim_completion_delivery(event["delegation_id"], claim)
+        assert async_delegation.release_completion_delivery(event["delegation_id"], claim)
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "dropped"
+    assert row["delivery_attempts"] == async_delegation._MAX_DELIVERY_ATTEMPTS

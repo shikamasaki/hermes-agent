@@ -739,7 +739,71 @@ class TestCodexOAuthContextLength:
             )
         assert ctx == expected_ctx
 
+    # Astra exact ``-872k`` static opt-in (single-entry sibling of the
+    # ``-900k`` mechanism above): standard 272K by default, 872K only on
+    # explicit opt-in, unknown numeric-suffix aliases rejected honestly.
+    _ASTRA_TABLE = [
+        ("gpt-6-astra-872k",  True,  872_000, "gpt-6-astra"),
+        # existing ``-900k`` mechanism is untouched
+        ("gpt-5.6-sol-900k",  True,  900_000, "gpt-5.6-sol"),
+        # unrelated bases never get the Astra suffix
+        ("gpt-5.5-872k",      False, 272_000, "gpt-5.5-872k"),
+        # unknown alias entirely (neither table matches)
+        ("gpt-5.4-mini-872k", False, 272_000, "gpt-5.4-mini-872k"),
+    ]
 
+    @pytest.mark.parametrize("model_id,valid,expected_ctx,wire", _ASTRA_TABLE)
+    def test_astra_872k_eligibility_table(self, model_id, valid, expected_ctx, wire):
+        from agent.model_metadata import (
+            get_model_context_length,
+            is_codex_context_variant,
+            strip_codex_context_variant_suffix,
+        )
+
+        assert is_codex_context_variant(model_id) is valid
+        assert strip_codex_context_variant_suffix(model_id) == wire
+
+        bare = model_id.rsplit("/", 1)[-1]
+        catalog_slug = strip_codex_context_variant_suffix(bare)
+        for suffix in ("-872k", "-900k"):
+            if catalog_slug.endswith(suffix):
+                catalog_slug = catalog_slug[: -len(suffix)]
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [{"slug": catalog_slug, "context_window": 272_000}]
+        }
+        import agent.model_metadata as mm
+        mm._codex_oauth_context_cache = {}
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model=model_id,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+        assert ctx == expected_ctx
+
+    def test_astra_base_slug_stays_272k(self):
+        """Base ``gpt-6-astra`` (no suffix) stays at advertised 272K — the
+        872K window is opt-in only, same rule as the ``-900k`` family."""
+        from agent.model_metadata import get_model_context_length
+
+        fake_response = MagicMock()
+        fake_response.status_code = 401
+        fake_response.json.return_value = {}
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model="gpt-6-astra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="expired-token",
+                provider="openai-codex",
+            )
+        assert ctx == 272_000
 
 
 # =========================================================================

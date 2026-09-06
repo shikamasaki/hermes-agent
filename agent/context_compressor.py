@@ -7631,6 +7631,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         if compress_start >= compress_end:
             return messages
 
+        _prior_summary = self._micro_compact_rolling_summary
+        _prior_cursor = self._micro_compact_cursor
         cursor = self._resolve_compact_cursor(messages, compress_start, compress_end)
         if cursor >= compress_end:
             return messages
@@ -7657,9 +7659,44 @@ This compaction should PRIORITISE preserving all information related to the focu
         # the transcript shape is unchanged and this pass does not also
         # absorb an exchange (one aux call per turn either way).
         if self._needs_defrag():
+            _prior_defrag_summary = self._micro_compact_rolling_summary
+            _defrag_marker = None
+            _defrag_marker_content = None
+            _defrag_marker_had_stamp = False
+            _defrag_marker_stamp = None
+            for idx in range(len(messages) - 1, -1, -1):
+                entry = messages[idx]
+                if (
+                    isinstance(entry, dict)
+                    and entry.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    and entry.get(MICRO_COMPACT_MARKER_KEY)
+                ):
+                    _defrag_marker = entry
+                    _defrag_marker_content = entry.get("content")
+                    _defrag_marker_had_stamp = _DB_PERSISTED_MARKER in entry
+                    _defrag_marker_stamp = entry.get(_DB_PERSISTED_MARKER)
+                    break
+
             defragged = self._defrag_rolling_summary(messages)
             if defragged:
-                self._sync_micro_compact_to_db(messages)
+                persisted = self._sync_micro_compact_to_db(messages)
+                if not persisted:
+                    self._micro_compact_rolling_summary = _prior_defrag_summary
+                    if _defrag_marker is not None:
+                        _defrag_marker["content"] = _defrag_marker_content
+                        if _defrag_marker_had_stamp:
+                            _defrag_marker[_DB_PERSISTED_MARKER] = _defrag_marker_stamp
+                        else:
+                            _defrag_marker.pop(_DB_PERSISTED_MARKER, None)
+                    self._emit_micro_compaction_telemetry(
+                        outcome="defrag_persist_failed",
+                        messages_before=_messages_before,
+                        messages_after=_messages_before,
+                        tokens_before=_tokens_before,
+                        tokens_after=_tokens_before,
+                        duration_ms=_elapsed_ms(),
+                    )
+                    return messages
                 self._micro_compact_consecutive_failures = 0
                 self._micro_compact_last_failure_cursor = -1
             self._emit_micro_compaction_telemetry(
@@ -7725,7 +7762,20 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages, exchange_start, exchange_end, supersede=_cumulative,
         )
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
+        persisted = self._sync_micro_compact_to_db(result)
+        if not persisted:
+            self._micro_compact_rolling_summary = _prior_summary
+            self._micro_compact_cursor = _prior_cursor
+            self._emit_micro_compaction_telemetry(
+                outcome="persist_failed",
+                messages_before=_messages_before,
+                messages_after=_messages_before,
+                tokens_before=_tokens_before,
+                tokens_after=_tokens_before,
+                exchange_tokens=_exchange_tokens,
+                duration_ms=_elapsed_ms(),
+            )
+            return messages
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
@@ -7854,7 +7904,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _sync_micro_compact_to_db(
         self,
         compacted_messages: List[Dict[str, Any]],
-    ) -> None:
+    ) -> bool:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
@@ -7871,7 +7921,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return True
+        # _insert_message_rows (hermes_state.py) stamps `_row_id` on each
+        # input dict as it INSERTs — one dict at a time, BEFORE the write
+        # transaction is known to commit. If a later row in the same
+        # transaction (e.g. the summary marker) trips a constraint/trigger
+        # ABORT, SQLite rolls the whole INSERT set back, but the Python
+        # dicts it already mutated do NOT roll back with it: a caller-owned
+        # dict can walk away from a failed persist carrying a `_row_id` from
+        # a row that no longer exists. Pass a deep copy to the DB layer so a
+        # failed commit never mutates the live transcript, then reflect the
+        # new row ids back onto the originals only once success is
+        # confirmed.
+        _db_copy = copy.deepcopy(compacted_messages)
         try:
             # The splice result is [..verbatim prefix.., summary_marker,
             # ..verbatim suffix..]: every row except the single marker is a
@@ -7879,17 +7941,34 @@ This compaction should PRIORITISE preserving all information related to the focu
             # originals rewind-style instead of compacted=1.
             session_db.archive_and_compact(
                 session_id,
-                compacted_messages,
+                _db_copy,
                 tail_count=max(0, len(compacted_messages) - 1),
             )
+        except Exception:
+            logger.info(
+                "Micro-compaction DB sync failed; keeping original "
+                "transcript for retry"
+            )
+            return False
+
+        for _orig, _persisted in zip(compacted_messages, _db_copy):
+            if (
+                isinstance(_orig, dict)
+                and isinstance(_persisted, dict)
+                and "_row_id" in _persisted
+            ):
+                _orig["_row_id"] = _persisted["_row_id"]
+
+        try:
             # Shared post-commit contract with the in-place batch commit and
             # the proactive prune (#98450) — one stamp site for the class.
             stamp_db_persisted_markers(compacted_messages)
         except Exception:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
-                "compacted messages until the next batch compression"
+                "Micro-compaction DB sync committed but marker stamping "
+                "failed; keeping compacted DB state"
             )
+        return True
 
     def _splice_micro_compact_result(
         self,
@@ -8023,14 +8102,17 @@ This compaction should PRIORITISE preserving all information related to the focu
             ):
                 prev_content = prev["content"]
                 new_content = msg["content"]
-                prev["content"] = (
+                merged_prev = dict(prev)
+                merged_prev["content"] = (
                     (prev_content + "\n\n" + new_content)
                     if prev_content and new_content
                     else (prev_content or new_content)
                 )
                 # Merged content invalidates the api_content sidecar (exact
-                # bytes previously sent for the pre-merge message).
-                drop_stale_api_content(prev)
+                # bytes previously sent for the pre-merge message). Operate on
+                # the copy so rollback paths do not mutate caller-owned turns.
+                drop_stale_api_content(merged_prev)
+                merged[-1] = merged_prev
                 continue
             merged.append(msg)
         return merged

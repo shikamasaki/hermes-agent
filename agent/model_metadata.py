@@ -2634,6 +2634,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
     "gpt-daybreak-blue-latest": 272_000,
+    "gpt-6-astra": 272_000,
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
@@ -2702,6 +2703,24 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
 _CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# GPT-6 Astra: same static opt-in mechanism as the ``-900k`` table above,
+# but with its own exact suffix because the verified cap (872,000) differs
+# from the ``-900k`` family's 900,000. This is a SEPARATE, hardcoded,
+# single-entry mapping — not a generic "any numeric suffix is valid"
+# rule. Only the literal base slug ``gpt-6-astra`` with the literal
+# suffix ``-872k`` is ever accepted; any other ``-NNNk`` spelling for any
+# other base is rejected the same way ``gpt-5.5-900k`` is rejected below.
+#
+# Basis: 2026-09-05, Chief's live probe of the same ChatGPT account's
+# Codex catalog (GET /backend-api/codex/models) showed GPT-6 Astra
+# advertising ``context_window=272000`` but reporting
+# ``max_context_window=872000``. Acceptance of genuinely long prompts at
+# 872K has NOT been separately verified end-to-end — only the catalog
+# value itself is the basis for this entry.
+CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX = "-872k"
+_CODEX_ASTRA_BASE = "gpt-6-astra"
+_CODEX_ASTRA_VERIFIED_CTX = 872_000
+
 
 def _bare_codex_slug(model: Optional[str]) -> str:
     """Lowercased slug with any ``vendor/`` namespace removed.
@@ -2734,30 +2753,50 @@ def is_codex_900k_base(model: Optional[str]) -> bool:
     return False
 
 
-def is_codex_context_variant(model: Optional[str]) -> bool:
-    """True when the model id is a VALID ``-900k`` opt-in variant.
+def is_codex_astra_872k_base(model: Optional[str]) -> bool:
+    """True when *model* (a BASE slug, no suffix) is the exact Astra base.
 
-    Requires both the suffix and an eligible base — ``gpt-5.5-900k`` is not
-    a variant, it's an invalid alias.
+    Single-entry sibling of :func:`is_codex_900k_base` for the
+    ``-872k`` suffix — literal match only, no prefix/snapshot matching.
     """
     slug = _bare_codex_slug(model)
+    return bool(slug) and slug == _CODEX_ASTRA_BASE
+
+
+def is_codex_context_variant(model: Optional[str]) -> bool:
+    """True when the model id is a VALID ``-900k`` or ``-872k`` opt-in variant.
+
+    Requires both the suffix and an eligible base — ``gpt-5.5-900k`` and
+    ``gpt-5.5-872k`` are not variants, they're invalid aliases.
+    """
+    slug = _bare_codex_slug(model)
+    if slug.endswith(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX):
+        return is_codex_astra_872k_base(
+            slug[: -len(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX)]
+        )
     if not slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
         return False
     return is_codex_900k_base(slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)])
 
 
 def strip_codex_context_variant_suffix(model: Optional[str]) -> str:
-    """Return the wire-safe slug with a VALID ``-900k`` suffix removed.
+    """Return the wire-safe slug with a VALID ``-900k``/``-872k`` suffix removed.
 
-    The suffix is a Hermes picker alias (``gpt-5.6-sol-900k``); the Codex
-    backend only knows the base slug. Stripping is conditional on base
-    eligibility: an ineligible alias like ``gpt-5.5-900k`` is returned
-    unchanged so it fails honestly at the API instead of silently running
-    as a different model. Case-insensitive; preserves any ``vendor/``
-    namespace prefix.
+    The suffix is a Hermes picker alias (``gpt-5.6-sol-900k``,
+    ``gpt-6-astra-872k``); the Codex backend only knows the base slug.
+    Stripping is conditional on base eligibility: an ineligible alias like
+    ``gpt-5.5-900k`` is returned unchanged so it fails honestly at the API
+    instead of silently running as a different model. Case-insensitive;
+    preserves any ``vendor/`` namespace prefix.
     """
     raw = (model or "").strip()
-    if not raw.lower().endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+    lower = raw.lower()
+    if lower.endswith(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX):
+        base = raw[: -len(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX)]
+        if is_codex_astra_872k_base(base):
+            return base
+        return raw
+    if not lower.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
         return raw
     base = raw[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
     if is_codex_900k_base(base):
@@ -2769,21 +2808,34 @@ def has_codex_context_variant(model_bare: str) -> bool:
     """True when a Codex BASE slug should get a synthetic ``-900k`` entry.
 
     Thin alias over :func:`is_codex_900k_base` kept for the picker call
-    sites' readability.
+    sites' readability. Does NOT cover the Astra ``-872k`` entry — the
+    picker synthesizes that one explicitly via
+    :func:`has_codex_astra_context_variant`, since the suffix differs.
     """
     return is_codex_900k_base(model_bare)
+
+
+def has_codex_astra_context_variant(model_bare: str) -> bool:
+    """True when a Codex BASE slug should get a synthetic ``-872k`` entry."""
+    return is_codex_astra_872k_base(model_bare)
 
 
 def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
     """Return the live-verified Codex cap for an OPTED-IN slug, or ``None``.
 
-    The large window is opt-in: only VALID ``-900k`` picker variants
-    (e.g. ``gpt-5.6-sol-900k``) resolve to the verified cap. Base slugs
-    keep the advertised 272K so the cheaper default limit applies unless
-    the user explicitly selects the large-context variant; ineligible
-    aliases (``gpt-5.5-900k``) never resolve here.
+    The large window is opt-in: only VALID ``-900k``/``-872k`` picker
+    variants (e.g. ``gpt-5.6-sol-900k``, ``gpt-6-astra-872k``) resolve to
+    the verified cap. Base slugs keep the advertised 272K so the cheaper
+    default limit applies unless the user explicitly selects the
+    large-context variant; ineligible aliases (``gpt-5.5-900k``) never
+    resolve here.
     """
     slug = _bare_codex_slug(model_bare)
+    if slug.endswith(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX):
+        base = slug[: -len(CODEX_ASTRA_CONTEXT_VARIANT_SUFFIX)]
+        if is_codex_astra_872k_base(base):
+            return _CODEX_ASTRA_VERIFIED_CTX
+        return None
     if not slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
         return None
     base = slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
