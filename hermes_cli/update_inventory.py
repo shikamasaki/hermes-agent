@@ -50,6 +50,8 @@ class RuntimeRecord:
     supervisor: str = "manual"    # systemd | launchd | desktop | manual
     code_sha: Optional[str] = None       # stamped running-code sha (#91283)
     code_version: Optional[str] = None
+    code_content_sha: Optional[str] = None
+    code_content_short_sha: Optional[str] = None
     restart_via: str = ""         # human-readable restart mechanism
     detail: dict = field(default_factory=dict)
 
@@ -66,6 +68,8 @@ class UpdatePlan:
     update_mechanism: str = "hermes update"
     expected_sha: Optional[str] = None    # current checkout HEAD (pre-pull)
     expected_version: Optional[str] = None
+    expected_content_sha: Optional[str] = None
+    expected_content_short_sha: Optional[str] = None
     profiles: list = field(default_factory=list)
     runtimes: list = field(default_factory=list)  # list[RuntimeRecord]
 
@@ -190,6 +194,8 @@ def collect_runtime_inventory() -> UpdatePlan:
         identity = get_code_identity(refresh=True)
         plan.expected_sha = identity.get("sha")
         plan.expected_version = identity.get("version")
+        plan.expected_content_sha = identity.get("content_sha")
+        plan.expected_content_short_sha = identity.get("content_short_sha")
     except Exception as exc:
         logger.debug("Code-identity probe failed: %s", exc)
 
@@ -281,6 +287,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                         )
                     )
                     sock_sha = identity.get("code_sha")
+                    sock_content_sha = identity.get("code_content_sha")
                     plan.runtimes.append(
                         RuntimeRecord(
                             kind="gateway",
@@ -289,6 +296,11 @@ def collect_runtime_inventory() -> UpdatePlan:
                             supervisor=supervisor,
                             code_sha=str(sock_sha) if sock_sha else None,
                             code_version=identity.get("code_version"),
+                            code_content_sha=
+                                str(sock_content_sha) if sock_content_sha else None,
+                            code_content_short_sha=identity.get(
+                                "code_content_short_sha"
+                            ),
                             restart_via=_restart_mechanism(supervisor, profile),
                         )
                     )
@@ -296,6 +308,7 @@ def collect_runtime_inventory() -> UpdatePlan:
             record = read_runtime_status(home / "gateway_state.json")
             pid: Optional[int] = None
             code_sha = code_version = None
+            code_content_sha = code_content_short_sha = None
             if record:
                 try:
                     pid = int(record.get("pid"))
@@ -303,6 +316,8 @@ def collect_runtime_inventory() -> UpdatePlan:
                     pid = None
                 code_sha = record.get("code_sha")
                 code_version = record.get("code_version")
+                code_content_sha = record.get("code_content_sha")
+                code_content_short_sha = record.get("code_content_short_sha")
             if pid is None or not _pid_exists(pid):
                 continue
             seen_pids.add(pid)
@@ -317,6 +332,8 @@ def collect_runtime_inventory() -> UpdatePlan:
                     supervisor=supervisor,
                     code_sha=str(code_sha) if code_sha else None,
                     code_version=code_version,
+                    code_content_sha=str(code_content_sha) if code_content_sha else None,
+                    code_content_short_sha=code_content_short_sha,
                     restart_via=_restart_mechanism(supervisor, profile),
                 )
             )

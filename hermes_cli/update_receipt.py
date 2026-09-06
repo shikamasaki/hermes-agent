@@ -321,6 +321,29 @@ def read_latest_receipt() -> Optional[dict[str, Any]]:
 # Fleet version verification
 # ---------------------------------------------------------------------------
 
+def _classify_code_identity_state(
+    *,
+    code_sha: Any,
+    code_content_sha: Any,
+    expected_sha: Optional[str],
+    expected_content_sha: Optional[str],
+) -> str:
+    """Classify a runtime against the current checkout using startup snapshot data.
+
+    ``current`` is only allowed when both the boot-time ``code_sha`` and the
+    recorded content digest can be compared successfully. The startup snapshot
+    is a provenance hint only; it does not prove every imported module or
+    plugin matches the checkout content.
+    """
+    if not code_sha or not expected_sha:
+        return "unknown"
+    if str(code_sha) != str(expected_sha):
+        return "stale"
+    if not code_content_sha or not expected_content_sha:
+        return "unknown"
+    return "current" if str(code_content_sha) == str(expected_content_sha) else "stale"
+
+
 def collect_fleet_versions(
     *, pre_restart_pids: Optional[list[int]] = None
 ) -> list[dict[str, Any]]:
@@ -332,10 +355,13 @@ def collect_fleet_versions(
         {"profile": str, "pid": int, "code_sha": str|None,
          "code_version": str|None, "state": "current"|"stale"|"unknown"|"down"}
 
+    ``current`` requires a boot-time ``code_sha`` match plus a comparable
+    content digest. That snapshot is a startup provenance hint only — it does
+    not claim to prove the set of all loaded modules or plugins.
     ``stale``   — gateway stamped a code_sha that differs from the updated
                   checkout's HEAD (it is still serving pre-update modules).
-    ``unknown`` — gateway predates the code-identity stamp (started before
-                  this feature landed) or identity could not be resolved.
+    ``unknown`` — gateway predates the code-identity stamp, or identity could
+                  not be compared safely.
     ``down``    — the gateway was ALIVE when this update started
                   (``pre_restart_pids``), its runtime status still says
                   running, but the PID is dead and no successor rewrote the
@@ -359,9 +385,12 @@ def collect_fleet_versions(
     try:
         from hermes_cli.build_info import get_code_identity
 
-        expected_sha = (get_code_identity(refresh=True) or {}).get("sha")
+        expected = get_code_identity(refresh=True) or {}
+        expected_sha = expected.get("sha")
+        expected_content_sha = expected.get("content_sha")
     except Exception:
         expected_sha = None
+        expected_content_sha = None
 
     try:
         from gateway.status import read_runtime_status, runtime_status_pid_is_live
@@ -400,18 +429,22 @@ def collect_fleet_versions(
                     pid = None
                 if pid is not None:
                     code_sha = identity.get("code_sha")
-                    if not code_sha or not expected_sha:
-                        state = "unknown"
-                    elif str(code_sha) == str(expected_sha):
-                        state = "current"
-                    else:
-                        state = "stale"
+                    code_content_sha = identity.get("code_content_sha")
+                    state = _classify_code_identity_state(
+                        code_sha=code_sha,
+                        code_content_sha=code_content_sha,
+                        expected_sha=expected_sha,
+                        expected_content_sha=expected_content_sha,
+                    )
                     results.append(
                         {
                             "profile": profile,
                             "pid": pid,
                             "code_sha": str(code_sha) if code_sha else None,
                             "code_version": identity.get("code_version"),
+                            "code_content_sha": (
+                                str(code_content_sha) if code_content_sha else None
+                            ),
                             "state": state,
                             "source": "socket",
                         }
@@ -459,18 +492,22 @@ def collect_fleet_versions(
                     )
                 continue
             code_sha = record.get("code_sha")
-            if not code_sha or not expected_sha:
-                state = "unknown"
-            elif str(code_sha) == str(expected_sha):
-                state = "current"
-            else:
-                state = "stale"
+            code_content_sha = record.get("code_content_sha")
+            state = _classify_code_identity_state(
+                code_sha=code_sha,
+                code_content_sha=code_content_sha,
+                expected_sha=expected_sha,
+                expected_content_sha=expected_content_sha,
+            )
             results.append(
                 {
                     "profile": profile,
                     "pid": pid,
                     "code_sha": str(code_sha) if code_sha else None,
                     "code_version": record.get("code_version"),
+                    "code_content_sha": (
+                        str(code_content_sha) if code_content_sha else None
+                    ),
                     "state": state,
                 }
             )

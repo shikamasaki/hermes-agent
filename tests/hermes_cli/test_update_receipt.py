@@ -265,17 +265,37 @@ class TestCommandBoundaryFinalization:
 
 
 class TestFleetClassification:
-    def _fleet_with(self, monkeypatch, tmp_path, record, expected_sha="a" * 40):
+    def _fleet_with(
+        self,
+        monkeypatch,
+        tmp_path,
+        record,
+        expected_sha="a" * 40,
+        expected_content_sha=None,
+    ):
         """Run collect_fleet_versions against one fake default profile."""
         home = tmp_path / "fleet_home"
         home.mkdir()
+        if expected_content_sha is None:
+            expected_content_sha = expected_sha
+        record = dict(record)
+        if "code_sha" in record and "code_content_sha" not in record:
+            record["code_content_sha"] = expected_content_sha
+        if "code_content_sha" in record and record["code_content_sha"] is not None and "code_content_short_sha" not in record:
+            record["code_content_short_sha"] = record["code_content_sha"][:8]
         (home / "gateway_state.json").write_text(
             json.dumps(record), encoding="utf-8"
         )
         monkeypatch.setattr(
             "hermes_cli.build_info.get_code_identity",
-            lambda refresh=False: {"sha": expected_sha, "short_sha": expected_sha[:8],
-                                   "version": "1.0", "source": "git"},
+            lambda refresh=False: {
+                "sha": expected_sha,
+                "short_sha": expected_sha[:8],
+                "version": "1.0",
+                "source": "git",
+                "content_sha": expected_content_sha,
+                "content_short_sha": expected_content_sha[:8],
+            },
         )
         monkeypatch.setattr(
             "hermes_cli.profiles._get_default_hermes_home", lambda: home
@@ -293,16 +313,19 @@ class TestFleetClassification:
             monkeypatch, tmp_path,
             {"pid": 4242, "code_sha": sha, "code_version": "1.0"},
             expected_sha=sha,
+            expected_content_sha=sha,
         )
         assert len(fleet) == 1
         assert fleet[0]["state"] == "current"
         assert fleet[0]["pid"] == 4242
+        assert fleet[0]["code_content_sha"] == sha
 
     def test_stale_gateway(self, monkeypatch, tmp_path):
         fleet = self._fleet_with(
             monkeypatch, tmp_path,
             {"pid": 4242, "code_sha": "b" * 40, "code_version": "0.9"},
             expected_sha="a" * 40,
+            expected_content_sha="a" * 40,
         )
         assert fleet[0]["state"] == "stale"
 
@@ -312,6 +335,99 @@ class TestFleetClassification:
             monkeypatch, tmp_path, {"pid": 4242}, expected_sha="a" * 40
         )
         assert fleet[0]["state"] == "unknown"
+
+    def test_old_format_gateway_with_no_content_digest_is_unknown(self, monkeypatch, tmp_path):
+        fleet = self._fleet_with(
+            monkeypatch,
+            tmp_path,
+            {
+                "pid": 4242,
+                "code_sha": "a" * 40,
+                "code_version": "1.0",
+                "code_content_sha": None,
+            },
+            expected_sha="a" * 40,
+            expected_content_sha="a" * 40,
+        )
+        assert fleet[0]["state"] == "unknown"
+
+    def test_startup_snapshot_survives_disk_change_in_subprocess(self, tmp_path):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["TEST_REPO"] = str(repo)
+        script = "\n".join(
+            [
+                "import json",
+                "import os",
+                "import subprocess",
+                "from pathlib import Path",
+                "",
+                "from hermes_cli import build_info as bi",
+                "from hermes_cli import update_receipt as ur",
+                "import gateway.status as gs",
+                "",
+                'repo = Path(os.environ["TEST_REPO"])',
+                'home = Path(os.environ["HERMES_HOME"])',
+                "bi._PROJECT_ROOT = repo",
+                "first = bi.record_startup_code_identity()",
+                'assert first and first["content_sha"]',
+                'head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()',
+                'gs.write_runtime_status(gateway_state="starting")',
+                'before = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))',
+                '(repo / "tracked.txt").write_text("two\\n", encoding="utf-8")',
+                'gs.write_runtime_status(gateway_state="starting")',
+                'after = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))',
+                'head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()',
+                'fleet = ur.collect_fleet_versions()',
+                'live = bi.get_code_identity(refresh=True)',
+                'print(json.dumps({',
+                '    "startup_content_sha": first["content_sha"],',
+                '    "before_content_sha": before.get("code_content_sha"),',
+                '    "after_content_sha": after.get("code_content_sha"),',
+                '    "live_content_sha": live.get("content_sha"),',
+                '    "head_before": head_before,',
+                '    "head_after": head_after,',
+                '    "state": fleet[0]["state"] if fleet else None,',
+                '}))',
+            ]
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout.strip())
+        assert payload["head_before"] == head_before
+        assert payload["head_after"] == head_before
+        assert payload["before_content_sha"] == payload["startup_content_sha"]
+        assert payload["after_content_sha"] == payload["startup_content_sha"]
+        assert payload["live_content_sha"] != payload["startup_content_sha"]
+        assert payload["state"] == "stale"
 
     def test_dead_pid_excluded(self, monkeypatch, tmp_path):
         home = tmp_path / "fleet_home2"
@@ -355,28 +471,41 @@ class TestFleetClassification:
 
 
 class TestGatewayStatusStamping:
-    def test_runtime_status_record_carries_code_identity(self, monkeypatch):
+    def test_runtime_status_record_carries_startup_code_identity(self, monkeypatch):
         import gateway.status as gs
+        import hermes_cli.build_info as bi
 
+        monkeypatch.setattr(bi.os, "getpid", lambda: 9876)
+        bi.record_startup_code_identity(
+            {
+                "sha": "c" * 40,
+                "short_sha": "c" * 8,
+                "version": "2.0",
+                "source": "git",
+                "content_sha": "d" * 64,
+                "content_short_sha": "d" * 8,
+            }
+        )
         monkeypatch.setattr(
             "hermes_cli.build_info.get_code_identity",
-            lambda refresh=False: {"sha": "c" * 40, "short_sha": "c" * 8,
-                                   "version": "2.0", "source": "git"},
+            lambda refresh=False: (_ for _ in ()).throw(AssertionError("should not refresh")),
         )
         record = gs._build_runtime_status_record()
         assert record["code_sha"] == "c" * 40
         assert record["code_version"] == "2.0"
+        assert record["code_content_sha"] == "d" * 64
+        assert record["code_content_short_sha"] == "d" * 8
 
-    def test_code_identity_failure_degrades_to_absent(self, monkeypatch):
+    def test_code_identity_failure_degrades_to_unknown(self, monkeypatch):
         import gateway.status as gs
+        import hermes_cli.build_info as bi
 
-        def _boom(refresh=False):
-            raise RuntimeError("no build info")
-
-        monkeypatch.setattr("hermes_cli.build_info.get_code_identity", _boom)
+        monkeypatch.setattr(bi, "get_startup_code_identity", lambda: None)
         record = gs._build_runtime_status_record()
-        # Must not raise, and must not stamp bogus values.
-        assert "code_sha" not in record
+        # Must not raise, and must not claim current when the startup snapshot is missing.
+        assert record["code_sha"] is None
+        assert record["code_version"] is None
+        assert record["code_content_sha"] is None
         assert record["gateway_state"] == "starting"
 
 
@@ -385,11 +514,20 @@ class TestCodeIdentity:
         from hermes_cli.build_info import get_code_identity
 
         identity = get_code_identity(refresh=True)
-        assert set(identity) == {"sha", "short_sha", "version", "source"}
+        assert set(identity) == {
+            "sha",
+            "short_sha",
+            "version",
+            "source",
+            "content_sha",
+            "content_short_sha",
+        }
         # Running from a git checkout in CI/dev: sha resolves via git.
         if identity["sha"]:
             assert identity["short_sha"] == identity["sha"][:8]
             assert identity["source"] in ("git", "build-file")
+        if identity["content_sha"]:
+            assert identity["content_short_sha"] == identity["content_sha"][:8]
 
     def test_get_code_identity_cached(self):
         from hermes_cli.build_info import get_code_identity

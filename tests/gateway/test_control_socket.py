@@ -274,10 +274,15 @@ def test_collect_fleet_versions_prefers_socket(tmp_path: Path, monkeypatch):
 
     home = tmp_path / ".hermes"
     home.mkdir()
+    content_sha = "TEST-CONTENT-SHA"
 
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
-        lambda refresh=False: {"sha": "HEADSHA", "version": "1.0"},
+        lambda refresh=False: {
+            "sha": "HEADSHA",
+            "version": "1.0",
+            "content_sha": content_sha,
+        },
     )
     monkeypatch.setattr(
         "hermes_cli.profiles._get_default_hermes_home", lambda: home
@@ -291,7 +296,10 @@ def test_collect_fleet_versions_prefers_socket(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(
         "gateway.control_socket.identify_gateway",
-        lambda h, **kw: _fake_identity(31337, "HEADSHA"),
+        lambda h, **kw: {
+            **_fake_identity(31337, "HEADSHA"),
+            "code_content_sha": content_sha,
+        },
     )
 
     fleet = ur.collect_fleet_versions()

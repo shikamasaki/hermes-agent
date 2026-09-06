@@ -81,6 +81,58 @@ def _run(outcome="completed", run_id=1, error=None):
 
 
 
+def test_stuck_in_blocked_no_rerun_fresh_block_still_shows_intentional_stop():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="intentionally stopped",
+    )
+    events = [_event("blocked", ts=now - 60, reason="policy stop")]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    assert diags[0].title == "Task intentionally stopped (no rerun)"
+    assert diags[0].data["blocked_at"] == now - 60
+
+
+def test_stuck_in_blocked_no_rerun_without_block_event_uses_task_timestamp():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="intentionally stopped",
+        created_at=now - 60,
+    )
+
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    assert diags[0].title == "Task intentionally stopped (no rerun)"
+    assert diags[0].data["blocked_at"] == now - 60
+
+
+def test_stuck_in_blocked_no_rerun_newer_unblocked_keeps_saved_stop():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="successor owns the work",
+    )
+    events = [
+        _event("blocked", ts=blocked_at, reason="policy stop"),
+        _event("unblocked", ts=blocked_at + 60, text="later event"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    assert diags[0].title == "Task intentionally stopped (no rerun)"
+    assert "successor owns the work" in diags[0].detail
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")
@@ -95,9 +147,505 @@ def test_stuck_in_blocked_fires_past_threshold():
     assert d.kind == "stuck_in_blocked"
     assert d.severity == "warning"
     assert d.data["age_hours"] >= 48
+    assert "waiting for human input" not in d.detail
+    assert not any(action.suggested for action in d.actions)
 
 
+def test_stuck_in_blocked_capability_does_not_recommend_blind_reopen():
+    now = int(time.time())
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "prohibited command", "kind": "capability"},
+        },
+    ]
 
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.severity == "warning"
+    assert d.data["block_kind"] == "capability"
+    assert not any(
+        action.suggested and "unblock" in action.label.lower()
+        for action in d.actions
+    )
+    assert "waiting for human input" not in d.detail
+    assert "no automatic retry" in d.detail
+    assert "without reviewing the saved block reason" in d.detail
+
+
+def test_stuck_in_blocked_transient_does_not_recommend_blind_reopen():
+    now = int(time.time())
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "temporary outage", "kind": "transient"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.severity == "warning"
+    assert d.data["block_kind"] == "transient"
+    assert not any(
+        action.suggested and "unblock" in action.label.lower()
+        for action in d.actions
+    )
+    assert "waiting for human input" not in d.detail
+    assert "no automatic retry" in d.detail
+    assert "without reviewing the saved block reason" in d.detail
+
+
+def test_stuck_in_blocked_needs_input_still_recommends_unblock():
+    now = int(time.time())
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.severity == "warning"
+    assert any(
+        action.suggested and action.label == "Add a comment / unblock the task"
+        for action in d.actions
+    )
+    assert "waiting for human input" in d.detail
+
+
+def test_stuck_in_blocked_no_rerun_suppresses_reopen_recommendations():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="superseded by follow-up task",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.severity == "warning"
+    assert d.data["no_rerun"] is True
+    assert d.data["no_rerun_reason"] == "superseded by follow-up task"
+    assert "superseded by follow-up task" in d.detail
+    assert "再実行禁止" in d.detail or "no rerun" in d.detail.lower()
+    assert not any(action.suggested for action in d.actions)
+    assert not any(action.kind in {"unblock", "reassign"} for action in d.actions)
+
+
+def test_stuck_in_blocked_mentions_successor_status_without_hiding_needs_input_branch():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        successor_task_id="t_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+    ]
+    graph = {"successor": {"id": "t_successor", "status": "running"}}
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.data["block_kind"] == "needs_input"
+    assert any(
+        action.suggested and action.label == "Add a comment / unblock the task"
+        for action in d.actions
+    )
+    assert "waiting for human input" in d.detail
+    assert "t_successor" in d.detail
+    assert "running" in d.detail
+    assert "check on the successor" in d.detail
+
+
+def test_stuck_in_blocked_no_rerun_mentions_done_successor_without_reopening():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="superseded by follow-up task",
+        successor_task_id="t_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "temporary outage", "kind": "capability"},
+        },
+    ]
+    graph = {"successor": {"id": "t_successor", "status": "done"}}
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.data["no_rerun"] is True
+    assert d.data["successor_task_id"] == "t_successor"
+    assert "再実行禁止" in d.detail or "no rerun" in d.detail.lower()
+    assert "t_successor" in d.detail
+    assert "done" in d.detail or "completed" in d.detail
+    assert not any(action.suggested for action in d.actions)
+
+
+def test_stuck_in_blocked_mentions_unresolvable_successor_needs_checking():
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        successor_task_id="t_missing_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "needs approval", "kind": "dependency"},
+        },
+    ]
+    graph = {
+        "successor": {"id": "t_missing_successor", "status": None, "error": "not_found"}
+    }
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "stuck_in_blocked"
+    assert d.data["block_kind"] == "dependency"
+    assert "t_missing_successor" in d.detail
+    assert "not found" in d.detail.lower() or "missing" in d.detail.lower()
+    assert "check on the successor" in d.detail
+
+
+@pytest.mark.parametrize("graph", [None, {}, {"successor": None}, {"successor": {}}])
+def test_stuck_in_blocked_mentions_successor_status_unavailable_when_graph_missing(graph):
+    now = int(time.time())
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="superseded by successor",
+        successor_task_id="t_unreadable_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "new prohibited work", "kind": "capability"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    detail = diags[0].detail
+    assert "再実行禁止" in detail or "no rerun" in detail.lower()
+    assert "superseded by successor" in detail
+    assert "t_unreadable_successor" in detail
+    assert "unavailable" in detail.lower()
+    assert "not found" not in detail.lower()
+    assert "check on the successor" in detail
+    assert diags[0].actions == []
+
+
+def test_stuck_in_blocked_no_rerun_comment_keeps_saved_stop_visible():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(
+        status="blocked",
+        no_rerun=1,
+        no_rerun_reason="new comment confirms successor owns the work",
+        successor_task_id="t_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+        _event("commented", ts=blocked_at + 60, text="do not reopen original"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    detail = diags[0].detail
+    assert "再実行禁止" in detail or "no rerun" in detail.lower()
+    assert "new comment confirms successor owns the work" in detail
+    assert "unblock with feedback" not in detail
+    assert diags[0].actions == []
+
+
+@pytest.mark.parametrize("terminal_status", ["done", "archived"])
+def test_stuck_in_blocked_no_rerun_terminal_status_keeps_saved_stop_visible(terminal_status):
+    now = int(time.time())
+    task = _task(
+        status=terminal_status,
+        no_rerun=1,
+        no_rerun_reason="successor completed the replacement work",
+        successor_task_id="t_successor",
+    )
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "prohibited original", "kind": "capability"},
+        },
+    ]
+    graph = {"successor": {"id": "t_successor", "status": "done"}}
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    detail = diags[0].detail
+    assert "再実行禁止" in detail or "no rerun" in detail.lower()
+    assert "successor completed the replacement work" in detail
+    assert "t_successor" in detail
+    assert "done" in detail
+    assert "reassign" not in detail.lower()
+    assert "unblock with feedback" not in detail
+    assert diags[0].actions == []
+
+
+def test_stuck_in_blocked_capability_comment_does_not_clear_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "prohibited command", "kind": "capability"},
+        },
+        _event("commented", ts=blocked_at + 60, text="reviewed but still blocked"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    assert diags[0].data["block_kind"] == "capability"
+    assert "waiting for human input" not in diags[0].detail
+
+def test_stuck_in_blocked_transient_comment_does_not_clear_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "temporary outage", "kind": "transient"},
+        },
+        _event("commented", ts=blocked_at + 60, text="still waiting on outage"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == ["stuck_in_blocked"]
+    assert diags[0].data["block_kind"] == "transient"
+    assert "waiting for human input" not in diags[0].detail
+
+
+def test_stuck_in_blocked_capability_unblocked_clears_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "prohibited command", "kind": "capability"},
+        },
+        _event("unblocked", ts=blocked_at + 60, text="human explicitly reopened"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == []
+
+
+def test_stuck_in_blocked_unknown_kind_uses_neutral_warning():
+    now = int(time.time())
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {
+                "reason": "unexpected block classification",
+                "kind": "weird_unknown_kind",
+            },
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.data["block_kind"] == "weird_unknown_kind"
+    assert "waiting for human input" not in d.detail
+    assert "no automatic retry" in d.detail
+    assert not any(action.suggested for action in d.actions)
+    assert not any(action.kind in {"write", "unblock"} for action in d.actions)
+
+
+@pytest.mark.parametrize("bad_kind", [123, ["capability"], {"kind": "capability"}])
+def test_stuck_in_blocked_non_string_kind_uses_neutral_warning(bad_kind):
+    now = int(time.time())
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": now - 3600 * 48,
+            "payload": {"reason": "bad payload", "kind": bad_kind},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.data["block_kind"] == bad_kind
+    assert "waiting for human input" not in d.detail
+    assert "no automatic retry" in d.detail
+    assert not any(action.suggested for action in d.actions)
+
+
+def test_stuck_in_blocked_dependency_comment_does_not_clear_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "waiting for predecessor", "kind": "dependency"},
+        },
+        _event("commented", ts=blocked_at + 60, text="not input"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.data["block_kind"] == "dependency"
+    assert "waiting for human input" not in d.detail
+    assert not any(action.suggested for action in d.actions)
+
+
+def test_stuck_in_blocked_missing_kind_comment_does_not_clear_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=blocked_at, reason="legacy missing kind"),
+        _event("commented", ts=blocked_at + 60, text="ambiguous comment"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    d = diags[0]
+    assert "block_kind" not in d.data
+    assert "waiting for human input" not in d.detail
+    assert not any(action.suggested for action in d.actions)
+
+
+def test_stuck_in_blocked_needs_input_comment_clears_warning():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+        _event("commented", ts=blocked_at + 60, text="approved"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert [d.kind for d in diags] == []
+
+
+def test_stuck_in_blocked_same_timestamp_uses_later_event_in_list_order():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "kind": "block_loop_detected",
+            "created_at": blocked_at,
+            "payload": {"reason": "loop", "kind": "capability"},
+        },
+        {
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    assert diags[0].data["block_kind"] == "needs_input"
+    assert "waiting for human input" in diags[0].detail
+
+
+def test_stuck_in_blocked_same_timestamp_prefers_highest_event_id():
+    now = int(time.time())
+    blocked_at = now - 3600 * 48
+    task = _task(status="blocked")
+    events = [
+        {
+            "id": 2,
+            "kind": "block_loop_detected",
+            "created_at": blocked_at,
+            "payload": {"reason": "loop", "kind": "capability"},
+        },
+        {
+            "id": 1,
+            "kind": "blocked",
+            "created_at": blocked_at,
+            "payload": {"reason": "needs approval", "kind": "needs_input"},
+        },
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert len(diags) == 1
+    assert diags[0].data["block_kind"] == "capability"
+    assert "waiting for human input" not in diags[0].detail
 
 
 

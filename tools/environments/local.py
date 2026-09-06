@@ -2098,6 +2098,34 @@ class LocalEnvironment(BaseEnvironment):
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
 
+    def _seed_child_snapshot(self, base_path: str, child_path: str) -> None:
+        """Create a local child snapshot atomically with private permissions."""
+        target = Path(child_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = b""
+        try:
+            data = Path(base_path).read_bytes()
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fd = -1
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+                fd = -1
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -2296,7 +2324,7 @@ class LocalEnvironment(BaseEnvironment):
             except Exception:
                 pass
 
-    def _update_cwd(self, result: dict):
+    def _update_cwd(self, result: dict, *, update_self: bool = True):
         """Update cwd from the stdout marker emitted by the wrapped command.
 
         The base command wrapper already appends ``pwd -P`` to stdout inside a
@@ -2305,9 +2333,9 @@ class LocalEnvironment(BaseEnvironment):
         ``_extract_cwd_from_output`` keeps the local Windows normalization and
         stale-path rollback semantics intact.
         """
-        self._extract_cwd_from_output(result)
+        self._extract_cwd_from_output(result, update_self=update_self)
 
-    def _extract_cwd_from_output(self, result: dict):
+    def _extract_cwd_from_output(self, result: dict, *, update_self: bool = True):
         """Same semantics as the base class, but on Windows the value
         emitted by ``pwd -P`` inside Git Bash is in MSYS form
         (``/c/Users/x``). Normalize to native Windows form and validate
@@ -2321,11 +2349,13 @@ class LocalEnvironment(BaseEnvironment):
         # Snapshot pre-existing cwd, defer to base for parsing + marker
         # stripping, then validate / normalize whatever it assigned.
         prev_cwd = self.cwd
-        super()._extract_cwd_from_output(result)
-        if self.cwd != prev_cwd:
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+        super()._extract_cwd_from_output(result, update_self=update_self)
+        observed = result.get("cwd")
+        if observed:
+            normalized = _msys_to_windows_path(observed) if _IS_WINDOWS else observed
             if normalized and os.path.isdir(normalized):
-                self.cwd = normalized
+                if update_self:
+                    self.cwd = normalized
                 result["cwd"] = normalized
             else:
                 # Stale / non-existent path — keep previous cwd; _run_bash
@@ -2338,7 +2368,9 @@ class LocalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Clean up temp files."""
-        for f in (self._snapshot_path, self._cwd_file):
+        snapshot_paths = [self._snapshot_path]
+        snapshot_paths.extend(getattr(self, "_child_snapshot_paths", {}).values())
+        for f in (*snapshot_paths, self._cwd_file):
             try:
                 os.unlink(f)
             except OSError:

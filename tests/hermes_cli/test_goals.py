@@ -429,12 +429,157 @@ class TestWaitBarrier:
             mgr.wait_on(proc.pid)
             assert mgr.is_waiting() is True
             assert mgr.stop_waiting() is True
+            assert mgr.state is not None
             assert mgr.state.waiting_on_pid is None
+            assert mgr.state.waiting_on_session is None
+            assert mgr.state.waiting_until == 0.0
+            assert mgr.state.wakeup_pending is False
             assert mgr.is_waiting() is False
+
+            reloaded = GoalManager(session_id="wb-stop")
+            assert reloaded.state is not None
+            assert reloaded.state.waiting_on_pid is None
+            assert reloaded.state.waiting_on_session is None
+            assert reloaded.state.waiting_until == 0.0
+            assert reloaded.state.wakeup_pending is False
+
             assert mgr.stop_waiting() is False  # idempotent
         finally:
             proc.terminate()
             proc.wait(timeout=10)
+
+    def test_stop_waiting_without_barrier_is_noop(self, hermes_home):
+        from hermes_cli.goals import GoalManager, _get_session_db
+
+        mgr = GoalManager(session_id="wb-noop")
+        mgr.set("g")
+        assert mgr.state is not None
+        assert mgr.stop_waiting() is False
+        assert mgr.state.goal == "g"
+        assert mgr.state.waiting_on_pid is None
+        assert mgr.state.waiting_on_session is None
+        assert mgr.state.waiting_until == 0.0
+        assert mgr.state.wakeup_pending is False
+
+        db = _get_session_db()
+        assert db is not None
+        trigger_name = "stop_waiting_abort_wb_noop"
+        meta_key = "goal:wb-noop"
+        try:
+            db._execute_write(
+                lambda conn: conn.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                    BEFORE UPDATE ON state_meta
+                    WHEN NEW.key = '{meta_key}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'stop_waiting no-op should not write');
+                    END;
+                    """
+                )
+            )
+            assert mgr.stop_waiting() is False
+        finally:
+            db._execute_write(lambda conn: conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+
+    @pytest.mark.parametrize(
+        "mutation, assert_state",
+        [
+            (
+                "new_goal",
+                lambda state: (
+                    state.goal == "new goal"
+                    and state.status == "active"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "new_wait",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "active"
+                    and state.waiting_until > time.time()
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "pause",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "paused"
+                    and state.paused_reason == "operator paused"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "clear",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "cleared"
+                    and state.wakeup_pending is False
+                ),
+            ),
+        ],
+    )
+    def test_stale_stop_waiting_does_not_overwrite_new_state(
+        self, hermes_home, mutation, assert_state
+    ):
+        from hermes_cli.goals import GoalManager
+
+        stale_mgr = GoalManager("stop-race")
+        stale_mgr.set("old goal")
+
+        writer = GoalManager("stop-race")
+        if mutation == "new_goal":
+            writer.set("new goal")
+        elif mutation == "new_wait":
+            writer.wait_for_seconds(600, reason="new wait")
+        elif mutation == "pause":
+            writer.pause("operator paused")
+        elif mutation == "clear":
+            writer.clear()
+        else:  # pragma: no cover
+            raise AssertionError(mutation)
+
+        assert stale_mgr.stop_waiting() is False
+
+        reloaded = GoalManager("stop-race")
+        assert reloaded.state is not None
+        assert assert_state(reloaded.state)
+
+    def test_stop_waiting_save_failure_does_not_mutate_local_state(self, hermes_home):
+        from hermes_cli.goals import GoalManager, _get_session_db, save_goal
+
+        session_id = "wb-save-fail"
+        mgr = GoalManager(session_id=session_id)
+        mgr.set("goal before failure")
+        assert mgr.state is not None
+        mgr.state.wakeup_pending = True
+        save_goal(session_id, mgr.state)
+
+        db = _get_session_db()
+        assert db is not None
+        trigger_name = "stop_waiting_abort_wb_save_fail"
+        meta_key = f"goal:{session_id}"
+        try:
+            db._execute_write(
+                lambda conn: conn.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                    BEFORE UPDATE ON state_meta
+                    WHEN NEW.key = '{meta_key}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'stop_waiting save failure');
+                    END;
+                    """
+                )
+            )
+
+            assert mgr.stop_waiting() is False
+            assert mgr.state.goal == "goal before failure"
+            assert mgr.state.wakeup_pending is True
+        finally:
+            db._execute_write(lambda conn: conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}"))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -498,6 +643,8 @@ class TestJudgeDrivenWait:
         assert mgr.is_waiting() is True
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
+        from hermes_cli.goals import save_goal
+        save_goal(mgr.session_id, mgr.state)
         assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
 
@@ -833,3 +980,270 @@ class TestBlockedVerdict:
         assert mgr.state is not None
         assert mgr.state.status == "paused"
         assert "unachievable" in (mgr.state.paused_reason or "").lower()
+
+    def test_parked_goal_wakeup(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        import time
+        mgr = GoalManager(session_id="pg-wakeup")
+        mgr.set("do work")
+        mgr.wait_for_seconds(120, reason="backoff")
+
+        # Still waiting, no wakeup
+        assert mgr.check_wakeup() is None
+
+        # Barrier clears
+        mgr.state.waiting_until = time.time() - 1
+        from hermes_cli.goals import save_goal
+        save_goal(mgr.session_id, mgr.state)
+
+        # Wakeup returns the continuation prompt and clears the barrier
+        prompt = mgr.check_wakeup()
+        assert prompt is not None
+        assert "cleared" in prompt.lower()
+        assert mgr.is_waiting() is False
+
+        # Pending wakeup is durable until the delivery surface acknowledges it.
+        assert mgr.check_wakeup() is not None
+        assert mgr.state is not None
+        assert mgr.state.wakeup_pending is True
+        reloaded = GoalManager(session_id="pg-wakeup")
+        assert reloaded.check_wakeup() is not None
+        reloaded.ack_wakeup()
+        assert reloaded.check_wakeup() is None
+
+
+
+def _force_expired_wait_goal(session_id: str):
+    from hermes_cli.goals import GoalManager, save_goal
+
+    mgr = GoalManager(session_id=session_id)
+    mgr.set("old goal")
+    mgr.wait_for_seconds(120, reason="old wait")
+    assert mgr.state is not None
+    mgr.state.waiting_until = time.time() - 1
+    save_goal(session_id, mgr.state)
+    assert mgr.check_wakeup() is not None
+    return mgr
+
+
+class TestGoalWakeupAckConcurrency:
+    @pytest.mark.parametrize(
+        "mutation, assert_state",
+        [
+            (
+                "new_goal",
+                lambda state: (
+                    state.goal == "new goal"
+                    and state.status == "active"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "new_wait",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "active"
+                    and state.waiting_until > time.time()
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "pause",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "paused"
+                    and state.paused_reason == "operator paused"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "clear",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "cleared"
+                    and state.wakeup_pending is False
+                ),
+            ),
+        ],
+    )
+    def test_stale_wakeup_ack_does_not_overwrite_new_goal_state(
+        self, hermes_home, mutation, assert_state
+    ):
+        from hermes_cli.goals import GoalManager
+
+        stale_mgr = _force_expired_wait_goal("ack-race")
+        writer = GoalManager("ack-race")
+        if mutation == "new_goal":
+            writer.set("new goal")
+        elif mutation == "new_wait":
+            writer.wait_for_seconds(600, reason="new wait")
+        elif mutation == "pause":
+            writer.pause("operator paused")
+        elif mutation == "clear":
+            writer.clear()
+        else:  # pragma: no cover
+            raise AssertionError(mutation)
+
+        stale_mgr.ack_wakeup()
+
+        reloaded = GoalManager("ack-race")
+        assert reloaded.state is not None
+        assert assert_state(reloaded.state)
+
+    def test_stale_wakeup_ack_cannot_clear_another_pending_request(self, hermes_home):
+        from hermes_cli.goals import GoalManager, save_goal
+
+        stale_mgr = _force_expired_wait_goal("ack-other-pending")
+        writer = GoalManager("ack-other-pending")
+        writer.add_subgoal("new pending identity")
+        writer.wait_for_seconds(120, reason="next wait")
+        assert writer.state is not None
+        writer.state.waiting_until = time.time() - 1
+        save_goal("ack-other-pending", writer.state)
+        assert writer.check_wakeup() is not None
+
+        stale_mgr.ack_wakeup()
+
+        reloaded = GoalManager("ack-other-pending")
+        assert reloaded.state is not None
+        assert reloaded.state.wakeup_pending is True
+        assert reloaded.state.subgoals == ["new pending identity"]
+        assert reloaded.state.waiting_reason is None
+
+
+class TestGoalWakeupAckConcurrency:
+    @pytest.mark.parametrize(
+        "mutation, assert_state",
+        [
+            (
+                "new_goal",
+                lambda state: (
+                    state.goal == "new goal"
+                    and state.status == "active"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "new_wait",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "active"
+                    and state.waiting_until > time.time()
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "pause",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "paused"
+                    and state.paused_reason == "operator paused"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "clear",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "cleared"
+                    and state.wakeup_pending is False
+                ),
+            ),
+        ],
+    )
+    def test_stale_wakeup_ack_does_not_overwrite_new_goal_state(
+        self, hermes_home, mutation, assert_state
+    ):
+        from hermes_cli.goals import GoalManager
+
+        stale_mgr = _force_expired_wait_goal("ack-race")
+        writer = GoalManager("ack-race")
+        if mutation == "new_goal":
+            writer.set("new goal")
+        elif mutation == "new_wait":
+            writer.wait_for_seconds(600, reason="new wait")
+        elif mutation == "pause":
+            writer.pause("operator paused")
+        elif mutation == "clear":
+            writer.clear()
+        else:  # pragma: no cover
+            raise AssertionError(mutation)
+
+        stale_mgr.ack_wakeup()
+
+        reloaded = GoalManager("ack-race")
+        assert reloaded.state is not None
+        assert assert_state(reloaded.state)
+
+    def test_stale_wakeup_ack_cannot_clear_another_pending_request(self, hermes_home):
+        from hermes_cli.goals import GoalManager, save_goal
+
+        stale_mgr = _force_expired_wait_goal("ack-other-pending")
+        writer = GoalManager("ack-other-pending")
+        writer.add_subgoal("new pending identity")
+        writer.wait_for_seconds(120, reason="next wait")
+        assert writer.state is not None
+        writer.state.waiting_until = time.time() - 1
+        save_goal("ack-other-pending", writer.state)
+        assert writer.check_wakeup() is not None
+
+        stale_mgr.ack_wakeup()
+
+        reloaded = GoalManager("ack-other-pending")
+        assert reloaded.state is not None
+        assert reloaded.state.wakeup_pending is True
+        assert reloaded.state.subgoals == ["new pending identity"]
+        assert reloaded.state.waiting_reason is None
+
+class TestGoalWakeupCheckConcurrency:
+    @pytest.mark.parametrize(
+        "mutation, assert_state",
+        [
+            (
+                "new_goal",
+                lambda state: (
+                    state.goal == "new goal"
+                    and state.status == "active"
+                    and state.wakeup_pending is False
+                ),
+            ),
+            (
+                "new_wait",
+                lambda state: (
+                    state.goal == "old goal"
+                    and state.status == "active"
+                    and state.waiting_until > time.time()
+                    and state.wakeup_pending is False
+                ),
+            ),
+        ],
+    )
+    def test_stale_wakeup_check_does_not_overwrite_new_state(
+        self, hermes_home, mutation, assert_state
+    ):
+        from hermes_cli.goals import GoalManager, save_goal, GoalState
+        session_id = f"check-race-{mutation}"
+        # Manager A sets old goal + waits
+        mgr_a = GoalManager(session_id)
+        mgr_a.set("old goal")
+        mgr_a.wait_for_seconds(120, reason="old wait")
+
+        # Fast forward time for manager A's wait so it expires
+        assert mgr_a.state is not None
+        mgr_a.state.waiting_until = time.time() - 1
+        save_goal(session_id, mgr_a.state)
+
+        # Manager B mutates the state BEFORE manager A checks wakeup
+        mgr_b = GoalManager(session_id)
+        if mutation == "new_goal":
+            mgr_b.set("new goal")
+        elif mutation == "new_wait":
+            mgr_b.wait_for_seconds(600, reason="new wait")
+
+        # Manager A's check_wakeup is invoked after its deadline
+        mgr_a.check_wakeup()
+
+        # Reload and assert DB still shows manager B's state
+        reloaded = GoalManager(session_id)
+        assert reloaded.state is not None
+        assert assert_state(reloaded.state), f"State clobbered by stale wakeup clear: {reloaded.state}"

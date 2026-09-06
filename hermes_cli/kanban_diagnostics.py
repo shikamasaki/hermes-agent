@@ -828,6 +828,44 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+
+def _successor_status_note(graph, successor_task_id) -> str:
+    if not successor_task_id:
+        return ""
+    fallback_id = str(successor_task_id).strip()
+    if not fallback_id:
+        return ""
+    unavailable = (
+        f" Successor {fallback_id} status is unavailable; check on the successor."
+    )
+    if not isinstance(graph, dict):
+        return unavailable
+    successor = graph.get("successor")
+    if not isinstance(successor, dict) or not successor:
+        return unavailable
+    successor_id = str(successor.get("id") or fallback_id).strip() or fallback_id
+    error = successor.get("error")
+    if error == "not_found":
+        return f" Successor {successor_id} was not found; check on the successor."
+    if error == "unavailable":
+        return (
+            f" Successor {successor_id} status is unavailable; check on the successor."
+        )
+    status = successor.get("status")
+    if status is None:
+        return (
+            f" Successor {successor_id} status is unavailable; check on the successor."
+        )
+    status_text = str(status).strip()
+    if not status_text:
+        return (
+            f" Successor {successor_id} status is unavailable; check on the successor."
+        )
+    if status_text.lower() in {"done", "completed"}:
+        return f" Successor {successor_id} is {status_text}."
+    return f" Successor {successor_id} is {status_text} (not done); check on the successor."
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``blocked`` status for too long without a comment.
 
@@ -836,45 +874,182 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """
     hours = float(cfg.get("blocked_stale_hours", 24))
     status = _task_field(task, "status")
-    if status != "blocked":
+    no_rerun = bool(_task_field(task, "no_rerun", 0))
+    if status != "blocked" and not (no_rerun and status in {"done", "archived"}):
         return []
-    # Find the most recent ``blocked`` event.
+    # Find the most recent block event.
     last_blocked_ts = 0
+    last_blocked_event = None
+    last_blocked_event_id = None
     for ev in events:
-        if _event_kind(ev) == "blocked":
+        if _event_kind(ev) in {"blocked", "block_loop_detected"}:
             t = _event_ts(ev)
-            last_blocked_ts = max(last_blocked_ts, t)
+            event_id = _task_field(ev, "id", None)
+            try:
+                event_id = int(event_id) if event_id is not None else None
+            except (TypeError, ValueError):
+                event_id = None
+            id_is_newer = False
+            if event_id is not None and last_blocked_event_id is not None:
+                id_is_newer = event_id > last_blocked_event_id
+            has_id_tiebreak = event_id is not None and last_blocked_event_id is not None
+            if (
+                t > last_blocked_ts
+                or (has_id_tiebreak and t == last_blocked_ts and id_is_newer)
+                or (not has_id_tiebreak and t == last_blocked_ts)
+            ):
+                last_blocked_ts = t
+                last_blocked_event = ev
+                last_blocked_event_id = event_id
     if last_blocked_ts == 0:
-        return []
-    age_hours = (now - last_blocked_ts) / 3600.0
-    if age_hours < hours:
-        return []
-    # Any comment / unblock after the block breaks the "stale" signal.
-    for ev in events:
-        if _event_kind(ev) in {"commented", "unblocked"} and _event_ts(ev) > last_blocked_ts:
+        if not no_rerun:
             return []
-    actions: list[DiagnosticAction] = [
-        DiagnosticAction(
-            kind="comment",
-            label="Add a comment / unblock the task",
-            suggested=True,
-        ),
-    ]
-    return [Diagnostic(
-        kind="stuck_in_blocked",
-        severity="warning",
-        title=f"Task has been blocked for {int(age_hours)}h",
-        detail=(
+        last_blocked_ts = int(
+            _task_field(task, "created_at", 0)
+            or _task_field(task, "updated_at", 0)
+            or now
+        )
+    age_hours = (now - last_blocked_ts) / 3600.0
+    if not no_rerun and age_hours < hours:
+        return []
+    payload = _parse_payload(last_blocked_event)
+    block_kind = (
+        payload["kind"] if "kind" in payload else _task_field(task, "block_kind")
+    )
+    no_rerun_reason = str(_task_field(task, "no_rerun_reason") or "").strip()
+    successor_task_id = _task_field(task, "successor_task_id")
+    graph = cfg.get("_graph")
+    successor_note = _successor_status_note(graph, successor_task_id)
+    is_known_kind = isinstance(block_kind, str) and block_kind in {
+        "dependency",
+        "needs_input",
+        "capability",
+        "transient",
+    }
+    comment_clears_stale = block_kind == "needs_input"
+    # Only explicit human-input blocks clear on comment. Safety-stop,
+    # dependency, missing, and malformed classifications require an explicit
+    # unblock; an arbitrary comment is not enough to clear the warning.
+    for ev in events:
+        kind = _event_kind(ev)
+        if _event_ts(ev) <= last_blocked_ts:
+            continue
+        if not no_rerun and (
+            kind == "unblocked"
+            or (comment_clears_stale and kind == "commented")
+        ):
+            return []
+    data = {"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)}
+    if block_kind is not None:
+        data["block_kind"] = block_kind
+    if no_rerun:
+        data["no_rerun"] = True
+        if no_rerun_reason:
+            data["no_rerun_reason"] = no_rerun_reason
+        if successor_task_id:
+            data["successor_task_id"] = successor_task_id
+    if is_known_kind and block_kind in {"capability", "transient"}:
+        actions: list[DiagnosticAction] = [
+            DiagnosticAction(
+                kind="comment",
+                label=(
+                    "Review the block reason before any reopen "
+                    "(no automatic retry recommended)"
+                ),
+                suggested=False,
+            ),
+        ]
+        detail = (
+            f"This task transitioned to blocked {int(age_hours)}h ago and "
+            f"the latest block was recorded as {block_kind}. Do not treat it "
+            f"as a generic human-input wait. Review the saved block reason "
+            f"and any successor relationship before acting. Do not recommend "
+            f"rerun, retry, reopen, or reassignment without reviewing the "
+            f"saved block reason first; no automatic retry is recommended."
+        )
+    elif block_kind == "needs_input":
+        actions = [
+            DiagnosticAction(
+                kind="comment",
+                label="Add a comment / unblock the task",
+                suggested=True,
+            ),
+        ]
+        detail = (
             f"This task transitioned to blocked {int(age_hours)}h ago and "
             f"has had no comments or unblock attempts since. Blocked tasks "
             f"are waiting for human input — check the block reason and "
             f"either unblock with feedback or answer with a comment."
+        )
+    elif block_kind == "dependency":
+        actions = [
+            DiagnosticAction(
+                kind="comment",
+                label=(
+                    "Review the dependency block before any reopen "
+                    "(no automatic retry recommended)"
+                ),
+                suggested=False,
+            ),
+        ]
+        detail = (
+            f"This task transitioned to blocked {int(age_hours)}h ago. The "
+            f"latest block was recorded as a dependency wait, not a human-input "
+            f"wait. Review the saved dependency reason and successor relationship "
+            f"before acting. Do not recommend rerun, retry, reopen, or reassignment "
+            f"without reviewing the saved block reason first; no automatic retry "
+            f"is recommended."
+        )
+    else:
+        actions = [
+            DiagnosticAction(
+                kind="comment",
+                label=(
+                    "Review the block reason before any reopen "
+                    "(unknown block kind; no automatic retry recommended)"
+                ),
+                suggested=False,
+            ),
+        ]
+        detail = (
+            f"This task transitioned to blocked {int(age_hours)}h ago. The "
+            f"latest block kind is unrecognized ({block_kind!r}), so the stop "
+            f"reason is not classified as a normal input wait. Review the saved "
+            f"block reason before acting. Do not recommend rerun, retry, reopen, "
+            f"or reassignment without reviewing the saved block reason first; "
+            f"no automatic retry is recommended."
+        )
+    if successor_note:
+        detail = f"{detail} {successor_note}"
+    if no_rerun:
+        reason_text = no_rerun_reason or "saved no-rerun marker"
+        saved_block_reason = str(payload.get("reason") or "").strip()
+        block_kind_text = f" Block kind: {block_kind}." if block_kind is not None else ""
+        block_reason_note = (
+            f" Saved block reason: {saved_block_reason}." if saved_block_reason else ""
+        )
+        detail = (
+            f"再実行禁止: {reason_text}. This original card remains stopped "
+            f"after the block recorded {int(age_hours)}h ago."
+            f"{block_kind_text}{block_reason_note}{successor_note} Do not use "
+            f"resume, retry, reopen, or worker-change actions from this "
+            f"original card."
+        )
+        actions = []
+    return [Diagnostic(
+        kind="stuck_in_blocked",
+        severity="warning",
+        title=(
+            "Task intentionally stopped (no rerun)"
+            if no_rerun
+            else f"Task has been blocked for {int(age_hours)}h"
         ),
+        detail=detail,
         actions=actions,
         first_seen_at=last_blocked_ts,
         last_seen_at=last_blocked_ts,
         count=1,
-        data={"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)},
+        data=data,
     )]
 
 

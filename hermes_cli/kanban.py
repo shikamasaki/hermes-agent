@@ -737,6 +737,50 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons.",
     )
 
+    p_no_rerun = sub.add_parser(
+        "no-rerun",
+        help="Set or clear the no-rerun guard on a stopped task",
+    )
+    no_rerun_sub = p_no_rerun.add_subparsers(dest="no_rerun_action")
+    p_no_rerun_set = no_rerun_sub.add_parser(
+        "set",
+        help="Mark a stopped task as intentionally not rerunnable",
+    )
+    p_no_rerun_set.add_argument("task_id")
+    p_no_rerun_set.add_argument(
+        "--reason",
+        required=True,
+        help="Required human-readable reason for setting no-rerun",
+    )
+    p_no_rerun_clear = no_rerun_sub.add_parser(
+        "clear",
+        help="Clear no-rerun without changing task status",
+    )
+    p_no_rerun_clear.add_argument("task_id")
+    p_no_rerun_clear.add_argument(
+        "--reason",
+        required=True,
+        help="Required human-readable reason for clearing no-rerun",
+    )
+
+    p_successor = sub.add_parser(
+        "successor",
+        help="Set or delete a task's successor reference",
+    )
+    successor_sub = p_successor.add_subparsers(dest="successor_action")
+    p_successor_set = successor_sub.add_parser(
+        "set",
+        help="Set the successor task id for a predecessor",
+    )
+    p_successor_set.add_argument("task_id")
+    p_successor_set.add_argument("successor_task_id")
+    p_successor_delete = successor_sub.add_parser(
+        "delete",
+        aliases=["rm", "clear"],
+        help="Delete the successor task id for a predecessor",
+    )
+    p_successor_delete.add_argument("task_id")
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1123,13 +1167,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 1
         board_scope = kb.scoped_current_board(normed)
 
-    # Auto-initialize the DB before dispatching any subcommand. init_db
-    # is idempotent, so running it every invocation is cheap (one
-    # SELECT against sqlite_master when tables already exist) and
-    # prevents "no such table: tasks" on first use from a fresh
-    # HERMES_HOME. Previously only `init` and `daemon` triggered
-    # schema creation; `create` / `list` / every other command would
-    # error out on a fresh install.
+    # Auto-initialize the DB before dispatching any subcommand unless this is
+    # a child read-only action. Those reads must not create or migrate the DB
+    # when a worker or delegated child is just inspecting board state.
     with board_scope:
         # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
         # init_db() itself raises KanbanDbCorruptError, which would turn
@@ -1137,11 +1177,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+        if not _is_dispatcher_child_readonly_action(args):
+            try:
+                kb.init_db()
+            except Exception as exc:
+                print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+                return 1
 
         handlers = {
             "init":     _cmd_init,
@@ -1171,6 +1212,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
+            "no-rerun": _cmd_no_rerun,
+            "successor": _cmd_successor,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1196,7 +1239,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
 
@@ -1236,6 +1279,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "no-rerun",
+    "successor",
     "promote",
     "archive",
     "dispatch",
@@ -1260,6 +1305,38 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "rename",
     "set-default-workdir",
 })
+
+_WORKER_READONLY_ACTIONS: frozenset[str] = frozenset({
+    "list", "ls", "show", "runs",
+})
+
+
+def _is_child_readonly_context() -> bool:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+def _is_dispatcher_child_readonly_action(args: argparse.Namespace) -> bool:
+    return bool(
+        _is_child_readonly_context()
+        and getattr(args, "kanban_action", None) in _WORKER_READONLY_ACTIONS
+    )
+
+
+@contextlib.contextmanager
+def _kanban_read_connection(args: argparse.Namespace):
+    if _is_dispatcher_child_readonly_action(args):
+        with kb.connect_readonly_closing() as conn:
+            yield conn
+    else:
+        with kb.connect_closing() as conn:
+            yield conn
 
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
@@ -1742,10 +1819,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
+    with _kanban_read_connection(args) as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        if not _is_dispatcher_child_readonly_action(args):
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -1792,7 +1870,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
-    with kb.connect_closing() as conn:
+    with _kanban_read_connection(args) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -2642,6 +2720,48 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_no_rerun(args: argparse.Namespace) -> int:
+    action = getattr(args, "no_rerun_action", None)
+    if action not in {"set", "clear"}:
+        print("kanban no-rerun: pass 'set' or 'clear'", file=sys.stderr)
+        return 2
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        print("kanban no-rerun: --reason is required", file=sys.stderr)
+        return 2
+    enabled = action == "set"
+    with kb.connect_closing() as conn:
+        if not kb.set_no_rerun(conn, args.task_id, enabled, reason=reason):
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+    if enabled:
+        print(f"Set no-rerun on {args.task_id}: {reason}")
+    else:
+        print(f"Cleared no-rerun on {args.task_id}: {reason}")
+    return 0
+
+
+def _cmd_successor(args: argparse.Namespace) -> int:
+    action = getattr(args, "successor_action", None)
+    if action not in {"set", "delete", "rm", "clear"}:
+        print("kanban successor: pass 'set' or 'delete'", file=sys.stderr)
+        return 2
+    successor_task_id = (
+        args.successor_task_id
+        if action == "set"
+        else None
+    )
+    with kb.connect_closing() as conn:
+        if not kb.set_successor_task_id(conn, args.task_id, successor_task_id):
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+    if successor_task_id:
+        print(f"Set successor for {args.task_id} -> {successor_task_id}")
+    else:
+        print(f"Deleted successor for {args.task_id}")
+    return 0
+
+
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -3137,7 +3257,7 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
+    with _kanban_read_connection(args) as conn:
         runs = kb.list_runs(conn, args.task_id, **rsk)
     if getattr(args, "json", False):
         print(json.dumps([

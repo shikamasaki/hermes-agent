@@ -10,6 +10,7 @@ import codecs
 import json
 import logging
 import os
+import posixpath
 import re
 import select
 import shlex
@@ -546,6 +547,11 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
     "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
 )
+# Process-trusted markers must not be captured in the shared shell snapshot.
+# They are restored from the command process environment after sourcing any
+# existing snapshot, so a stale snapshot cannot turn a parent command into a
+# delegated child, while a real child subprocess keeps its marker.
+_SNAPSHOT_PROCESS_TRUSTED_ENV_NAMES = ("HERMES_DELEGATED_CHILD_CONTEXT",)
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -579,7 +585,7 @@ def _export_dump_excluding_session_vars(
     # Quote caller-provided names so malformed configuration can never become
     # shell syntax. Valid environment names remain unquoted by shlex.quote().
     safe_names = {
-        name for name in excluded_names
+        name for name in (*excluded_names, *_SNAPSHOT_PROCESS_TRUSTED_ENV_NAMES)
         if isinstance(name, str) and name
     }
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
@@ -655,6 +661,9 @@ class BaseEnvironment(ABC):
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
         self._snapshot_passthrough_names: set[str] = set()
+        self._child_snapshot_paths: dict[str, str] = {}
+        self._child_snapshot_lock = threading.Lock()
+        self._child_cwds: dict[str, str] = {}
         # When True, login bash is unusable (e.g. broken Git-for-Windows
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
@@ -721,6 +730,73 @@ class BaseEnvironment(ABC):
                 exc_info=True,
             )
         return tuple(sorted(self._snapshot_passthrough_names))
+
+    def _current_child_snapshot_scope(self) -> str | None:
+        """Return the delegated-child snapshot scope for this command, if any."""
+        try:
+            from agent.delegation_context import (
+                get_delegated_child_snapshot_scope,
+                is_delegated_child_context,
+            )
+
+            if is_delegated_child_context():
+                return get_delegated_child_snapshot_scope() or f"thread-{threading.get_ident()}"
+        except Exception:
+            pass
+        return None
+
+    def _seed_child_snapshot(self, base_path: str, child_path: str) -> None:
+        """Create a child snapshot in the target environment with 0600 mode."""
+        child_dir = posixpath.dirname(child_path) or "."
+        quoted_dir = self._quote_shell_path(child_dir)
+        quoted_base = self._quote_shell_path(base_path)
+        quoted_child = self._quote_shell_path(child_path)
+        quoted_template = self._quote_shell_path(child_path + ".seed.XXXXXXXXXX")
+        command = (
+            "umask 077\n"
+            f"mkdir -p {quoted_dir} || exit 1\n"
+            f"__hermes_child_snap_tmp=$(mktemp {quoted_template}) || exit 1\n"
+            f"if [ -e {quoted_base} ]; then\n"
+            f"  cat {quoted_base} > \"$__hermes_child_snap_tmp\" || "
+            f"{{ rm -f \"$__hermes_child_snap_tmp\"; exit 1; }}\n"
+            "fi\n"
+            f"chmod 600 \"$__hermes_child_snap_tmp\" || "
+            f"{{ rm -f \"$__hermes_child_snap_tmp\"; exit 1; }}\n"
+            f"mv -f \"$__hermes_child_snap_tmp\" {quoted_child} || "
+            f"{{ rm -f \"$__hermes_child_snap_tmp\"; exit 1; }}\n"
+        )
+        proc = self._run_bash(command, login=False, timeout=self._snapshot_timeout)
+        result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
+        if int(result.get("returncode") or 0) != 0:
+            raise OSError("delegated child terminal snapshot seed failed")
+
+    def _snapshot_path_for_current_context(self) -> str:
+        """Return the snapshot path isolated for the current execution context.
+
+        The base snapshot belongs to the parent environment. A delegated child
+        that runs ``export HERMES_HOME=...`` must be able to keep that value for
+        its own later terminal calls without publishing it back to the parent or
+        an unrelated sibling child that shares the same LocalEnvironment.
+        """
+        scope = self._current_child_snapshot_scope()
+        if not scope:
+            return self._snapshot_path
+        with self._child_snapshot_lock:
+            existing = self._child_snapshot_paths.get(scope)
+            if existing:
+                return existing
+            safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "-", scope).strip(".-")[:48]
+            if not safe_scope:
+                safe_scope = uuid.uuid4().hex[:12]
+            child_path = f"{self._snapshot_path}.child-{safe_scope}-{uuid.uuid4().hex[:8]}"
+            if self._snapshot_ready:
+                try:
+                    self._seed_child_snapshot(self._snapshot_path, child_path)
+                except OSError:
+                    logger.debug("Could not seed delegated child terminal snapshot", exc_info=True)
+                    raise RuntimeError("Could not seed delegated child terminal snapshot")
+            self._child_snapshot_paths[scope] = child_path
+            return child_path
 
     def init_session(self):
         """Capture login shell environment into a snapshot file.
@@ -869,14 +945,13 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
-    def _wrap_command(self, command: str, cwd: str) -> str:
+    def _wrap_command(self, command: str, cwd: str, *, snapshot_path: str | None = None) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
+        active_snapshot_path = snapshot_path or self._snapshot_path
 
-        # Quote the snapshot path (see init_session — LocalEnvironment
-        # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
-        _quoted_snap = self._quote_shell_path(self._snapshot_path)
+        _quoted_snap = self._quote_shell_path(active_snapshot_path)
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
@@ -885,7 +960,7 @@ class BaseEnvironment(ABC):
         # expands empty, collapsing every writer onto one temp name) and ``$$``
         # is shared by ``&``-launched subshells.  Template shell-quoted
         # (Windows/spaces); the allocated path lives in a shell variable.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
+        _snap_tmp_template = self._quote_shell_path(active_snapshot_path + ".tmp.XXXXXXXXXX")
         _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
@@ -897,8 +972,12 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
-            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
+        names_to_restore = tuple(dict.fromkeys((
+            *passthrough_names,
+            *_SNAPSHOT_PROCESS_TRUSTED_ENV_NAMES,
+        )))
+        for name in names_to_restore:
+            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{uuid.uuid4().hex}_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
             saved_names.append((name, present, value))
@@ -1374,11 +1453,11 @@ class BaseEnvironment(ABC):
     # CWD extraction
     # ------------------------------------------------------------------
 
-    def _update_cwd(self, result: dict):
+    def _update_cwd(self, result: dict, *, update_self: bool = True):
         """Extract CWD from command output. Override for local file-based read."""
-        self._extract_cwd_from_output(result)
+        self._extract_cwd_from_output(result, update_self=update_self)
 
-    def _extract_cwd_from_output(self, result: dict):
+    def _extract_cwd_from_output(self, result: dict, *, update_self: bool = True):
         """Parse the __HERMES_CWD_{session}__ marker from stdout output.
 
         Updates self.cwd and strips the marker from result["output"].
@@ -1405,7 +1484,8 @@ class BaseEnvironment(ABC):
 
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
-            self.cwd = cwd_path
+            if update_self:
+                self.cwd = cwd_path
             result["cwd_observed"] = True
             # Keep the observation on this command's result as well as on the
             # shared environment. Concurrent callers must not read self.cwd
@@ -1477,7 +1557,10 @@ class BaseEnvironment(ABC):
             from tools.terminal_tool import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
-        effective_cwd = cwd or self.cwd
+        snapshot_scope = self._current_child_snapshot_scope()
+        effective_cwd = cwd or (
+            self._child_cwds.get(snapshot_scope, self.cwd) if snapshot_scope else self.cwd
+        )
 
         # Merge sudo stdin with caller stdin
         if sudo_stdin is not None and stdin_data is not None:
@@ -1492,7 +1575,11 @@ class BaseEnvironment(ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
-        wrapped = self._wrap_command(exec_command, effective_cwd)
+        wrapped = self._wrap_command(
+            exec_command,
+            effective_cwd,
+            snapshot_path=self._snapshot_path_for_current_context(),
+        )
 
         # Use login shell if snapshot failed (so user's profile still loads),
         # unless login itself is broken — then non-login is the only path.
@@ -1577,7 +1664,12 @@ class BaseEnvironment(ABC):
             result = {"output": timeout_msg.lstrip(), "returncode": 124}
         else:
             result = bounded.value
-        self._update_cwd(result)
+        if snapshot_scope:
+            self._update_cwd(result, update_self=False)
+            if result.get("cwd_observed") and result.get("cwd"):
+                self._child_cwds[snapshot_scope] = str(result["cwd"])
+        else:
+            self._update_cwd(result)
 
         return result
 

@@ -2234,6 +2234,12 @@ def _start_backend_heartbeat_refresher() -> None:
         if _heartbeat_refresher_started:
             return
         _heartbeat_refresher_started = True
+    try:
+        from hermes_cli.build_info import record_startup_code_identity
+
+        record_startup_code_identity()
+    except Exception:
+        logger.debug("startup code identity capture failed", exc_info=True)
     # Write a row synchronously so the sweep run later in this same
     # process can see ourselves in the heartbeat table too.  Without
     # this, exclude_ids would have to cover every local session — a
@@ -12357,6 +12363,62 @@ _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
 
+def _maybe_wake_tui_parked_goal(sid: str, session: dict) -> None:
+    """Wake a parked goal if its barrier has just cleared."""
+    try:
+        from hermes_cli.goals import GoalManager
+    except Exception:
+        return
+
+    sid_key = session.get("session_key") or ""
+    if not sid_key:
+        return
+
+    # Busy sessions keep the durable pending wakeup for the next poll.
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+
+    mgr = GoalManager(session_id=sid_key)
+    prompt = mgr.check_wakeup()
+    if not prompt:
+        return
+
+    running_claim = object()
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        session["running"] = True
+        session["_goal_wakeup_running_claim"] = running_claim
+
+    rid = f"__goal__{int(time.time() * 1000)}"
+    accepted = False
+    try:
+        _emit("message.start", sid)
+        accepted = bool(_run_prompt_submit(rid, sid, session, prompt))
+    except Exception as exc:
+        print(
+            f"[tui_gateway] goal wakeup dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    finally:
+        with session["history_lock"]:
+            owns_running = session.get("_goal_wakeup_running_claim") is running_claim
+            if owns_running:
+                session.pop("_goal_wakeup_running_claim", None)
+                if not accepted:
+                    session["running"] = False
+    if accepted:
+        mgr.ack_wakeup()
+
+
+def _clear_running_after_submit_refusal(session: dict) -> None:
+    with session["history_lock"]:
+        session.pop("_goal_wakeup_running_claim", None)
+        session["running"] = False
+
+
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     """Fire a due /loop wakeup for an idle TUI/Desktop/dashboard session.
 
@@ -12497,20 +12559,24 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     return None
 
 
-def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this TUI session's subscriptions.
+class _KanbanNotificationClaim(NamedTuple):
+    text: str
+    task_id: str
+    platform: str
+    chat_id: str
+    thread_id: str
+    board_slug: str
+    old_cursor: int
+    new_cursor: int
+    remove_after_ack: bool
 
-    ``kanban_create`` auto-subscribes TUI/desktop sessions with
-    ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
-    tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
-    can't deliver those — there is no "tui" messaging adapter — so this
-    poller is the delivery path for them (issue #59890). Uses the same
-    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
 
-    Returns the list of formatted notification texts (may be empty).
-    """
+def _collect_kanban_notifications_with_claims(
+    session: dict,
+    *,
+    ack: bool = False,
+) -> list[_KanbanNotificationClaim]:
+    """Read unseen kanban events and retain enough cursor data to ack."""
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
         return []
@@ -12518,7 +12584,7 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
-    texts: list = []
+    claims: list[_KanbanNotificationClaim] = []
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
@@ -12571,7 +12637,8 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                _old = int(sub.get("last_event_id") or 0)
+                _new, events = _kb.unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -12582,15 +12649,61 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
+                claim_start = len(claims)
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
-                        texts.append(text)
+                        claims.append(
+                            _KanbanNotificationClaim(
+                                text=text,
+                                task_id=sub["task_id"],
+                                platform=sub["platform"],
+                                chat_id=sub["chat_id"],
+                                thread_id=sub.get("thread_id") or "",
+                                board_slug=slug,
+                                old_cursor=int(_old),
+                                new_cursor=int(_new),
+                                remove_after_ack=bool(
+                                    task and getattr(task, "status", "") == "archived"
+                                ),
+                            )
+                        )
+                if len(claims) == claim_start:
+                    claims.append(
+                        _KanbanNotificationClaim(
+                            text="",
+                            task_id=sub["task_id"],
+                            platform=sub["platform"],
+                            chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or "",
+                            board_slug=slug,
+                            old_cursor=int(_old),
+                            new_cursor=int(_new),
+                            remove_after_ack=bool(
+                                task and getattr(task, "status", "") == "archived"
+                            ),
+                        )
+                    )
+                if ack:
+                    with _kb.write_txn(conn):
+                        conn.execute(
+                            "UPDATE kanban_notify_subs SET last_event_id = ? "
+                            "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                            "AND thread_id = ? AND last_event_id = ?",
+                            (
+                                int(_new),
+                                sub["task_id"],
+                                sub["platform"],
+                                sub["chat_id"],
+                                sub.get("thread_id") or "",
+                                int(_old),
+                            ),
+                        )
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
                 # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
+                if ack and task and getattr(task, "status", "") == "archived":
                     try:
                         _kb.remove_notify_sub(
                             conn,
@@ -12603,7 +12716,155 @@ def _collect_kanban_notifications(session: dict) -> list:
                         pass
         finally:
             conn.close()
-    return texts
+    return claims
+
+
+def _collect_kanban_notifications(session: dict) -> list:
+    """Claim unseen terminal kanban events for this TUI session's subscriptions.
+
+    ``kanban_create`` auto-subscribes TUI/desktop sessions with
+    ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
+    tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
+    can't deliver those — there is no "tui" messaging adapter — so this
+    poller is the delivery path for them (issue #59890). Uses the same
+    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
+    notifier, so a subscription is delivered exactly once even if a gateway
+    and a TUI poll the same board DB.
+
+    Returns the list of formatted notification texts (may be empty).
+    """
+    claims = _collect_kanban_notifications_with_claims(session, ack=True)
+    return [claim.text for claim in claims if claim.text]
+
+
+def _advance_kanban_notification_claims(
+    claims: list[_KanbanNotificationClaim],
+) -> None:
+    """Persist accepted kanban notification cursors with an old-cursor CAS."""
+    if not claims:
+        return
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return
+    seen: set[tuple[str, str, str, str, str, int, int]] = set()
+    for claim in claims:
+        key = (
+            claim.board_slug,
+            claim.task_id,
+            claim.platform,
+            claim.chat_id,
+            claim.thread_id,
+            claim.old_cursor,
+            claim.new_cursor,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            conn = _kb.connect(board=claim.board_slug)
+        except Exception:
+            continue
+        try:
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE kanban_notify_subs SET last_event_id = ? "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                    "AND thread_id = ? AND last_event_id = ?",
+                    (
+                        int(claim.new_cursor),
+                        claim.task_id,
+                        claim.platform,
+                        claim.chat_id,
+                        claim.thread_id,
+                        int(claim.old_cursor),
+                    ),
+                )
+            if claim.remove_after_ack:
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=claim.task_id,
+                    platform=claim.platform,
+                    chat_id=claim.chat_id,
+                    thread_id=claim.thread_id,
+                )
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+
+def _rewind_kanban_notification_claims(
+    claims: list[_KanbanNotificationClaim],
+) -> None:
+    """Undo claimed kanban cursors after an agent-turn dispatch failure."""
+    if not claims:
+        return
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return
+    seen: set[tuple[str, str, str, str, str, int, int]] = set()
+    for claim in claims:
+        key = (
+            claim.board_slug,
+            claim.task_id,
+            claim.platform,
+            claim.chat_id,
+            claim.thread_id,
+            claim.old_cursor,
+            claim.new_cursor,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            conn = _kb.connect(board=claim.board_slug)
+        except Exception:
+            continue
+        try:
+            _kb.rewind_notify_cursor(
+                conn,
+                task_id=claim.task_id,
+                platform=claim.platform,
+                chat_id=claim.chat_id,
+                thread_id=claim.thread_id,
+                claimed_cursor=claim.new_cursor,
+                old_cursor=claim.old_cursor,
+            )
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+
+def _release_kanban_running_claim(session: dict, running_claim: object) -> None:
+    with session["history_lock"]:
+        if session.get("_kanban_running_claim") is running_claim:
+            session.pop("_kanban_running_claim", None)
+            session["running"] = False
+
+
+def _clear_kanban_running_claim(session: dict, running_claim: object) -> None:
+    with session["history_lock"]:
+        if session.get("_kanban_running_claim") is running_claim:
+            session.pop("_kanban_running_claim", None)
+
+
+def _kanban_claim_signature(claims: list[_KanbanNotificationClaim]) -> tuple:
+    return tuple(
+        (
+            claim.text,
+            claim.task_id,
+            claim.platform,
+            claim.chat_id,
+            claim.thread_id,
+            claim.board_slug,
+            claim.old_cursor,
+            claim.new_cursor,
+        )
+        for claim in claims
+    )
 
 
 def _notification_poller_loop(
@@ -12639,6 +12900,7 @@ def _notification_poller_loop(
             _last_loop_poll = _now
             try:
                 _maybe_fire_tui_loop_tick(sid, session)
+                _maybe_wake_tui_parked_goal(sid, session)
             except Exception as _loop_exc:
                 print(
                     f"[tui_gateway] loop wakeup poll failed: "
@@ -12647,42 +12909,96 @@ def _notification_poller_loop(
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
-            try:
-                _kanban_texts = _collect_kanban_notifications(session)
-            except Exception as _kb_exc:
-                print(
-                    f"[tui_gateway] kanban notification poll failed: "
-                    f"{type(_kb_exc).__name__}: {_kb_exc}",
-                    file=sys.stderr,
-                )
-                _kanban_texts = []
-            if _kanban_texts:
-                for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+            _batch: list = []
+            _batch_claims: list[_KanbanNotificationClaim] = []
+            _running_claim = object()
+            _owns_running = False
+            _suppress_status = False
             _pending = session.get("_kanban_pending") or []
             if _pending:
-                _batch: list = []
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
+                        session["_kanban_running_claim"] = _running_claim
+                        _owns_running = True
                         _batch = list(_pending)
+                        _batch_claims = list(session.get("_kanban_pending_claims") or [])
                         session["_kanban_pending"] = []
-                if _batch:
-                    rid = f"__notif__{int(time.time() * 1000)}"
+                        session["_kanban_pending_claims"] = []
+            else:
+                with session["history_lock"]:
+                    if not session.get("running"):
+                        session["running"] = True
+                        session["_kanban_running_claim"] = _running_claim
+                        _owns_running = True
+                if _owns_running:
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
-                    except Exception as exc:
+                        _batch_claims = _collect_kanban_notifications_with_claims(session)
+                        _batch = [claim.text for claim in _batch_claims if claim.text]
+                    except Exception as _kb_exc:
                         print(
-                            f"[tui_gateway] kanban notification dispatch failed: "
-                            f"{type(exc).__name__}: {exc}",
+                            f"[tui_gateway] kanban notification poll failed: "
+                            f"{type(_kb_exc).__name__}: {_kb_exc}",
                             file=sys.stderr,
                         )
+                        _batch = []
+                    if _batch:
+                        _shown_claims = list(session.get("_kanban_pending_claims") or [])
+                        _suppress_status = _kanban_claim_signature(
+                            _shown_claims
+                        ) == _kanban_claim_signature(_batch_claims)
+                        if _suppress_status:
+                            if session.get("active_session_lease") is None:
+                                _ownership_refusal = _ensure_active_session_slot(sid, session)
+                                if _ownership_refusal is not None:
+                                    _batch = []
+                                    _release_kanban_running_claim(session, _running_claim)
+                                    _owns_running = False
+                        else:
+                            try:
+                                for _kb_text in _batch:
+                                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
+                            except Exception as _emit_exc:
+                                print(
+                                    f"[tui_gateway] kanban notification status emit failed: "
+                                    f"{type(_emit_exc).__name__}: {_emit_exc}",
+                                    file=sys.stderr,
+                                )
+                                _batch = []
+                                _release_kanban_running_claim(session, _running_claim)
+                                _owns_running = False
+                    elif _batch_claims:
+                        _advance_kanban_notification_claims(_batch_claims)
+                        _release_kanban_running_claim(session, _running_claim)
+                        _owns_running = False
+                    else:
+                        _release_kanban_running_claim(session, _running_claim)
+                        _owns_running = False
+            if _batch:
+                rid = f"__notif__{int(time.time() * 1000)}"
+                try:
+                    if not _suppress_status:
+                        _emit("message.start", sid)
+                    _submit_ok = _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                    if _submit_ok is False:
+                        if _owns_running:
+                            with session["history_lock"]:
+                                session["_kanban_pending_claims"] = list(_batch_claims)
+                            _release_kanban_running_claim(session, _running_claim)
+                    else:
+                        _advance_kanban_notification_claims(_batch_claims)
                         with session["history_lock"]:
-                            session["running"] = False
+                            session["_kanban_pending_claims"] = []
+                        if _owns_running:
+                            _clear_kanban_running_claim(session, _running_claim)
+                except Exception as exc:
+                    print(
+                        f"[tui_gateway] kanban notification dispatch failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if _owns_running:
+                        _release_kanban_running_claim(session, _running_claim)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -12753,7 +13069,10 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery,
+            complete_event_delivery,
+            release_event_admission_refusal,
+            release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
@@ -12761,7 +13080,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _submit_ok = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -12770,8 +13089,11 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                _submit_ok = _run_prompt_submit(rid, sid, session, text)
+            if _submit_ok is True:
+                complete_event_delivery(evt, _claim)
+            else:
+                release_event_admission_refusal(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -12831,7 +13153,10 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery,
+            complete_event_delivery,
+            release_event_admission_refusal,
+            release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
@@ -12839,7 +13164,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _submit_ok = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -12848,8 +13173,11 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                _submit_ok = _run_prompt_submit(rid, sid, session, text)
+            if _submit_ok is True:
+                complete_event_delivery(evt, _claim)
+            else:
+                release_event_admission_refusal(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -13200,18 +13528,19 @@ def _run_prompt_submit(
             session.get("session_key") or sid,
             getattr(ownership_refusal, "reason", None) or "refused",
         )
-        with session["history_lock"]:
-            session["running"] = False
+        _clear_running_after_submit_refusal(session)
         _emit("error", sid, {"message": str(ownership_refusal)})
         return False
     with session["history_lock"]:
         if session.get("_closing"):
+            session.pop("_goal_wakeup_running_claim", None)
             session["running"] = False
             return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
+            session.pop("_goal_wakeup_running_claim", None)
             session["running"] = False
             return False
         if image_paths is None:

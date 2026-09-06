@@ -366,6 +366,69 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_message"] is None
 
 
+class TestGatewayStartupIdentity:
+    def _prepare_repo(self, tmp_path, monkeypatch):
+        import subprocess
+        import hermes_cli.build_info as bi
+
+        home = tmp_path / "home"
+        repo = tmp_path / "repo"
+        home.mkdir()
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        monkeypatch.setattr(bi, "_PROJECT_ROOT", repo)
+        monkeypatch.setattr(bi, "_code_identity_cache", None)
+        monkeypatch.setattr(bi, "_startup_code_identity_cache", None)
+        monkeypatch.setattr(bi, "_startup_code_identity_pid", None)
+        monkeypatch.setattr(bi, "_startup_code_identity_attempted_pid", None)
+        return home, repo, bi
+
+    def test_write_pid_file_then_runtime_status_keeps_boot_identity(
+        self, tmp_path, monkeypatch
+    ):
+        home, repo, bi = self._prepare_repo(tmp_path, monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        boot_identity = bi.get_code_identity(refresh=True)
+        boot_content_sha = boot_identity["content_sha"]
+
+        status.write_pid_file()
+        (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+        live_identity = bi.get_code_identity(refresh=True)
+        assert live_identity["content_sha"] != boot_content_sha
+
+        status.write_runtime_status(gateway_state="starting")
+        payload = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+        pid_payload = json.loads((home / "gateway.pid").read_text(encoding="utf-8"))
+
+        assert pid_payload["pid"] == os.getpid()
+        assert payload["code_content_sha"] == boot_content_sha
+        assert payload["code_content_sha"] != live_identity["content_sha"]
+
+    def test_write_pid_file_capture_failure_keeps_runtime_identity_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        home, repo, bi = self._prepare_repo(tmp_path, monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(bi, "record_startup_code_identity", lambda identity=None: None)
+
+        status.write_pid_file()
+        (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+        live_identity = bi.get_code_identity(refresh=True)
+
+        status.write_runtime_status(gateway_state="starting")
+        payload = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+
+        assert live_identity["content_sha"] is not None
+        assert payload["code_content_sha"] is None
+        assert payload["code_sha"] is None
+
+
 class TestGetProcessStartTime:
     """Start-time fingerprint backing the PID-reuse guard (#43846 / #50468).
 
