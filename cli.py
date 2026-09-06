@@ -13451,6 +13451,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._loop_manager = mgr
         return mgr
 
+
+    def _maybe_wake_parked_goal(self) -> None:
+        """Idle hook run from process_loop: wake a parked goal if its barrier cleared."""
+        mgr = self._get_goal_manager()
+        if mgr is None:
+            return
+        prompt = mgr.check_wakeup()
+        if prompt:
+            try:
+                self._pending_input.put(prompt)
+            except Exception as exc:
+                logging.debug("goal wakeup enqueue failed: %s", exc)
+            else:
+                mgr.ack_wakeup()
+
     def _maybe_fire_loop_tick(self) -> None:
         """Idle hook run from process_loop: fire a due /loop wakeup.
 
@@ -21083,6 +21098,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 self._drain_process_notifications("cli-idle")
                             except Exception:
                                 pass
+                            # Check parked goals that just had their wait barrier cleared.
+                            try:
+                                self._maybe_wake_parked_goal()
+                            except Exception:
+                                pass
+
                             # Fire a due /loop wakeup while idle (defers to
                             # queued user input and active /goal loops).
                             try:

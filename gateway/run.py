@@ -14950,6 +14950,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (SessionDB loop:* rows) and injects due wakeup prompts into their
         # originating chats while the session is idle.
         self._spawn_supervised(self._loop_wakeup_watcher, "loop_wakeup_watcher")
+        self._spawn_supervised(self._goal_wakeup_watcher, "goal_wakeup_watcher")
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
@@ -24833,6 +24834,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
+
+
+    async def _goal_wakeup_watcher(self, interval: float = 15.0) -> None:
+        """Fire continuations for parked goals whose wait barriers just cleared.
+
+        Like _loop_wakeup_watcher, this scans persisted goals and wakes up any
+        parked goal that is now unblocked (e.g. pid finished, session ended).
+        """
+        await asyncio.sleep(6)  # offset from loop watcher
+        warned_no_route: set = set()
+        while self._running:
+            try:
+                from hermes_cli.goals import GoalManager, list_active_goals
+
+                # Warm the cache off-loop once per scan.
+                await self._warm_goals_session_db("goal wakeup")
+
+                active_goals = await self._run_in_executor_with_context(list_active_goals)
+
+                for sid, state in active_goals:
+                    if not self._running:
+                        break
+
+                    route = state.route or {}
+                    platform_name = route.get("platform", "")
+                    chat_id = route.get("chat_id", "")
+                    if not platform_name or not chat_id:
+                        continue
+
+                    adapter = None
+                    for p, a in self.adapters.items():
+                        if p.value == platform_name:
+                            adapter = a
+                            break
+                    if adapter is None:
+                        if sid not in warned_no_route:
+                            warned_no_route.add(sid)
+                            logger.debug(
+                                "goal wakeup: no adapter for platform %r (session %s)",
+                                platform_name, sid,
+                            )
+                        continue
+
+                    # Build the source + session key to check business.
+                    evt_stub = {
+                        "session_key": "",
+                        "platform": platform_name,
+                        "chat_id": chat_id,
+                        "chat_type": route.get("chat_type", ""),
+                        "thread_id": route.get("thread_id", ""),
+                        "user_id": route.get("user_id", ""),
+                        "user_name": route.get("user_name", ""),
+                    }
+                    source = self._build_process_event_source(evt_stub)
+                    if source is None:
+                        continue
+                    try:
+                        session_key = self._session_key_for_source(source)
+                    except Exception:
+                        session_key = None
+                    if session_key and session_key in self._running_agents:
+                        continue  # busy
+
+                    mgr = GoalManager(session_id=sid)
+                    prompt = await self._run_in_executor_with_context(mgr.check_wakeup)
+                    if prompt:
+                        try:
+                            synth_event = MessageEvent(
+                                text=prompt,
+                                message_type=MessageType.TEXT,
+                                source=source,
+                                internal=True,
+                            )
+                            logger.info(
+                                "goal wakeup — injecting for %s chat=%s thread=%s",
+                                platform_name, source.chat_id, source.thread_id,
+                            )
+                            await adapter.handle_message(synth_event)
+                        except Exception as exc:
+                            logger.warning("goal wakeup injection failed for %s: %s", sid, exc)
+                        else:
+                            await self._run_in_executor_with_context(mgr.ack_wakeup)
+            except Exception as e:
+                logger.debug("goal wakeup watcher failed: %s", e)
+
+            if not self._running:
+                break
+            await asyncio.sleep(interval)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions.

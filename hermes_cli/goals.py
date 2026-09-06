@@ -1915,7 +1915,6 @@ class GoalManager:
         )
         if not had_barrier and self._state.wakeup_pending == wakeup_pending:
             return False
-
         expected = replace(self._state)
         updated = replace(
             self._state,
