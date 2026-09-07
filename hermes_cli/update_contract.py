@@ -127,7 +127,10 @@ def record_refusal_receipt(refusal: UpdateRefusal) -> None:
             record_step,
         )
 
-        begin_update_receipt()
+        # probe_content=False: a refused/package-managed install must not
+        # shell out to `git ls-files` (#91277 admission contract — zero
+        # git/subprocess work on a refused update).
+        begin_update_receipt(probe_content=False)
         record_step(
             "admission",
             False,

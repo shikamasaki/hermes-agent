@@ -249,7 +249,7 @@ def _resolve_git_head_sha(project_root: Path) -> Optional[str]:
     return None
 
 
-def get_code_identity(refresh: bool = False) -> dict:
+def get_code_identity(refresh: bool = False, probe_content: bool = True) -> dict:
     """Return the running checkout's code identity as a dict.
 
     Shape: ``{"sha": full-or-short sha | None, "short_sha": str | None,
@@ -261,13 +261,22 @@ def get_code_identity(refresh: bool = False) -> dict:
     rev-parse`` for source installs, the baked ``.hermes_build_sha`` for
     Docker images (no ``.git`` inside the published image), else unknown.
 
+    ``probe_content=False`` skips ``_resolve_repo_content_sha`` entirely —
+    that helper shells out to ``git ls-files`` (see
+    ``_iter_repo_content_paths``), which a package-managed-install refusal
+    receipt must never invoke (#91277 admission contract: a refused update
+    performs zero git/subprocess work). Callers that don't need the content
+    digest (e.g. the refusal receipt) should pass ``probe_content=False``;
+    the result is never cached in that mode, so it can't shadow the full
+    identity a later ``probe_content=True`` call needs.
+
     Cached per process — code identity cannot change while a process is
     running (an updated checkout requires a restart to take effect, which
     is exactly the property the fleet version verification relies on).
     Never raises; every field degrades to ``None`` independently.
     """
     global _code_identity_cache
-    if _code_identity_cache is not None and not refresh:
+    if probe_content and _code_identity_cache is not None and not refresh:
         return dict(_code_identity_cache)
 
     sha: Optional[str] = None
@@ -283,7 +292,7 @@ def get_code_identity(refresh: bool = False) -> dict:
             sha = baked
             source = "build-file"
 
-    content_sha = _resolve_repo_content_sha(project_root)
+    content_sha = _resolve_repo_content_sha(project_root) if probe_content else None
 
     version: Optional[str] = None
     try:
@@ -295,7 +304,7 @@ def get_code_identity(refresh: bool = False) -> dict:
     except Exception:
         version = None
 
-    _code_identity_cache = {
+    identity = {
         "sha": sha,
         "short_sha": sha[:8] if sha else None,
         "version": version,
@@ -303,6 +312,9 @@ def get_code_identity(refresh: bool = False) -> dict:
         "content_sha": content_sha,
         "content_short_sha": content_sha[:8] if content_sha else None,
     }
+    if not probe_content:
+        return dict(identity)
+    _code_identity_cache = identity
     return dict(_code_identity_cache)
 
 

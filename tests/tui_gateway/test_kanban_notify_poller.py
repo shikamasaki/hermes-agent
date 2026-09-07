@@ -169,6 +169,30 @@ class TestCollectKanbanNotifications:
         assert len(rows) == 1
         assert rows[0]["last_event_id"] == pre_cursor
 
+    def test_two_tui_sessions_get_independent_claims_for_same_event(self):
+        tid = _create_subscribed_task(chat_id=SESSION_KEY)
+        conn = kb.connect()
+        try:
+            kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="second-tui-session")
+        finally:
+            conn.close()
+        _complete(tid, summary="fanout completion")
+
+        first = _collect_kanban_notifications(_session(SESSION_KEY))
+        second = _collect_kanban_notifications(_session("second-tui-session"))
+
+        assert len(first) == 1
+        assert len(second) == 1
+        assert tid in first[0]
+        assert tid in second[0]
+        assert "fanout completion" in first[0]
+        assert "fanout completion" in second[0]
+        rows = sorted(_sub_rows(tid), key=lambda row: row["chat_id"])
+        assert [row["chat_id"] for row in rows] == ["second-tui-session", SESSION_KEY]
+        assert all(int(row["last_event_id"]) > 0 for row in rows)
+        assert _collect_kanban_notifications(_session(SESSION_KEY)) == []
+        assert _collect_kanban_notifications(_session("second-tui-session")) == []
+
     def test_probe_error_falls_back_to_writable_delivery(self, monkeypatch):
         tid = _create_subscribed_task()
         _complete(tid, summary="fallback delivery")
