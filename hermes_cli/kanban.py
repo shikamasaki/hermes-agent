@@ -418,6 +418,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument("--requires-chief-review", action="store_true",
+                          help="Require chief review before the task can be marked complete.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -1761,6 +1763,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
+            requires_chief_review=bool(getattr(args, "requires_chief_review", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
@@ -2529,7 +2532,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
-    kind = getattr(args, "kind", None)
+    kind = getattr(args, "kind", None) or "needs_input"
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2594,13 +2597,13 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
-    author = _profile_author() if reason else None
+    author = _profile_author()
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(conn, tid, actor=author):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
