@@ -1918,3 +1918,332 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_unblock_task_records_actor(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="blocked task")
+        kb.block_task(conn, tid, reason="testing block", kind="needs_input")
+
+        assert kb.unblock_task(conn, tid, actor="someone") is True
+
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (tid,),
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"]) if events[0]["payload"] else {}
+        assert payload.get("actor") == "someone"
+
+
+def test_unblock_task_without_actor(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="blocked task 2")
+        kb.block_task(conn, tid, reason="testing block 2", kind="needs_input")
+
+        assert kb.unblock_task(conn, tid) is True
+
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (tid,),
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"]) if events[0]["payload"] else {}
+        assert "actor" not in payload
+
+
+
+
+def test_requires_chief_review_survives_worker_crash_and_reassign(kanban_home, all_assignees_spawnable, monkeypatch):
+    """
+    requires_chief_reviewフラグがworker強制終了(SIGKILL)後も持続し、
+    再アサインされたworkerに対してもkanban_completeを拒否することを実証するテスト。
+    """
+    import sqlite3
+    import subprocess
+    import sys
+    import os
+    import signal
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import _handle_complete
+
+    db_path = kanban_home / "kanban.db"
+    
+    # クラッシュ検知を即座に行うため猶予を0秒に設定
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    
+    # 1. requires_chief_review=Trueでタスク作成
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        tid = kb.create_task(
+            conn,
+            title="crash_test_task",
+            assignee="default",
+            requires_chief_review=True
+        )
+        task = kb.get_task(conn, tid)
+        assert task.requires_chief_review is True
+        assert task.status == "ready"
+
+    # 2. dispatch_once経由で実プロセスを立ち上げてclaimさせる
+    spawned_pid = None
+    spawned_proc = None
+    
+    def fake_spawn(task, workspace, board=None):
+        nonlocal spawned_pid, spawned_proc
+        spawned_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        spawned_pid = spawned_proc.pid
+        return spawned_pid
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
+        
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == spawned_pid
+            
+    assert spawned_pid is not None
+    assert spawned_proc is not None
+    
+    # 3. WorkerをSIGKILLで強制終了
+    os.kill(spawned_pid, signal.SIGKILL)
+    spawned_proc.wait()
+        
+    # 4. クラッシュ検知と再アサインの確認
+    # dispatch_onceの冒頭でdetect_crashed_workersが呼ばれ、タスクが回収され再ディスパッチされる
+    first_pid = spawned_pid
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        res2 = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
+        
+        task2 = kb.get_task(conn, tid)
+        assert task2 is not None
+        assert task2.requires_chief_review is True
+        assert task2.status in ("ready", "running")
+        assert task2.worker_pid != first_pid
+        
+    # 5. 再アサイン後のworkerが_handle_complete経由で自己完了しようとしても拒否されることの検証
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    
+    result = _handle_complete({"task_id": tid})
+    assert result is not None
+    assert "requires_chief_review=true" in result
+    assert "kanban_complete is rejected" in result
+
+
+# ---------------------------------------------------------------------------
+# Duplicate complete_task notification resilience verification
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_is_idempotent_on_duplicate_notification(kanban_home):
+    """Verify duplicate complete_task calls on already-done tasks return False without side effects."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="test duplicate complete")
+        kb.claim_task(conn, tid)
+
+        # 1st call to complete_task
+        ret1 = kb.complete_task(conn, tid, result="first_result", summary="first_summary")
+        assert ret1 is True
+
+        task1 = kb.get_task(conn, tid)
+        assert task1 is not None
+        assert task1.status == "done"
+        assert task1.result == "first_result"
+
+        events1 = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(events1) == 1
+
+        # 2nd call to complete_task (duplicate notification)
+        ret2 = kb.complete_task(conn, tid, result="second_result", summary="second_summary")
+        assert ret2 is False
+
+        task2 = kb.get_task(conn, tid)
+        assert task2 is not None
+        assert task2.status == "done"
+        assert task2.result == "first_result"
+
+        events2 = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(events2) == 1
+
+
+def test_complete_task_with_expected_run_id_is_idempotent(kanban_home):
+    """Verify duplicate complete_task calls with expected_run_id return False safely."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="test expected_run_id duplicate")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+        ret1 = kb.complete_task(conn, tid, result="first_run_res", expected_run_id=run_id)
+        assert ret1 is True
+
+        ret2 = kb.complete_task(conn, tid, result="second_run_res", expected_run_id=run_id)
+        assert ret2 is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.result == "first_run_res"
+
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(events) == 1
+
+
+def test_complete_task_after_review_is_idempotent(kanban_home):
+    """Verify duplicate complete_task calls after review approval return False safely."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="test review complete duplicate")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.request_review(conn, tid, expected_run_id=claimed.current_run_id, summary="needs review")
+
+        task_in_review = kb.get_task(conn, tid)
+        assert task_in_review is not None
+        assert task_in_review.status == "review"
+
+        ret1 = kb.complete_task(conn, tid, result="review_approved")
+        assert ret1 is True
+
+        ret2 = kb.complete_task(conn, tid, result="review_approved_again")
+        assert ret2 is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.result == "review_approved"
+
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(events) == 1
+
+
+def test_complete_task_rejects_stale_run_id_after_reassignment(kanban_home):
+    """Verify delayed/stale complete_task notifications with an old run_id are safely rejected after reassignment."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="test stale run_id rejection")
+
+        # 1. First claim -> run_id_1
+        claimed1 = kb.claim_task(conn, tid)
+        assert claimed1 is not None
+        run_id_1 = claimed1.current_run_id
+        assert run_id_1 is not None
+
+        # 2. Reset task status back to ready (simulating worker crash/reclaim)
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        # 3. Second claim -> run_id_2
+        claimed2 = kb.claim_task(conn, tid)
+        assert claimed2 is not None
+        run_id_2 = claimed2.current_run_id
+        assert run_id_2 is not None
+        assert run_id_2 != run_id_1
+
+        # 4. Stale complete notification arriving with old run_id_1 must be rejected
+        ret_stale = kb.complete_task(conn, tid, result="stale_result", expected_run_id=run_id_1)
+        assert ret_stale is False
+
+        # Verify task is still running under run_id_2 and result is unaffected
+        task_stale = kb.get_task(conn, tid)
+        assert task_stale is not None
+        assert task_stale.status == "running"
+        assert task_stale.current_run_id == run_id_2
+        assert task_stale.result is None
+
+        # 5. Fresh complete notification with current run_id_2 must succeed
+        ret_fresh = kb.complete_task(conn, tid, result="fresh_result", expected_run_id=run_id_2)
+        assert ret_fresh is True
+
+        task_fresh = kb.get_task(conn, tid)
+        assert task_fresh is not None
+        assert task_fresh.status == "done"
+        assert task_fresh.result == "fresh_result"
+
+
+
+
+def test_stale_run_id_completion_rejected_after_real_dispatch_crash_recovery(kanban_home, all_assignees_spawnable, monkeypatch):
+    import sqlite3
+    import subprocess
+    import sys
+    import os
+    import signal
+    from hermes_cli import kanban_db as kb
+
+    db_path = kanban_home / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        tid = kb.create_task(conn, title="stale_run_id_real_crash_test", assignee="default")
+
+    spawned_procs = []
+    def fake_spawn(task, workspace, board=None):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        spawned_procs.append(proc)
+        return proc.pid
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        run_id_1 = task.current_run_id
+        assert run_id_1 is not None
+
+    proc1 = spawned_procs[0]
+    os.kill(proc1.pid, signal.SIGKILL)
+    proc1.wait()
+    
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+        task2 = kb.get_task(conn, tid)
+        assert task2.status == "running"
+        run_id_2 = task2.current_run_id
+        assert run_id_2 is not None
+        assert run_id_2 != run_id_1
+        
+        assert len(spawned_procs) == 2, "Task should only be spawned once per dispatch_once"
+        
+        ret_stale = kb.complete_task(conn, tid, result="stale", expected_run_id=run_id_1)
+        assert ret_stale is False
+        
+        task_after_stale = kb.get_task(conn, tid)
+        assert task_after_stale.current_run_id == run_id_2
+        assert task_after_stale.status == "running"
+        assert task_after_stale.result is None
+
+    try:
+        os.kill(spawned_procs[1].pid, signal.SIGTERM)
+        spawned_procs[1].wait()
+    except OSError:
+        pass
+
+
+def test_block_task_requires_valid_kind(kanban_home):
+    from hermes_cli import kanban_db as kb
+    import pytest
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="test kind required")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        
+        # Missing kind in kwargs raises TypeError
+        with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
+            kb.block_task(conn, tid, reason="test")
+
+        # Explicit None raises ValueError
+        with pytest.raises(ValueError, match="block kind is required and must be one of"):
+            kb.block_task(conn, tid, reason="test", kind=None)
+
+        # Invalid kind
+        with pytest.raises(ValueError, match="block kind is required and must be one of"):
+            kb.block_task(conn, tid, reason="test", kind="invalid_kind")
+        
+        # Valid kind works
+        assert kb.block_task(conn, tid, reason="test", kind="needs_input") is True

@@ -119,7 +119,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 def test_no_rerun_cli_sets_and_clears_with_required_reason_without_status_change(kanban_home):
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="cli no rerun")
-        assert kb.block_task(conn, task_id, reason="waiting")
+        assert kb.block_task(conn, task_id, reason="waiting", kind="needs_input")
 
     missing = kc.run_slash(f"no-rerun set {task_id}")
     assert "--reason" in missing
@@ -227,5 +227,25 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
+
+
+def test_unblock_cli_records_profile_actor(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "test-operator")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="cli blocked task")
+        kb.block_task(conn, tid, reason="need operator", kind="needs_input")
+
+    out = kc.run_slash(f"unblock {tid}")
+    assert f"Unblocked {tid}" in out
+
+    with kb.connect_closing() as conn:
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (tid,),
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"]) if events[0]["payload"] else {}
+        assert payload.get("actor") == "test-operator"
+
 
 

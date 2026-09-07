@@ -8410,6 +8410,186 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
+def _get_git_info_for_path(path: str | Path) -> tuple[Path | None, str | None]:
+    """Given a directory or file path, return (worktree_root_path, commit_hash)."""
+    try:
+        target_dir = Path(path).resolve()
+        if target_dir.is_file():
+            target_dir = target_dir.parent
+        res_top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res_top.returncode != 0:
+            return target_dir, None
+        worktree_root = Path(res_top.stdout.strip()).resolve()
+
+        res_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        commit_hash = res_head.stdout.strip() if res_head.returncode == 0 else None
+        return worktree_root, commit_hash
+    except Exception:
+        return None, None
+
+
+def _extract_runtime_info_for_pid(pid: int) -> dict:
+    """Extract worktree path and commit hash for a running gateway PID."""
+    cmdline = None
+    cwd = None
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        try:
+            cmdline = proc.cmdline()
+        except Exception:
+            pass
+        try:
+            cwd = proc.cwd()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    if not cmdline:
+        cmdline = _capture_gateway_argv(pid)
+
+    candidates: list[Path] = []
+    if cwd:
+        candidates.append(Path(cwd))
+
+    if cmdline:
+        for arg in cmdline:
+            if "/" in arg or "\\" in arg:
+                p = Path(arg)
+                if p.is_absolute() or p.exists():
+                    candidates.append(p if p.is_dir() else p.parent)
+                    candidates.append(p.parent if p.is_dir() else p.parent.parent)
+
+    wt_path: Path | None = None
+    commit_hash: str | None = None
+
+    for cand in candidates:
+        try:
+            cand_wt, cand_commit = _get_git_info_for_path(cand)
+            if cand_wt and cand_commit:
+                wt_path = cand_wt
+                commit_hash = cand_commit
+                break
+            elif cand_wt and not wt_path:
+                wt_path = cand_wt
+        except Exception:
+            continue
+
+    return {
+        "pid": pid,
+        "cmdline": cmdline or [],
+        "worktree": wt_path,
+        "commit": commit_hash,
+    }
+
+
+def verify_gateway_runtime(
+    expected_worktree: str | Path | None = None,
+    json_output: bool = False,
+) -> None:
+    """Verify that all running gateway processes match the expected worktree/commit.
+
+    Exits 0 if all processes match (or if no gateway is running), exits non-zero (1)
+    if any running process mismatch is detected.
+    """
+    if expected_worktree:
+        exp_target = Path(expected_worktree)
+    else:
+        exp_target = Path.cwd()
+
+    exp_wt_path, exp_commit = _get_git_info_for_path(exp_target)
+    if exp_wt_path is None:
+        exp_wt_path = Path(exp_target).resolve()
+
+    pids = find_gateway_pids(all_profiles=True)
+
+    if not pids:
+        if json_output:
+            out = {
+                "status": "not_running",
+                "message": "Gateway process is not running",
+                "expected": {
+                    "worktree": str(exp_wt_path) if exp_wt_path else None,
+                    "commit": exp_commit,
+                },
+                "processes": [],
+                "mismatches": [],
+            }
+            print(json.dumps(out, indent=2))
+        else:
+            print_info("Gateway process is not running (Gateway未稼働)")
+        sys.exit(0)
+
+    proc_results = []
+    has_mismatch = False
+
+    for pid in pids:
+        info = _extract_runtime_info_for_pid(pid)
+        act_wt = info["worktree"]
+        act_commit = info["commit"]
+
+        reasons = []
+        if act_wt is None or exp_wt_path is None or act_wt.resolve() != exp_wt_path.resolve():
+            reasons.append("worktree_mismatch")
+        if act_commit is None or exp_commit is None or act_commit != exp_commit:
+            reasons.append("commit_mismatch")
+
+        is_mismatch = len(reasons) > 0
+        if is_mismatch:
+            has_mismatch = True
+
+        proc_results.append({
+            "pid": pid,
+            "worktree": str(act_wt) if act_wt else None,
+            "commit": act_commit,
+            "matches": not is_mismatch,
+            "mismatch_reasons": reasons,
+        })
+
+    if json_output:
+        out = {
+            "status": "mismatch" if has_mismatch else "ok",
+            "expected": {
+                "worktree": str(exp_wt_path) if exp_wt_path else None,
+                "commit": exp_commit,
+            },
+            "processes": proc_results,
+            "mismatches": [p["pid"] for p in proc_results if not p["matches"]],
+        }
+        print(json.dumps(out, indent=2))
+    else:
+        if not has_mismatch:
+            commit_str = exp_commit[:7] if exp_commit else "unknown"
+            print_success(f"✓ All running gateway processes match expected runtime ({exp_wt_path} @ {commit_str})")
+        else:
+            print_warning("✗ Gateway runtime mismatch detected!")
+            print_warning(f"  Expected worktree: {exp_wt_path}")
+            print_warning(f"  Expected commit:   {exp_commit}")
+            for pr in proc_results:
+                if not pr["matches"]:
+                    print_warning(
+                        f"  PID {pr['pid']}: worktree={pr['worktree']} (commit={pr['commit']}) "
+                        f"mismatches [{', '.join(pr['mismatch_reasons'])}]"
+                    )
+
+    if has_mismatch:
+        sys.exit(1)
+    sys.exit(0)
+
+
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
@@ -9176,3 +9356,9 @@ def _gateway_command_inner(args):
             print("Legacy unit migration only applies to systemd-based Linux hosts.")
             return
         remove_legacy_hermes_units(interactive=not yes, dry_run=dry_run)
+
+    elif subcmd == "verify-runtime":
+        expected_wt = getattr(args, "expected_worktree", None)
+        json_fmt = getattr(args, "json", False)
+        verify_gateway_runtime(expected_worktree=expected_wt, json_output=json_fmt)
+        return
