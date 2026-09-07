@@ -55,6 +55,20 @@ def _iter_repo_content_paths(project_root: Path) -> Optional[list[Path]]:
     return ``None`` rather than pretending two unknown trees are equivalent.
     """
     try:
+        from hermes_cli.config import detect_install_method
+
+        if detect_install_method(project_root) in (
+            "apt",
+            "docker",
+            "nix",
+            "nixos",
+            "home-manager",
+        ):
+            return None
+    except Exception:
+        pass
+
+    try:
         proc = subprocess.run(
             [
                 "git",
