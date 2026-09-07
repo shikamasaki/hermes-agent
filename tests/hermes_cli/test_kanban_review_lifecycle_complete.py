@@ -532,6 +532,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
         conn,
         task_id,
         reason="stale reviewer must not block successor",
+        kind="needs_input",
         expected_run_id=review.current_run_id,
     )
     current = kb.get_task(conn, task_id)
@@ -576,6 +577,7 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
         conn,
         implementation_id,
         reason="review-required: implementation ready for independent review",
+        kind="needs_input",
         expected_run_id=implementation.current_run_id,
     )
     reviewer_task = kb.get_task(conn, reviewer_id)
@@ -624,6 +626,7 @@ def test_hard_block_with_waiting_child_is_not_mislabeled_as_review_deadlock(conn
         conn,
         implementation_id,
         reason="needs_input: production credentials unavailable",
+        kind="needs_input",
         expected_run_id=implementation.current_run_id,
     )
 

@@ -219,8 +219,8 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
         )
-        kb.block_task(conn, passive_tid, reason="passive block")
-        kb.block_task(conn, active_tid, reason="active block")
+        kb.block_task(conn, passive_tid, reason="passive block", kind="needs_input")
+        kb.block_task(conn, active_tid, reason="active block", kind="needs_input")
     finally:
         conn.close()
 
@@ -283,7 +283,7 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
             session_id="origin-session-id",
         )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-        kb.block_task(conn, tid, reason="plain notify block")
+        kb.block_task(conn, tid, reason="plain notify block", kind="needs_input")
     finally:
         conn.close()
 
@@ -384,7 +384,7 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
             user_id="op-42", chat_type="group", delivery_mode="wake",
             notifier_profile="owner-profile",
         )
-        kb.block_task(conn, tid, reason="group block")
+        kb.block_task(conn, tid, reason="group block", kind="needs_input")
     finally:
         conn.close()
 
@@ -438,7 +438,7 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="wake",
         )
-        kb.block_task(conn, tid, reason="wake only block")
+        kb.block_task(conn, tid, reason="wake only block", kind="needs_input")
     finally:
         conn.close()
 

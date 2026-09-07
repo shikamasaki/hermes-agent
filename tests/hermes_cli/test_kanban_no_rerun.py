@@ -68,7 +68,7 @@ def test_no_rerun_enable_and_clear_require_reason_and_preserve_status(tmp_path):
             kb.set_no_rerun(conn, task_id, True, reason="not stopped")
         assert kb.get_task(conn, task_id).no_rerun == 0  # type: ignore[union-attr]
 
-        assert kb.block_task(conn, task_id, reason="waiting")
+        assert kb.block_task(conn, task_id, reason="waiting", kind="needs_input")
         with pytest.raises(ValueError, match="reason"):
             kb.set_no_rerun(conn, task_id, True, reason=" ")
 

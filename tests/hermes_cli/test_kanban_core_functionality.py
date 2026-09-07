@@ -421,14 +421,14 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert run2.id != run1.id
 
         assert not kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
-        assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
+        assert not kb.block_task(conn, tid, reason="late block", kind="needs_input", expected_run_id=run1.id)
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
         assert task.last_heartbeat_at is None
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
-        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
+        assert kb.block_task(conn, tid, reason="current block", kind="needs_input", expected_run_id=run2.id)
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
