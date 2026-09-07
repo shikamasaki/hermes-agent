@@ -54,9 +54,16 @@ def _utc_now_iso() -> str:
 
 
 class UpdateReceipt:
-    """Collects the observable facts of one ``hermes update`` run."""
+    """Collects the observable facts of one ``hermes update`` run.
 
-    def __init__(self) -> None:
+    ``probe_content=False`` (used for refusal receipts — #91277 admission
+    contract) skips the content-digest probe in ``get_code_identity``, which
+    shells out to ``git ls-files``. A refused/package-managed install must
+    perform zero git/subprocess work while recording its refusal receipt.
+    """
+
+    def __init__(self, probe_content: bool = True) -> None:
+        self._probe_content = probe_content
         self.data: dict[str, Any] = {
             "schema": 1,
             "started_at": _utc_now_iso(),
@@ -74,7 +81,7 @@ class UpdateReceipt:
         try:
             from hermes_cli.build_info import get_code_identity
 
-            self.data["pre_update"] = get_code_identity()
+            self.data["pre_update"] = get_code_identity(probe_content=probe_content)
         except Exception:
             pass
 
@@ -162,7 +169,9 @@ class UpdateReceipt:
         try:
             from hermes_cli.build_info import get_code_identity
 
-            self.data["post_update"] = get_code_identity(refresh=True)
+            self.data["post_update"] = get_code_identity(
+                refresh=True, probe_content=self._probe_content
+            )
         except Exception:
             pass
 
@@ -173,11 +182,16 @@ def _receipt_dir() -> Path:
     return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
 
 
-def begin_update_receipt() -> None:
-    """Start recording a new update receipt. Never raises."""
+def begin_update_receipt(probe_content: bool = True) -> None:
+    """Start recording a new update receipt. Never raises.
+
+    ``probe_content=False`` is for refusal receipts (#91277 admission
+    contract): a refused/package-managed update must not shell out to
+    ``git`` at all while recording that it was refused.
+    """
     global _current
     try:
-        _current = UpdateReceipt()
+        _current = UpdateReceipt(probe_content=probe_content)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         _current = None
