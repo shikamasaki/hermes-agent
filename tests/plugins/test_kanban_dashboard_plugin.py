@@ -1230,3 +1230,92 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_dashboard_single_unblock_records_actor(client, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "single-unblock-actor")
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "test blocked task"},
+    ).json()["task"]
+    tid = t["id"]
+
+    with kb.connect_closing() as conn:
+        kb.block_task(conn, tid, reason="need review", kind="needs_input")
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "ready"},
+    )
+    assert r.status_code == 200, r.text
+
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        assert payload.get("actor") == "single-unblock-actor"
+
+
+def test_dashboard_bulk_unblock_records_actor(client, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "bulk-unblock-actor")
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "test bulk blocked task"},
+    ).json()["task"]
+    tid = t["id"]
+
+    with kb.connect_closing() as conn:
+        kb.block_task(conn, tid, reason="need review", kind="needs_input")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [tid], "status": "ready"},
+    )
+    assert r.status_code == 200, r.text
+
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        assert payload.get("actor") == "bulk-unblock-actor"
+
+
+def test_single_block_task_invalid_kind_returns_400(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "task for invalid single block kind test"},
+    ).json()["task"]
+    tid = t["id"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "blocked", "block_reason": "test invalid kind", "block_kind": "invalid_kind"},
+    )
+    assert r.status_code == 400
+    assert "block kind is required and must be one of" in r.json()["detail"]
+
+
+def test_bulk_block_task_invalid_kind_returns_ok_false(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "task for invalid bulk block kind test"},
+    ).json()["task"]
+    tid = t["id"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [tid], "status": "blocked", "block_reason": "test invalid kind", "block_kind": "invalid_kind"},
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["id"] == tid
+    assert results[0]["ok"] is False
+    assert "block kind is required and must be one of" in results[0]["error"]
+
+
+

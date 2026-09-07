@@ -120,7 +120,7 @@ class TestCollectKanbanNotifications:
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
         conn = kb.connect()
         try:
-            kb.block_task(conn, tid, reason="waiting on review")
+            kb.block_task(conn, tid, reason="waiting on review", kind="needs_input")
         finally:
             conn.close()
 

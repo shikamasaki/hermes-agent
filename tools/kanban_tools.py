@@ -662,6 +662,32 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+
+def _enforce_chief_review_flow(tid: str, board: Optional[str] = None) -> Optional[str]:
+    """Reject kanban_complete from workers if the task requires chief review.
+
+    If HERMES_KANBAN_TASK is set and the task has requires_chief_review=True,
+    force the worker to use kanban_request_review instead.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task and getattr(task, "requires_chief_review", False):
+                return tool_error(
+                    "This task requires Chief review (requires_chief_review=true). "
+                    "kanban_complete is rejected. Please use kanban_request_review instead."
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("Failed to check chief review requirement for task %s", tid)
+        return tool_error(f"Failed to check chief review requirement: {e}")
+    return None
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -675,6 +701,9 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    review_flow_err = _enforce_chief_review_flow(tid, args.get("board"))
+    if review_flow_err:
+        return review_flow_err
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -850,13 +879,15 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    if not kind:
+        return tool_error("kind is required")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+        if kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)}"
             )
         # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
         # judge gate in #38367). kanban_block is a second exit path out of
@@ -1648,10 +1679,11 @@ def _handle_unblock(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     board = args.get("board")
+    actor = os.environ.get("HERMES_KANBAN_TASK") or "chief"
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            ok = kb.unblock_task(conn, str(tid), actor=actor)
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
@@ -1920,7 +1952,7 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["reason"],
+        "required": ["reason", "kind"],
     },
 }
 

@@ -21767,6 +21767,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 c,
                 task_id,
                 reason=reason,
+                kind="needs_input",
                 expected_run_id=worker_run_id,
             )
         finally:
