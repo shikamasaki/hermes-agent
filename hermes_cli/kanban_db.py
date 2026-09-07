@@ -173,7 +173,7 @@ _REQUIRED_READONLY_SCHEMA: Mapping[str, frozenset[str]] = {
         "last_failure_error", "max_runtime_seconds", "last_heartbeat_at",
         "current_run_id", "workflow_template_id", "current_step_key",
         "skills", "model_override", "provider_override", "reasoning_effort",
-        "max_retries", "goal_mode", "goal_max_turns", "session_id",
+        "max_retries", "goal_mode", "requires_chief_review", "goal_max_turns", "session_id",
         "block_kind", "block_recurrences", "no_rerun", "no_rerun_reason",
         "successor_task_id",
     }),
@@ -1161,6 +1161,7 @@ class Task:
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
     goal_mode: bool = False
+    requires_chief_review: bool = False
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
@@ -1263,6 +1264,9 @@ class Task:
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+            ),
+            requires_chief_review=(
+                bool(row["requires_chief_review"]) if "requires_chief_review" in keys and row["requires_chief_review"] else False
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
@@ -1459,6 +1463,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    requires_chief_review INTEGER NOT NULL DEFAULT 0,
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
@@ -2801,6 +2806,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "requires_chief_review" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "requires_chief_review", "requires_chief_review INTEGER NOT NULL DEFAULT 0"
+        )
+
     if "goal_max_turns" not in cols:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
@@ -3343,6 +3353,7 @@ def create_task(
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
+    requires_chief_review: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
@@ -3663,8 +3674,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, requires_chief_review, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3688,6 +3699,7 @@ def create_task(
                         provider_override,
                         reasoning_effort,
                         1 if goal_mode else 0,
+                        1 if requires_chief_review else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                     ),
@@ -6595,13 +6607,12 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
-    kind: Optional[str] = None,
+    kind: str,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
-    ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
-    un-typed block) drives routing instead of every block landing in one
+    ``kind`` (one of :data:`VALID_BLOCK_KINDS`) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
     * ``dependency`` — the task is only waiting on another task. It does NOT
@@ -6610,7 +6621,7 @@ def block_task(
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
 
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
+    * ``needs_input`` / ``capability`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
@@ -6625,9 +6636,9 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
+    if kind is None or kind not in VALID_BLOCK_KINDS:
         raise ValueError(
-            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+            f"block kind is required and must be one of {sorted(VALID_BLOCK_KINDS)}"
         )
     recurrences = 0
     with write_txn(conn):
@@ -7241,7 +7252,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, actor: Optional[str] = None) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -7293,13 +7304,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        
+        payload = {}
+        if new_status != "ready" or resume_status != "ready":
+            payload = {"status": new_status, "resume_status": resume_status}
+        if actor is not None:
+            payload["actor"] = actor
+            
         _append_event(
             conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+            payload if payload else None,
         )
         return True
 

@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -1281,3 +1282,124 @@ def test_find_profile_gateway_processes_strict_propagates_profile_listing_failur
 
     with pytest.raises(RuntimeError, match="profile listing failed"):
         gateway.find_profile_gateway_processes(strict=True)
+
+
+def test_verify_runtime_match(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda all_profiles=True: [12345])
+
+    def fake_get_git_info(path):
+        return Path("/path/to/wt"), "commit1234567890"
+
+    monkeypatch.setattr(gateway, "_get_git_info_for_path", fake_get_git_info)
+
+    def fake_extract_runtime(pid):
+        return {
+            "pid": pid,
+            "cmdline": ["python", "main.py"],
+            "worktree": Path("/path/to/wt"),
+            "commit": "commit1234567890",
+        }
+
+    monkeypatch.setattr(gateway, "_extract_runtime_info_for_pid", fake_extract_runtime)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.verify_gateway_runtime(expected_worktree="/path/to/wt", json_output=False)
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "✓ All running gateway processes match expected runtime" in captured.out
+
+
+def test_verify_runtime_mismatch(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda all_profiles=True: [12345])
+
+    def fake_get_git_info(path):
+        return Path("/path/to/expected_wt"), "commit_expected"
+
+    monkeypatch.setattr(gateway, "_get_git_info_for_path", fake_get_git_info)
+
+    def fake_extract_runtime(pid):
+        return {
+            "pid": pid,
+            "cmdline": ["python", "main.py"],
+            "worktree": Path("/path/to/actual_wt"),
+            "commit": "commit_actual",
+        }
+
+    monkeypatch.setattr(gateway, "_extract_runtime_info_for_pid", fake_extract_runtime)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.verify_gateway_runtime(expected_worktree="/path/to/expected_wt", json_output=False)
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Gateway runtime mismatch detected" in captured.out
+
+
+def test_verify_runtime_json(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda all_profiles=True: [12345])
+
+    def fake_get_git_info(path):
+        return Path("/path/to/expected_wt"), "commit_expected"
+
+    monkeypatch.setattr(gateway, "_get_git_info_for_path", fake_get_git_info)
+
+    def fake_extract_runtime(pid):
+        return {
+            "pid": pid,
+            "cmdline": ["python", "main.py"],
+            "worktree": Path("/path/to/actual_wt"),
+            "commit": "commit_actual",
+        }
+
+    monkeypatch.setattr(gateway, "_extract_runtime_info_for_pid", fake_extract_runtime)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.verify_gateway_runtime(expected_worktree="/path/to/expected_wt", json_output=True)
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "mismatch"
+    assert data["mismatches"] == [12345]
+    assert data["processes"][0]["matches"] is False
+    assert "worktree_mismatch" in data["processes"][0]["mismatch_reasons"]
+    assert "commit_mismatch" in data["processes"][0]["mismatch_reasons"]
+
+
+def test_verify_runtime_not_running(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda all_profiles=True: [])
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.verify_gateway_runtime(json_output=False)
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "Gateway process is not running" in captured.out
+
+
+def test_verify_runtime_cli_arg_parsing(monkeypatch):
+    called_args = {}
+
+    def fake_verify(expected_worktree, json_output):
+        called_args["expected_worktree"] = expected_worktree
+        called_args["json_output"] = json_output
+
+    monkeypatch.setattr(gateway, "verify_gateway_runtime", fake_verify)
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=gateway.gateway_command,
+        cmd_proxy=lambda args: None,
+        cmd_gateway_enroll=lambda args: None,
+    )
+
+    args = parser.parse_args(
+        ["gateway", "verify-runtime", "--expected-worktree", "/custom/path", "--json"]
+    )
+    gateway.gateway_command(args)
+
+    assert called_args == {
+        "expected_worktree": "/custom/path",
+        "json_output": True,
+    }

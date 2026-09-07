@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +56,19 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _dashboard_actor() -> str:
+    """Best-effort actor name for dashboard actions."""
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        v = os.environ.get(env)
+        if v:
+            return v
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "user"
+    except Exception:
+        return "user"
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +848,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    kind: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -905,7 +921,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                kind = getattr(payload, "block_kind", None) or getattr(payload, "kind", None) or "needs_input"
+                try:
+                    ok = kanban_db.block_task(
+                        conn, task_id, reason=payload.block_reason, kind=kind
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "review":
@@ -929,7 +951,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # reopen_review_task via _reopen_if_review.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    ok = kanban_db.unblock_task(conn, task_id, actor=_dashboard_actor())
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).
@@ -1305,6 +1327,9 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    kind: Optional[str] = None
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -1349,7 +1374,10 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        kind = getattr(payload, "block_kind", None) or getattr(payload, "kind", None) or "needs_input"
+                        ok = kanban_db.block_task(
+                            conn, tid, reason=getattr(payload, "block_reason", None), kind=kind
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
@@ -1362,7 +1390,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
-                            ok = kanban_db.unblock_task(conn, tid)
+                            ok = kanban_db.unblock_task(conn, tid, actor=_dashboard_actor())
                         else:
                             reopened = _reopen_if_review(conn, tid, cur)
                             ok = reopened if reopened is not None else _set_status_direct(conn, tid, "ready")

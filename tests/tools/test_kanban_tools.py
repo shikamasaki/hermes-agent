@@ -217,7 +217,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -264,10 +264,12 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    # Give it a valid kind, but one not allowed for goal_mode if we're testing goal_mode restriction.
+    # The previous code tested "missing kind", but now it's rejected upfront by required `kind`.
     out = kt._handle_block({"reason": "giving up"})
     d = json.loads(out)
     assert "error" in d
-    assert "goal_mode" in d["error"]
+    assert "kind is required" in d["error"]
 
     conn = kb.connect()
     try:
@@ -436,7 +438,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -669,7 +671,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(conn, other, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -1134,3 +1136,126 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+def test_complete_rejects_chief_review_for_worker(monkeypatch, tmp_path):
+    import json
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker-chief-test", assignee="test-worker", requires_chief_review=True)
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    out = kt._handle_complete({
+        "summary": "got the thing done",
+    })
+    d = json.loads(out)
+    assert d.get("error") is not None
+    assert "Chief review" in d["error"]
+    assert "rejected" in d["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.completed_at is None
+    finally:
+        conn.close()
+
+def test_request_review_allows_chief_review_for_worker(monkeypatch, tmp_path):
+    import json
+    import os
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker-chief-test", assignee="test-worker", requires_chief_review=True)
+        kb.claim_task(conn, tid)
+        run_id = conn.execute("SELECT MAX(id) as rid FROM task_runs WHERE task_id = ?", (tid,)).fetchone()["rid"]
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if run_id:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    out = kt._handle_request_review({
+        "summary": "please review this"
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+    finally:
+        conn.close()
+
+def test_enforce_chief_review_flow_fail_closed_on_db_exception(monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+    def _raise_err(board=None):
+        raise RuntimeError("DB connection error")
+    monkeypatch.setattr(kt, "_connect", _raise_err)
+
+    err = kt._enforce_chief_review_flow("t_test")
+    assert err is not None
+    assert "Failed to check chief review requirement" in err
+
+
+def test_unblock_tool_records_hermes_kanban_task_actor(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.setattr(kt, "_require_orchestrator_tool", lambda name: None)
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, worker_env, reason="blocked for tool test", kind="needs_input")
+    finally:
+        conn.close()
+
+    out = kt._handle_unblock({"task_id": worker_env})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (worker_env,),
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"]) if events[0]["payload"] else {}
+        assert payload.get("actor") == worker_env
+    finally:
+        conn.close()
+

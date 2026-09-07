@@ -307,6 +307,24 @@ def build_gateway_parser(
     )
     gateway_enroll.set_defaults(func=cmd_gateway_enroll)
 
+    # gateway verify-runtime — verify running process worktree and commit against expected
+    gateway_verify_runtime = gateway_subparsers.add_parser(
+        "verify-runtime",
+        help="Verify running gateway process runtime matches expected worktree/commit",
+    )
+    gateway_verify_runtime.add_argument(
+        "--expected-worktree",
+        dest="expected_worktree",
+        default=None,
+        help="Path to expected git worktree (defaults to current working directory/environment)",
+    )
+    gateway_verify_runtime.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Output runtime verification result as JSON",
+    )
+
     # =========================================================================
     # proxy command — local OpenAI-compatible proxy that attaches the user's
     # OAuth-authenticated provider credentials to outbound requests. Lets
