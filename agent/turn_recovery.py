@@ -323,6 +323,15 @@ def _refresh_credentials_after_401(
             agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
             return True
     if (
+        agent.api_mode == "chat_completions"
+        and agent.provider == "google-antigravity"
+        and not _retry.antigravity_auth_retry_attempted
+    ):
+        _retry.antigravity_auth_retry_attempted = True
+        if agent._try_refresh_antigravity_client_credentials():
+            agent._buffer_vprint("🔐 Google Antigravity token refreshed after 401. Retrying request...")
+            return True
+    if (
         agent.api_mode in ("chat_completions", "anthropic_messages")
         and agent.provider == "nous"
         and not _retry.nous_auth_retry_attempted

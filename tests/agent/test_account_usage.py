@@ -163,6 +163,129 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
 
 
 
+class _FakeStatusResponse(_FakeResponse):
+    def __init__(self, payload, status_code=200):
+        super().__init__(payload)
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            request = account_usage.httpx.Request("GET", "https://example.invalid")
+            response = account_usage.httpx.Response(self.status_code, request=request)
+            raise account_usage.httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+class _FakeAntigravityClient:
+    def __init__(self, calls, response):
+        self.calls = calls
+        self.response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers):
+        self.calls.append({"url": url, "headers": headers})
+        return self.response
+
+
+def _save_antigravity_auth(tmp_path, monkeypatch, *, project_id="project-123"):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.antigravity_auth import ANTIGRAVITY_BASE_URL, save_state
+
+    state = {
+        "access_token": "access-token-secret",
+        "refresh_token": "refresh-token-secret",
+        "expires_at": 4102444800.0,
+        "auth_type": "oauth_pkce",
+        "base_url": ANTIGRAVITY_BASE_URL,
+    }
+    if project_id:
+        state["project_id"] = project_id
+    save_state(state, set_active=True)
+
+
+def test_antigravity_usage_fetches_quota_summary(monkeypatch, tmp_path):
+    _save_antigravity_auth(tmp_path, monkeypatch, project_id="project-123")
+    calls = []
+    payload = {
+        "planType": "pro",
+        "quotaSummary": {
+            "limits": [
+                {"label": "Session", "usedPercent": 20, "resetAt": "2026-09-09T00:00:00Z"},
+                {"label": "Daily", "usagePercentage": 0.35, "resetTime": 1780230796},
+            ],
+            "details": ["Included requests: 1000"],
+        },
+    }
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeAntigravityClient(calls, _FakeStatusResponse(payload)),
+    )
+
+    snapshot = account_usage.fetch_account_usage("google-antigravity")
+
+    assert snapshot is not None
+    assert snapshot.provider == "google-antigravity"
+    assert snapshot.plan == "Pro"
+    assert [w.label for w in snapshot.windows] == ["Session", "Daily"]
+    assert snapshot.windows[0].used_percent == 20
+    assert snapshot.windows[1].used_percent == 35
+    assert snapshot.details == ("Included requests: 1000",)
+    assert calls[0]["url"].endswith("/projects/project-123/quotaSummary")
+    assert calls[0]["headers"]["Authorization"] == "Bearer access-token-secret"
+
+
+def test_antigravity_usage_missing_project_fails_open(monkeypatch, tmp_path):
+    _save_antigravity_auth(tmp_path, monkeypatch, project_id="")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: (_ for _ in ()).throw(AssertionError("HTTP must not run without project_id")),
+    )
+
+    assert account_usage.fetch_account_usage("google-antigravity") is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _FakeStatusResponse({}, status_code=401),
+        _FakeStatusResponse({}, status_code=403),
+        _FakeStatusResponse(ValueError("bad json")),
+    ],
+)
+def test_antigravity_usage_auth_rejection_and_invalid_json_fail_open(monkeypatch, tmp_path, response):
+    _save_antigravity_auth(tmp_path, monkeypatch, project_id="project-123")
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeAntigravityClient(calls, response),
+    )
+
+    assert account_usage.fetch_account_usage("google-antigravity") is None
+
+
+def test_antigravity_usage_network_error_fails_open(monkeypatch, tmp_path):
+    _save_antigravity_auth(tmp_path, monkeypatch, project_id="project-123")
+
+    class _NetworkErrorClient(_FakeAntigravityClient):
+        def get(self, url, headers):
+            raise account_usage.httpx.ConnectError("connect failed")
+
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _NetworkErrorClient([], _FakeStatusResponse({})),
+    )
+
+    assert account_usage.fetch_account_usage("google-antigravity") is None
+
+
 
 # ── Banked rate-limit reset credits (`/usage reset`) ─────────────────────────
 

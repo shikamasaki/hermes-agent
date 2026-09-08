@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
+from urllib.parse import quote
 
 from agent.anthropic_credentials import _is_oauth_token, resolve_anthropic_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
@@ -557,9 +558,75 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     return _snapshot("openrouter", "credits_api", windows, details)
 
 
+def _antigravity_usage_value(item: dict, *keys: str) -> Optional[float]:
+    for key in keys:
+        value = item.get(key)
+        if _is_num(value):
+            used = float(value)
+            return used * 100 if used <= 1 else used
+    return None
+
+
+def _fetch_antigravity_account_usage(
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    from hermes_cli.antigravity_auth import resolve_antigravity_runtime_credentials
+
+    runtime = resolve_antigravity_runtime_credentials()
+    token = str(api_key or runtime.get("api_key") or "").strip()
+    project_id = str(runtime.get("project_id") or "").strip()
+    if not token or not project_id:
+        return None
+    normalized = str(base_url or runtime.get("base_url") or "").rstrip("/")
+    if not normalized:
+        return None
+    url = f"{normalized}/projects/{quote(project_id, safe='')}/quotaSummary"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(url, headers=headers)
+            if response.status_code in (401, 403):
+                return None
+            response.raise_for_status()
+            payload = response.json() or {}
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get("quotaSummary") or payload.get("quota_summary") or payload
+    if not isinstance(summary, dict):
+        return None
+    limits = summary.get("limits") or summary.get("windows") or summary.get("quotas") or []
+    windows: list[AccountUsageWindow] = []
+    if isinstance(limits, list):
+        for idx, item in enumerate(limits, start=1):
+            if not isinstance(item, dict):
+                continue
+            used = _antigravity_usage_value(item, "usedPercent", "usagePercentage", "used_percent", "utilization")
+            if used is None:
+                continue
+            label = str(item.get("label") or item.get("name") or item.get("window") or f"Quota {idx}").strip()
+            windows.append(AccountUsageWindow(
+                label=label,
+                used_percent=used,
+                reset_at=_parse_dt(item.get("resetAt") or item.get("resetTime") or item.get("reset_at") or item.get("resets_at")),
+            ))
+    raw_details = summary.get("details") or payload.get("details") or []
+    details = [str(detail) for detail in raw_details if isinstance(detail, str) and detail.strip()] if isinstance(raw_details, list) else []
+    return _snapshot(
+        "google-antigravity",
+        "quota_summary_api",
+        windows,
+        details,
+        title="Google Antigravity quota",
+        plan=_title_case_slug(payload.get("planType") or summary.get("planType") or summary.get("plan")),
+    )
+
+
 _USAGE_FETCHERS: dict[str, Callable[[Optional[str], Optional[str]], Optional[AccountUsageSnapshot]]] = {
     "openai-codex": _fetch_codex_account_usage, "anthropic": _fetch_anthropic_account_usage,
     "openrouter": _fetch_openrouter_account_usage,
+    "google-antigravity": _fetch_antigravity_account_usage,
 }
 
 

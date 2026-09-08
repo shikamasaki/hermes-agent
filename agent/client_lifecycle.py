@@ -775,6 +775,34 @@ class ClientLifecycleMixin:
             logger.info("Vertex AI OAuth token refreshed")
         return ok
 
+    def _try_refresh_antigravity_client_credentials(self) -> bool:
+        """Refresh Google Antigravity OAuth credentials and rebuild the OpenAI-style client."""
+        if self.api_mode != "chat_completions" or self.provider != "google-antigravity":
+            return False
+        old_key = str(self.api_key or "").strip()
+        try:
+            from hermes_cli.antigravity_auth import refresh_antigravity_runtime_credentials
+            creds = refresh_antigravity_runtime_credentials(stale_access_token=old_key or None)
+        except Exception as exc:
+            logger.debug("Google Antigravity credential refresh failed: %s", exc)
+            return False
+        api_key, base_url = creds.get("api_key"), creds.get("base_url")
+        if not _valid_credential_pair(api_key, base_url):
+            return False
+        if old_key and str(api_key).strip() == old_key:
+            return False
+        self.api_key, self.base_url = str(api_key).strip(), str(base_url).strip().rstrip("/")
+        self._sync_client_kwargs_credentials()
+        try:
+            from agent.gemini_cloudcode_adapter import apply_cloudcode_context
+            apply_cloudcode_context(self._client_kwargs, project_id=creds.get("project_id"))
+        except Exception:
+            logger.debug("Google Antigravity project header refresh skipped", exc_info=True)
+        ok = self._replace_primary_openai_client(reason="google_antigravity_credential_refresh")
+        if ok:
+            logger.info("Google Antigravity OAuth token refreshed")
+        return ok
+
     def _apply_copilot_token(self, token: str, enterprise_base_url: Any, *, reason: str) -> bool:
         self.api_key = token
         if enterprise_base_url:

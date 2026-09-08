@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
@@ -25,7 +26,7 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY, _agent_key_is_usable, _nous_inference_env_override, format_auth_error, resolve_provider,
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
-    resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
+    resolve_qwen_runtime_credentials, resolve_antigravity_runtime_credentials, resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,  # noqa: F401
     has_usable_secret, is_actual_local_base_url, normalize_actual_base_url,
 )
@@ -317,6 +318,16 @@ def _pool_entry_base_url(entry: Any) -> str:
     return getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or ""
 
 
+def _pool_entry_expired(entry: Any) -> bool:
+    raw = getattr(entry, "expires_at", None)
+    if raw is None:
+        return False
+    try:
+        return float(raw) <= time.time()
+    except (TypeError, ValueError):
+        return False
+
+
 def _nous_entry_key_usable(entry: Any, min_ttl: int) -> bool:
     return _agent_key_is_usable({k: getattr(entry, k, None) for k in ("agent_key", "agent_key_expires_at", "scope")}, min_ttl)
 
@@ -511,6 +522,8 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
     entry = pool.select()
     if entry is None:
         return None
+    if provider == "google-antigravity" and _pool_entry_expired(entry):
+        return None
     pool_api_key = _pool_entry_api_key(entry)
     if provider == "nous":
         entry, pool_api_key = _refresh_nous_pool_entry(pool, entry, pool_api_key)
@@ -638,6 +651,9 @@ _OAUTH_RUNTIME_PROVIDERS: Dict[str, _OAuthRuntimeSpec] = {
                                    "last_refresh", "Auto-detected xAI OAuth provider but credentials failed", DEFAULT_XAI_OAUTH_BASE_URL),
     "qwen-oauth": _OAuthRuntimeSpec(lambda: resolve_qwen_runtime_credentials(), "chat_completions", "qwen-cli",
                                     "expires_at_ms", "Qwen OAuth credentials failed"),
+    "google-antigravity": _OAuthRuntimeSpec(
+        lambda: resolve_antigravity_runtime_credentials(), "chat_completions", "hermes-auth-store",
+        "expires_at", "Google Antigravity credentials failed", auth_mod.ANTIGRAVITY_BASE_URL),
 }
 
 
@@ -654,9 +670,11 @@ def _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model
         logger.info("%s; falling through to next provider.", spec.failure_msg)
         return None
     api_mode = spec.api_mode(_effective_model(model_cfg, target_model)) if callable(spec.api_mode) else spec.api_mode
+    extra = {spec.expiry_key: creds.get(spec.expiry_key), "requested_provider": requested_provider}
+    if provider == "google-antigravity":
+        extra["project_id"] = creds.get("project_id", "")
     return _runtime(provider, api_mode, (creds.get("base_url") or "").rstrip("/") or spec.default_base_url,
-                    creds.get("api_key", ""), source=creds.get("source", spec.default_source),
-                    **{spec.expiry_key: creds.get(spec.expiry_key)}, requested_provider=requested_provider)
+                    creds.get("api_key", ""), source=creds.get("source", spec.default_source), **extra)
 
 
 def _minimax_oauth_runtime(provider, requested_provider) -> Optional[Dict[str, Any]]:

@@ -89,6 +89,9 @@ from hermes_cli.auth_qwen import (  # noqa: F401  re-exported
     _qwen_access_token_is_expiring, _qwen_cli_auth_path, _read_qwen_cli_tokens,
     _refresh_qwen_cli_tokens, _save_qwen_cli_tokens, get_qwen_auth_status,
     resolve_qwen_runtime_credentials)
+from hermes_cli.antigravity_auth import (  # noqa: F401  re-exported
+    ANTIGRAVITY_BASE_URL, get_antigravity_auth_status, resolve_antigravity_runtime_credentials,
+    run_pkce_login as run_antigravity_pkce_login)
 from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     _decode_jwt_claims, AUTH_STORE_VERSION, AUTH_LOCK_TIMEOUT_SECONDS, DEFAULT_NOUS_PORTAL_URL,
     DEFAULT_NOUS_INFERENCE_URL, DEFAULT_NOUS_CLIENT_ID, NOUS_BILLING_MANAGE_SCOPE,
@@ -183,6 +186,7 @@ _REGISTRY_ROWS: Tuple[Any, ...] = (
         "xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "oauth_external",
         inference_base_url=DEFAULT_XAI_OAUTH_BASE_URL),
     ProviderConfig("qwen-oauth", "Qwen OAuth", "oauth_external", inference_base_url=DEFAULT_QWEN_BASE_URL),
+    ProviderConfig("google-antigravity", "Google Antigravity", "oauth_external", inference_base_url=ANTIGRAVITY_BASE_URL),
     ("lmstudio", "LM Studio", "http://127.0.0.1:1234/v1", ("LM_API_KEY",), "LM_BASE_URL"),
     ("copilot", "GitHub Copilot", DEFAULT_GITHUB_MODELS_BASE_URL,
      ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"), "COPILOT_API_BASE_URL"),
@@ -1718,6 +1722,9 @@ OAUTH_PROVIDER_FLOWS: Dict[str, OAuthProviderFlow] = {
         logout_from_config=True),
     "qwen-oauth": OAuthProviderFlow(
         "qwen-oauth", "resolve_qwen_runtime_credentials", "get_qwen_auth_status"),
+    "google-antigravity": OAuthProviderFlow(
+        "google-antigravity", "resolve_antigravity_runtime_credentials", "get_antigravity_auth_status",
+        logout_from_config=True),
     "minimax-oauth": OAuthProviderFlow(
         "minimax-oauth", "resolve_minimax_oauth_runtime_credentials", "get_minimax_oauth_auth_status"),
 }

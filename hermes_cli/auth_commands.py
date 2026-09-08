@@ -24,7 +24,8 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {
+    "anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth", "google-antigravity"}
 
 
 def _get_custom_provider_entries() -> list[dict]:
@@ -247,6 +248,18 @@ _OAUTH_ADD_SPECS: dict[str, _OAuthAddSpec] = {
         source=f"{SOURCE_MANUAL}:minimax_oauth",
         fields=lambda creds, provider: {
             "refresh_token": creds.get("refresh_token"), "base_url": creds.get("inference_base_url")}),
+    "google-antigravity": _OAuthAddSpec(
+        login=lambda args: __import__("hermes_cli.antigravity_auth", fromlist=["run_pkce_login"]).run_pkce_login(
+            open_browser=not getattr(args, "no_browser", False),
+            timeout_seconds=getattr(args, "timeout", None) or 180.0),
+        token=lambda creds: creds["access_token"],
+        source=f"{SOURCE_MANUAL}:antigravity_pkce",
+        fields=lambda creds, provider: {
+            "refresh_token": creds.get("refresh_token"),
+            "expires_at": creds.get("expires_at"),
+            "base_url": creds.get("base_url") or auth_mod.ANTIGRAVITY_BASE_URL,
+            "extra": {"project_id": creds.get("project_id")}},
+        activate_first=True),
 }
 
 
@@ -370,8 +383,9 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
 
     creds = spec.login(args)
     token = spec.token(creds)
-    label = (getattr(args, "label", None) or "").strip() or label_from_token(
-        token, f"{provider}-oauth-{len(pool.entries()) + 1}")
+    default_label = f"{provider}-oauth-{len(pool.entries()) + 1}"
+    label = (getattr(args, "label", None) or "").strip() or (
+        default_label if provider == "google-antigravity" else label_from_token(token, default_label))
     # Every account gets a distinct, self-contained pool entry instead of routing through a
     # singleton save path (which collapsed every added account into the latest login).
     # ``manual:*`` entries refresh from their own token pair, so they need no singleton shadow.
